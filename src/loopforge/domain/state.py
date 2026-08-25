@@ -119,32 +119,35 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
 
 def _validate_transition(state: RunState, event: Event) -> None:
     if state.status.is_terminal:
-        raise InvalidTransitionError(f"terminal run cannot accept {type(event).__name__}")
+        msg = f"terminal run cannot accept {type(event).__name__}"
+        raise InvalidTransitionError(msg)
     allowed = _ALLOWED_STATUS[type(event)]
     if state.status not in allowed:
-        raise InvalidTransitionError(
-            f"{type(event).__name__} is invalid while run is {state.status.value}"
-        )
+        msg_2 = f"{type(event).__name__} is invalid while run is {state.status.value}"
+        raise InvalidTransitionError(msg_2)
 
-    if isinstance(event, (ToolExecutionStarted, ToolSucceeded, ToolFailed, RetryScheduled)):
-        if state.current_action_id is None or str(event.action_id) != state.current_action_id:
-            raise InvalidTransitionError("tool journal event does not match current action")
+    if isinstance(event, (ToolExecutionStarted, ToolSucceeded, ToolFailed, RetryScheduled)) and (
+        state.current_action_id is None or str(event.action_id) != state.current_action_id
+    ):
+        msg_3 = "tool journal event does not match current action"
+        raise InvalidTransitionError(msg_3)
 
     if isinstance(event, ToolExecutionStarted):
         expected_attempt = state.current_attempt + 1
         if event.attempt != expected_attempt:
-            raise InvalidTransitionError(
-                f"tool attempt {event.attempt} does not match expected {expected_attempt}"
-            )
+            msg_4 = f"tool attempt {event.attempt} does not match expected {expected_attempt}"
+            raise InvalidTransitionError(msg_4)
     elif isinstance(event, (ToolSucceeded, ToolFailed)):
         # Legacy schema-v1 streams may have an outcome directly after ActionAuthorized
         # without a ToolExecutionStarted journal event. Preserve replay compatibility.
         if state.current_attempt not in {0, event.attempt}:
-            raise InvalidTransitionError("tool outcome attempt does not match active attempt")
+            msg_7 = "tool outcome attempt does not match active attempt"
+            raise InvalidTransitionError(msg_7)
     elif isinstance(event, RetryScheduled):
         active_attempt = max(1, state.current_attempt)
         if event.next_attempt != active_attempt + 1:
-            raise InvalidTransitionError("retry attempt is not the next journal attempt")
+            msg_8 = "retry attempt is not the next journal attempt"
+            raise InvalidTransitionError(msg_8)
 
 
 def _update_streak(
@@ -167,8 +170,12 @@ def _verification_progress(
     return state.best_verification_score, state.consecutive_no_progress + 1
 
 
-def reduce_event(state: RunState, event: Event) -> RunState:
-    """Project one immutable event into a new immutable RunState."""
+def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, PLR0912
+    """Project one immutable event into a new immutable RunState.
+
+    The flat match dispatch is deliberate: each event projection stays a single
+    auditable case rather than being scattered across handler indirection.
+    """
     _validate_transition(state, event)
     base = replace(
         state,
@@ -242,9 +249,7 @@ def reduce_event(state: RunState, event: Event) -> RunState:
                 ),
                 status=RunStatus.VERIFYING,
             )
-        case ToolFailed(
-            error_message=message, failure_class=failure_class, attempt=attempt
-        ):
+        case ToolFailed(error_message=message, failure_class=failure_class, attempt=attempt):
             tool_name = base.current_tool_metadata.name if base.current_tool_metadata else "unknown"
             return replace(
                 base,
@@ -321,11 +326,11 @@ def replay(run_id: RunId, events: tuple[Event, ...]) -> RunState:
     state = RunState(run_id=run_id)
     for expected_sequence, event in enumerate(events, start=1):
         if event.run_id != run_id:
-            raise ValueError(
-                f"event {event.event_id} belongs to run {event.run_id}, expected {run_id}"
-            )
+            msg_5 = f"event {event.event_id} belongs to run {event.run_id}, expected {run_id}"
+            raise ValueError(msg_5)
         if event.sequence != expected_sequence:
-            raise ValueError(f"expected sequence {expected_sequence}, got {event.sequence}")
+            msg_6 = f"expected sequence {expected_sequence}, got {event.sequence}"
+            raise ValueError(msg_6)
         state = reduce_event(state, event)
     return state
 

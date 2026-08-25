@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import NewType
@@ -75,14 +76,24 @@ class BudgetLimit:
     max_elapsed_seconds: float | None = None
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.max_cost_usd):
+            msg_6 = "max_cost_usd must be finite"
+            raise ValueError(msg_6)
         if self.max_cost_usd <= 0:
-            raise ValueError("max_cost_usd must be positive")
+            msg_2 = "max_cost_usd must be positive"
+            raise ValueError(msg_2)
         if self.max_iterations <= 0:
-            raise ValueError("max_iterations must be positive")
+            msg_3 = "max_iterations must be positive"
+            raise ValueError(msg_3)
         if self.max_total_tokens is not None and self.max_total_tokens <= 0:
-            raise ValueError("max_total_tokens must be positive when set")
+            msg_4 = "max_total_tokens must be positive when set"
+            raise ValueError(msg_4)
+        if self.max_elapsed_seconds is not None and not math.isfinite(self.max_elapsed_seconds):
+            msg_7 = "max_elapsed_seconds must be finite when set"
+            raise ValueError(msg_7)
         if self.max_elapsed_seconds is not None and self.max_elapsed_seconds <= 0:
-            raise ValueError("max_elapsed_seconds must be positive when set")
+            msg_5 = "max_elapsed_seconds must be positive when set"
+            raise ValueError(msg_5)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +104,9 @@ class UsageDelta:
     cached_input_tokens: int = 0
 
     def __post_init__(self) -> None:
+        if not math.isfinite(self.cost_usd):
+            msg_2 = "cost_usd must be finite"
+            raise ValueError(msg_2)
         if self.cost_usd < 0:
             msg = "cost_usd cannot be negative"
             raise ValueError(msg)

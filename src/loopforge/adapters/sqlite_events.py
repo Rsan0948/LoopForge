@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -69,7 +69,7 @@ class SQLiteEventStore:
         self._initialize()
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self) -> Generator[sqlite3.Connection]:
         connection = sqlite3.connect(self._path, timeout=5.0, isolation_level=None)
         try:
             connection.execute("PRAGMA foreign_keys = ON")
@@ -93,9 +93,8 @@ class SQLiteEventStore:
             ).fetchone()
             current = int(row[0]) if row is not None else 0
             if current > STORE_SCHEMA_VERSION:
-                raise UnsupportedStoreSchemaError(
-                    f"store schema {current} is newer than supported {STORE_SCHEMA_VERSION}"
-                )
+                msg_2 = f"store schema {current} is newer than supported {STORE_SCHEMA_VERSION}"
+                raise UnsupportedStoreSchemaError(msg_2)
             for version, sql in _MIGRATIONS:
                 if version <= current:
                     continue
@@ -117,28 +116,34 @@ class SQLiteEventStore:
             ).fetchone()
             return int(row[0]) if row is not None else 0
 
+    @staticmethod
+    def _assert_append_position(
+        connection: sqlite3.Connection, event: Event, *, expected_version: int
+    ) -> None:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE run_id = ?",
+            (str(event.run_id),),
+        ).fetchone()
+        actual = int(row[0]) if row is not None else 0
+        if actual != expected_version:
+            raise StreamVersionConflictError(
+                event.run_id,
+                expected=expected_version,
+                actual=actual,
+            )
+        if event.sequence != expected_version + 1:
+            msg = (
+                f"event sequence {event.sequence} does not match "
+                f"expected next sequence {expected_version + 1}"
+            )
+            raise ValueError(msg)
+
     def append(self, event: Event, *, expected_version: int) -> int:
         payload = self._codec.encode(event)
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
-                row = connection.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE run_id = ?",
-                    (str(event.run_id),),
-                ).fetchone()
-                actual = int(row[0]) if row is not None else 0
-                if actual != expected_version:
-                    raise StreamVersionConflictError(
-                        event.run_id,
-                        expected=expected_version,
-                        actual=actual,
-                    )
-                if event.sequence != expected_version + 1:
-                    msg = (
-                        f"event sequence {event.sequence} does not match "
-                        f"expected next sequence {expected_version + 1}"
-                    )
-                    raise ValueError(msg)
+                self._assert_append_position(connection, event, expected_version=expected_version)
                 try:
                     connection.execute(
                         """
@@ -157,9 +162,8 @@ class SQLiteEventStore:
                     )
                 except sqlite3.IntegrityError as exc:
                     if "events.event_id" in str(exc):
-                        raise DuplicateEventError(
-                            f"duplicate event id: {event.event_id}"
-                        ) from exc
+                        msg_3 = f"duplicate event id: {event.event_id}"
+                        raise DuplicateEventError(msg_3) from exc
                     raise
                 connection.execute("COMMIT")
             except BaseException:

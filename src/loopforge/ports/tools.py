@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -17,9 +18,14 @@ class ToolExecutionRequest:
 
     def __post_init__(self) -> None:
         if self.attempt <= 0:
-            raise ValueError("attempt must be positive")
+            msg = "attempt must be positive"
+            raise ValueError(msg)
+        if not math.isfinite(self.timeout_seconds):
+            msg_5 = "timeout_seconds must be finite"
+            raise ValueError(msg_5)
         if self.timeout_seconds <= 0:
-            raise ValueError("timeout_seconds must be positive")
+            msg_2 = "timeout_seconds must be positive"
+            raise ValueError(msg_2)
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,9 +37,11 @@ class ToolResult:
 
     def __post_init__(self) -> None:
         if self.ok and self.failure_class is not None:
-            raise ValueError("successful tool result cannot declare failure_class")
+            msg_3 = "successful tool result cannot declare failure_class"
+            raise ValueError(msg_3)
         if not self.ok and self.failure_class is None:
-            raise ValueError("failed tool result requires failure_class")
+            msg_4 = "failed tool result requires failure_class"
+            raise ValueError(msg_4)
 
 
 class ToolContractError(TypeError):

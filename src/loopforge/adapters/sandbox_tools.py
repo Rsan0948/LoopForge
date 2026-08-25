@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import SandboxRequirements
@@ -18,7 +18,7 @@ from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolE
 class SandboxToolBinding:
     metadata: ToolMetadata
     command_name: str
-    requirements: SandboxRequirements = SandboxRequirements()
+    requirements: SandboxRequirements = field(default_factory=SandboxRequirements)
 
 
 class SandboxCommandTools:
@@ -28,25 +28,27 @@ class SandboxCommandTools:
         self._sandbox = sandbox
         self._bindings = {item.metadata.name: item for item in bindings}
         if len(self._bindings) != len(bindings):
-            raise ValueError("sandbox tool names must be unique")
+            msg = "sandbox tool names must be unique"
+            raise ValueError(msg)
         for binding in bindings:
             try:
                 sandbox.capabilities.require(binding.requirements)
             except ValueError as exc:
-                raise ValueError(
-                    f"sandbox cannot satisfy tool {binding.metadata.name!r}: {exc}"
-                ) from exc
+                msg_4 = f"sandbox cannot satisfy tool {binding.metadata.name!r}: {exc}"
+                raise ValueError(msg_4) from exc
 
     def metadata_for(self, tool_name: str) -> ToolMetadata:
         try:
             return self._bindings[tool_name].metadata
         except KeyError as exc:
-            raise UnknownToolError(f"unknown sandbox tool: {tool_name}") from exc
+            msg_3 = f"unknown sandbox tool: {tool_name}"
+            raise UnknownToolError(msg_3) from exc
 
     def execute(self, request: ToolExecutionRequest) -> ToolResult:
         binding = self._bindings.get(request.proposal.tool_name)
         if binding is None:
-            raise UnknownToolError(f"unknown sandbox tool: {request.proposal.tool_name}")
+            msg_2 = f"unknown sandbox tool: {request.proposal.tool_name}"
+            raise UnknownToolError(msg_2)
         try:
             result = self._sandbox.run(
                 binding.command_name, timeout_seconds=request.timeout_seconds

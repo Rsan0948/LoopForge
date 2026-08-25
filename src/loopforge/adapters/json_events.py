@@ -1,20 +1,13 @@
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime
-from typing import Any, Final
+from typing import Any, Final, cast
 
 from loopforge.domain.actions import ActionProposal
-from loopforge.domain.reliability import ToolFailureClass
-from loopforge.domain.tooling import (
-    ApprovalClass,
-    DataSensitivity,
-    IdempotencyClass,
-    RetryClass,
-    SideEffectClass,
-    ToolMetadata,
-)
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
@@ -35,6 +28,15 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+)
+from loopforge.domain.reliability import ToolFailureClass
+from loopforge.domain.tooling import (
+    ApprovalClass,
+    DataSensitivity,
+    IdempotencyClass,
+    RetryClass,
+    SideEffectClass,
+    ToolMetadata,
 )
 from loopforge.domain.types import (
     ActionId,
@@ -72,7 +74,6 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
 }
 
 
-
 class UnsupportedEventSchemaError(ValueError):
     """Raised when a serialized event uses an unsupported schema version."""
 
@@ -97,13 +98,14 @@ class JsonEventCodec:
         return json.dumps(envelope, sort_keys=True, separators=(",", ":"))
 
     def decode(self, payload: str) -> Event:
-        raw = json.loads(payload)
-        if not isinstance(raw, dict):
+        parsed: Any = json.loads(payload)
+        if not isinstance(parsed, dict):
             msg = "event envelope must be a JSON object"
-            raise ValueError(msg)
+            raise TypeError(msg)
+        raw = cast(dict[str, Any], parsed)
 
         version = raw.get("schema_version")
-        if version != SCHEMA_VERSION:
+        if not isinstance(version, int) or isinstance(version, bool) or version != SCHEMA_VERSION:
             msg = f"unsupported event schema version: {version!r}"
             raise UnsupportedEventSchemaError(msg)
 
@@ -112,11 +114,7 @@ class JsonEventCodec:
             msg = f"unknown event type: {event_type!r}"
             raise UnknownEventTypeError(msg)
 
-        event_data = raw.get("event")
-        if not isinstance(event_data, dict):
-            msg = "event body must be a JSON object"
-            raise ValueError(msg)
-
+        event_data = _required_object(raw, "event")
         return _construct_event(event_type, event_data)
 
 
@@ -124,9 +122,11 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
     if isinstance(value, dict):
-        return {str(key): _to_jsonable(item) for key, item in value.items()}
+        mapping = cast(dict[Any, Any], value)
+        return {str(key): _to_jsonable(item) for key, item in mapping.items()}
     if isinstance(value, (list, tuple)):
-        return [_to_jsonable(item) for item in value]
+        sequence = cast(list[Any] | tuple[Any, ...], value)
+        return [_to_jsonable(item) for item in sequence]
     # StrEnum and NewType-backed strings serialize naturally. Dataclasses have
     # already been lowered by asdict().
     return value
@@ -134,6 +134,9 @@ def _to_jsonable(value: Any) -> Any:
 
 def _base(data: dict[str, Any]) -> dict[str, Any]:
     caused_by_raw = data.get("caused_by")
+    if caused_by_raw is not None and not isinstance(caused_by_raw, str):
+        msg = "caused_by must be a string or null"
+        raise TypeError(msg)
     return {
         "event_id": EventId(_required_str(data, "event_id")),
         "run_id": RunId(_required_str(data, "run_id")),
@@ -143,138 +146,200 @@ def _base(data: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _construct_run_started(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return RunStarted(**base, objective=_required_str(data, "objective"))
+
+
+def _construct_plan_created(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return PlanCreated(**base, plan=_required_str(data, "plan"))
+
+
+def _required_object(data: dict[str, Any], key: str) -> dict[str, Any]:
+    value = data.get(key)
+    if not isinstance(value, dict):
+        msg = f"{key} must be a JSON object"
+        raise TypeError(msg)
+    return cast(dict[str, Any], value)
+
+
+def _construct_action_proposed(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ActionProposed(**base, proposal=_proposal(_required_object(data, "proposal")))
+
+
+def _construct_action_authorized(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ActionAuthorized(
+        **base,
+        proposal=_proposal(_required_object(data, "proposal")),
+        tool_metadata=_tool_metadata(_required_object(data, "tool_metadata")),
+    )
+
+
+def _construct_action_rejected(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ActionRejected(
+        **base,
+        proposal=_proposal(_required_object(data, "proposal")),
+        reason_code=_required_str(data, "reason_code"),
+    )
+
+
+def _construct_tool_execution_started(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    key = data.get("idempotency_key")
+    if key is not None and not isinstance(key, str):
+        msg_2 = "idempotency_key must be a string or null"
+        raise TypeError(msg_2)
+    return ToolExecutionStarted(
+        **base,
+        action_id=ActionId(_required_str(data, "action_id")),
+        attempt=_required_int(data, "attempt"),
+        idempotency_key=key,
+    )
+
+
+def _construct_tool_succeeded(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ToolSucceeded(
+        **base,
+        action_id=ActionId(_required_str(data, "action_id")),
+        observation=_required_str(data, "observation"),
+        attempt=_optional_int(data, "attempt", default=1),
+    )
+
+
+def _construct_tool_failed(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    failure_raw = data.get("failure_class")
+    if failure_raw is not None and not isinstance(failure_raw, str):
+        msg = "failure_class must be a string or null"
+        raise TypeError(msg)
+    if isinstance(failure_raw, str):
+        failure_class = ToolFailureClass(failure_raw)
+    else:
+        # Backward-compatible decode for PACS-001/002 schema-v1 payloads.
+        legacy_retryable = _required_bool(data, "retryable")
+        failure_class = (
+            ToolFailureClass.TRANSIENT if legacy_retryable else ToolFailureClass.PERMANENT
+        )
+    return ToolFailed(
+        **base,
+        action_id=ActionId(_required_str(data, "action_id")),
+        error_code=_required_str(data, "error_code"),
+        error_message=_required_str(data, "error_message"),
+        failure_class=failure_class,
+        attempt=_optional_int(data, "attempt", default=1),
+    )
+
+
+def _construct_retry_scheduled(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return RetryScheduled(
+        **base,
+        action_id=ActionId(_required_str(data, "action_id")),
+        next_attempt=_required_int(data, "next_attempt"),
+        delay_seconds=_required_number(data, "delay_seconds"),
+        reason_code=_required_str(data, "reason_code"),
+    )
+
+
+def _construct_circuit_opened(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return CircuitOpened(
+        **base,
+        tool_name=_required_str(data, "tool_name"),
+        reason_code=_required_str(data, "reason_code"),
+    )
+
+
+def _construct_verification_passed(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return VerificationPassed(**base, summary=_required_str(data, "summary"))
+
+
+def _construct_verification_failed(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    score = data.get("score")
+    if score is not None and (not isinstance(score, (int, float)) or isinstance(score, bool)):
+        msg = "score must be numeric or null"
+        raise TypeError(msg)
+    if score is not None and not math.isfinite(float(score)):
+        msg = "score must be finite"
+        raise ValueError(msg)
+    return VerificationFailed(
+        **base,
+        summary=_required_str(data, "summary"),
+        score=float(score) if score is not None else None,
+    )
+
+
+def _construct_reflection_recorded(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ReflectionRecorded(**base, reflection=_required_str(data, "reflection"))
+
+
+def _construct_budget_debited(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return BudgetDebited(**base, usage=_usage(_required_object(data, "usage")))
+
+
+def _construct_approval_requested(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ApprovalRequested(
+        **base,
+        action_id=ActionId(_required_str(data, "action_id")),
+        reason=_required_str(data, "reason"),
+    )
+
+
+def _construct_approval_granted(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ApprovalGranted(**base, action_id=ActionId(_required_str(data, "action_id")))
+
+
+def _construct_run_stopped(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return RunStopped(
+        **base,
+        reason=StopReason(_required_str(data, "reason")),
+        summary=_required_str(data, "summary"),
+    )
+
+
+_CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]]] = {
+    "RunStarted": _construct_run_started,
+    "PlanCreated": _construct_plan_created,
+    "ActionProposed": _construct_action_proposed,
+    "ActionAuthorized": _construct_action_authorized,
+    "ActionRejected": _construct_action_rejected,
+    "ToolExecutionStarted": _construct_tool_execution_started,
+    "ToolSucceeded": _construct_tool_succeeded,
+    "ToolFailed": _construct_tool_failed,
+    "RetryScheduled": _construct_retry_scheduled,
+    "CircuitOpened": _construct_circuit_opened,
+    "VerificationPassed": _construct_verification_passed,
+    "VerificationFailed": _construct_verification_failed,
+    "ReflectionRecorded": _construct_reflection_recorded,
+    "BudgetDebited": _construct_budget_debited,
+    "ApprovalRequested": _construct_approval_requested,
+    "ApprovalGranted": _construct_approval_granted,
+    "RunStopped": _construct_run_stopped,
+}
+
+
 def _construct_event(event_type: str, data: dict[str, Any]) -> Event:
     base = _base(data)
-    if event_type == "RunStarted":
-        return RunStarted(**base, objective=_required_str(data, "objective"))
-    if event_type == "PlanCreated":
-        return PlanCreated(**base, plan=_required_str(data, "plan"))
-    if event_type in {"ActionProposed", "ActionAuthorized", "ActionRejected"}:
-        proposal_raw = data.get("proposal")
-        if not isinstance(proposal_raw, dict):
-            msg = "proposal must be a JSON object"
-            raise ValueError(msg)
-        proposal = _proposal(proposal_raw)
-        if event_type == "ActionProposed":
-            return ActionProposed(**base, proposal=proposal)
-        if event_type == "ActionAuthorized":
-            metadata_raw = data.get("tool_metadata")
-            if not isinstance(metadata_raw, dict):
-                msg = "tool_metadata must be a JSON object"
-                raise ValueError(msg)
-            return ActionAuthorized(
-                **base,
-                proposal=proposal,
-                tool_metadata=_tool_metadata(metadata_raw),
-            )
-        return ActionRejected(
-            **base,
-            proposal=proposal,
-            reason_code=_required_str(data, "reason_code"),
-        )
-    if event_type == "ToolExecutionStarted":
-        key = data.get("idempotency_key")
-        if key is not None and not isinstance(key, str):
-            raise ValueError("idempotency_key must be a string or null")
-        return ToolExecutionStarted(
-            **base,
-            action_id=ActionId(_required_str(data, "action_id")),
-            attempt=_required_int(data, "attempt"),
-            idempotency_key=key,
-        )
-    if event_type == "ToolSucceeded":
-        return ToolSucceeded(
-            **base,
-            action_id=ActionId(_required_str(data, "action_id")),
-            observation=_required_str(data, "observation"),
-            attempt=_optional_int(data, "attempt", default=1),
-        )
-    if event_type == "ToolFailed":
-        failure_raw = data.get("failure_class")
-        if isinstance(failure_raw, str):
-            failure_class = ToolFailureClass(failure_raw)
-        else:
-            # Backward-compatible decode for PACS-001/002 schema-v1 payloads.
-            legacy_retryable = _required_bool(data, "retryable")
-            failure_class = (
-                ToolFailureClass.TRANSIENT
-                if legacy_retryable
-                else ToolFailureClass.PERMANENT
-            )
-        return ToolFailed(
-            **base,
-            action_id=ActionId(_required_str(data, "action_id")),
-            error_code=_required_str(data, "error_code"),
-            error_message=_required_str(data, "error_message"),
-            failure_class=failure_class,
-            attempt=_optional_int(data, "attempt", default=1),
-        )
-    if event_type == "RetryScheduled":
-        return RetryScheduled(
-            **base,
-            action_id=ActionId(_required_str(data, "action_id")),
-            next_attempt=_required_int(data, "next_attempt"),
-            delay_seconds=_required_number(data, "delay_seconds"),
-            reason_code=_required_str(data, "reason_code"),
-        )
-    if event_type == "CircuitOpened":
-        return CircuitOpened(
-            **base,
-            tool_name=_required_str(data, "tool_name"),
-            reason_code=_required_str(data, "reason_code"),
-        )
-    if event_type == "VerificationPassed":
-        return VerificationPassed(**base, summary=_required_str(data, "summary"))
-    if event_type == "VerificationFailed":
-        score = data.get("score")
-        if score is not None and not isinstance(score, (int, float)):
-            msg = "score must be numeric or null"
-            raise ValueError(msg)
-        return VerificationFailed(
-            **base,
-            summary=_required_str(data, "summary"),
-            score=float(score) if score is not None else None,
-        )
-    if event_type == "ReflectionRecorded":
-        return ReflectionRecorded(**base, reflection=_required_str(data, "reflection"))
-    if event_type == "BudgetDebited":
-        usage_raw = data.get("usage")
-        if not isinstance(usage_raw, dict):
-            msg = "usage must be a JSON object"
-            raise ValueError(msg)
-        return BudgetDebited(**base, usage=_usage(usage_raw))
-    if event_type == "ApprovalRequested":
-        return ApprovalRequested(
-            **base,
-            action_id=ActionId(_required_str(data, "action_id")),
-            reason=_required_str(data, "reason"),
-        )
-    if event_type == "ApprovalGranted":
-        return ApprovalGranted(**base, action_id=ActionId(_required_str(data, "action_id")))
-    if event_type == "RunStopped":
-        return RunStopped(
-            **base,
-            reason=StopReason(_required_str(data, "reason")),
-            summary=_required_str(data, "summary"),
-        )
-    raise UnknownEventTypeError(event_type)
+    try:
+        constructor = _CONSTRUCTORS[event_type]
+    except KeyError as exc:
+        raise UnknownEventTypeError(event_type) from exc
+    return constructor(base, data)
 
 
 def _proposal(data: dict[str, Any]) -> ActionProposal:
-    arguments = data.get("arguments")
-    if not isinstance(arguments, dict) or not all(
-        isinstance(key, str) and isinstance(value, str) for key, value in arguments.items()
-    ):
+    arguments_raw: Any = data.get("arguments")
+    if not isinstance(arguments_raw, dict):
         msg = "proposal arguments must be an object of string keys and values"
-        raise ValueError(msg)
+        raise TypeError(msg)
+    arguments = cast(dict[Any, Any], arguments_raw)
+    if not all(isinstance(key, str) and isinstance(value, str) for key, value in arguments.items()):
+        msg = "proposal arguments must be an object of string keys and values"
+        raise TypeError(msg)
     expected_observation = data.get("expected_observation")
     if expected_observation is not None and not isinstance(expected_observation, str):
         msg = "expected_observation must be a string or null"
-        raise ValueError(msg)
+        raise TypeError(msg)
+    validated_arguments = cast(dict[str, str], dict(arguments))
     return ActionProposal(
         action_id=ActionId(_required_str(data, "action_id")),
         tool_name=_required_str(data, "tool_name"),
-        arguments=arguments,
+        arguments=validated_arguments,
         expected_observation=expected_observation,
     )
 
@@ -306,7 +371,7 @@ def _required_str(data: dict[str, Any], key: str) -> str:
     value = data.get(key)
     if not isinstance(value, str):
         msg = f"{key} must be a string"
-        raise ValueError(msg)
+        raise TypeError(msg)
     return value
 
 
@@ -314,7 +379,7 @@ def _required_int(data: dict[str, Any], key: str) -> int:
     value = data.get(key)
     if not isinstance(value, int) or isinstance(value, bool):
         msg = f"{key} must be an integer"
-        raise ValueError(msg)
+        raise TypeError(msg)
     return value
 
 
@@ -322,7 +387,7 @@ def _required_bool(data: dict[str, Any], key: str) -> bool:
     value = data.get(key)
     if not isinstance(value, bool):
         msg = f"{key} must be a boolean"
-        raise ValueError(msg)
+        raise TypeError(msg)
     return value
 
 
@@ -330,8 +395,12 @@ def _required_number(data: dict[str, Any], key: str) -> float:
     value = data.get(key)
     if not isinstance(value, (int, float)) or isinstance(value, bool):
         msg = f"{key} must be numeric"
+        raise TypeError(msg)
+    result = float(value)
+    if not math.isfinite(result):
+        msg = f"{key} must be finite"
         raise ValueError(msg)
-    return float(value)
+    return result
 
 
 def _optional_int(data: dict[str, Any], key: str, *, default: int) -> int:

@@ -26,7 +26,6 @@ from loopforge.domain.events import (
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import (
     ReliabilityPolicy,
-    ToolFailureClass,
     idempotency_key_for,
 )
 from loopforge.domain.state import RunState, replay
@@ -90,7 +89,8 @@ class Runtime:
     def state_for(self, run_id: RunId) -> RunState:
         events = self.store.events_for(run_id)
         if not events:
-            raise UnknownRunError(f"no persisted run: {run_id}")
+            msg = f"no persisted run: {run_id}"
+            raise UnknownRunError(msg)
         return replay(run_id, events)
 
     def cancel(self, run_id: RunId, *, summary: str = "cancelled by operator") -> RunState:
@@ -127,23 +127,23 @@ class Runtime:
                 return self.state_for(run_id)
 
             turn = self.model.propose_action(current)
-            if not isinstance(turn, ModelTurn):
-                raise ModelContractError(
-                    f"model adapter returned {type(turn).__name__}, expected ModelTurn"
-                )
-            if (
-                not isinstance(turn.action, ActionProposal)
-                or not isinstance(turn.usage, UsageDelta)
+            # Boundary validation is intentional: adapters may violate port return types.
+            if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg_7 = f"model adapter returned {type(turn).__name__}, expected ModelTurn"
+                raise ModelContractError(msg_7)
+            if not isinstance(turn.action, ActionProposal) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                turn.usage, UsageDelta
             ):
-                raise ModelContractError("model turn contains invalid action or usage payload")
+                msg_8 = "model turn contains invalid action or usage payload"
+                raise ModelContractError(msg_8)
             self._persist(
                 run_id,
-                lambda event_id, rid, occurred_at, sequence: BudgetDebited(
+                lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
                     event_id=event_id,
                     run_id=rid,
                     occurred_at=occurred_at,
                     sequence=sequence,
-                    usage=turn.usage,
+                    usage=usage,
                 ),
             )
 
@@ -156,7 +156,7 @@ class Runtime:
             action = turn.action
             self._persist(
                 run_id,
-                lambda event_id, rid, occurred_at, sequence: ActionProposed(
+                lambda event_id, rid, occurred_at, sequence, action=action: ActionProposed(
                     event_id=event_id,
                     run_id=rid,
                     occurred_at=occurred_at,
@@ -167,11 +167,12 @@ class Runtime:
 
             try:
                 metadata = self.tools.metadata_for(action.tool_name)
-                if not isinstance(metadata, ToolMetadata):
-                    raise ToolContractError(
+                if not isinstance(metadata, ToolMetadata):  # pyright: ignore[reportUnnecessaryIsInstance]
+                    msg_11 = (
                         f"tool metadata adapter returned {type(metadata).__name__}, "
                         "expected ToolMetadata"
                     )
+                    raise ToolContractError(msg_11)
             except UnknownToolError:
                 self._reject(run_id, action, "BLOCK_UNKNOWN_TOOL")
                 continue
@@ -186,13 +187,15 @@ class Runtime:
 
             self._persist(
                 run_id,
-                lambda event_id, rid, occurred_at, sequence: ActionAuthorized(
-                    event_id=event_id,
-                    run_id=rid,
-                    occurred_at=occurred_at,
-                    sequence=sequence,
-                    proposal=action,
-                    tool_metadata=metadata,
+                lambda event_id, rid, occurred_at, sequence, action=action, metadata=metadata: (
+                    ActionAuthorized(
+                        event_id=event_id,
+                        run_id=rid,
+                        occurred_at=occurred_at,
+                        sequence=sequence,
+                        proposal=action,
+                        tool_metadata=metadata,
+                    )
                 ),
             )
             self._execute_current_action(run_id, attempt=1)
@@ -210,16 +213,16 @@ class Runtime:
         proposal = state.current_proposal
         metadata = state.current_tool_metadata
         if proposal is None or metadata is None:
-            raise UnsafeResumeStateError("acting state is missing durable action metadata")
+            msg_2 = "acting state is missing durable action metadata"
+            raise UnsafeResumeStateError(msg_2)
 
         if state.execution_in_flight:
             safe = metadata.side_effect in {SideEffectClass.PURE, SideEffectClass.READ_ONLY} or (
                 metadata.idempotency in {IdempotencyClass.NATURAL, IdempotencyClass.KEYED}
             )
             if not safe:
-                raise UnsafeResumeStateError(
-                    "ambiguous action outcome cannot be replayed without idempotency"
-                )
+                msg_9 = "ambiguous action outcome cannot be replayed without idempotency"
+                raise UnsafeResumeStateError(msg_9)
             self._execute_request(
                 run_id,
                 proposal=proposal,
@@ -240,7 +243,8 @@ class Runtime:
         proposal = state.current_proposal
         metadata = state.current_tool_metadata
         if proposal is None or metadata is None:
-            raise RuntimeError("authorized action metadata missing from state")
+            msg_3 = "authorized action metadata missing from state"
+            raise RuntimeError(msg_3)
         self._execute_request(
             run_id,
             proposal=proposal,
@@ -273,7 +277,8 @@ class Runtime:
             )
         metadata = self.state_for(run_id).current_tool_metadata
         if metadata is None:
-            raise RuntimeError("tool execution missing metadata")
+            msg_4 = "tool execution missing metadata"
+            raise RuntimeError(msg_4)
         result = self.tools.execute(
             ToolExecutionRequest(
                 proposal=proposal,
@@ -282,10 +287,10 @@ class Runtime:
                 idempotency_key=idempotency_key,
             )
         )
-        if not isinstance(result, ToolResult):
-            raise ToolContractError(
-                f"tool adapter returned {type(result).__name__}, expected ToolResult"
-            )
+        # Boundary validation is intentional: adapters may violate port return types.
+        if not isinstance(result, ToolResult):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_5 = f"tool adapter returned {type(result).__name__}, expected ToolResult"
+            raise ToolContractError(msg_5)
         self._record_tool_result(run_id, proposal.action_id, attempt, result)
 
     def _record_tool_result(
@@ -311,7 +316,8 @@ class Runtime:
             return
         failure_class = result.failure_class
         if failure_class is None:
-            raise RuntimeError("failed tool result missing failure classification")
+            msg_6 = "failed tool result missing failure classification"
+            raise RuntimeError(msg_6)
         self._persist(
             run_id,
             lambda event_id, rid, occurred_at, sequence: ToolFailed(
@@ -335,7 +341,8 @@ class Runtime:
             metadata = state.current_tool_metadata
             proposal = state.current_proposal
             if metadata is None or proposal is None:
-                raise RuntimeError("tool failure missing action metadata")
+                msg_10 = "tool failure missing action metadata"
+                raise RuntimeError(msg_10)
 
             streak = state.failure_streak_for(metadata.name)
             if self.reliability.circuit_is_open(consecutive_failures=streak):
@@ -362,6 +369,7 @@ class Runtime:
             )
             if retry.should_retry:
                 assert retry.next_attempt is not None
+                next_attempt = retry.next_attempt
                 self._persist(
                     run_id,
                     lambda event_id, rid, occurred_at, sequence: RetryScheduled(
@@ -370,13 +378,13 @@ class Runtime:
                         occurred_at=occurred_at,
                         sequence=sequence,
                         action_id=proposal.action_id,
-                        next_attempt=retry.next_attempt,
+                        next_attempt=next_attempt,
                         delay_seconds=retry.delay_seconds,
                         reason_code=retry.reason_code,
                     ),
                 )
                 self.sleeper.sleep(retry.delay_seconds)
-                self._execute_current_action(run_id, attempt=retry.next_attempt)
+                self._execute_current_action(run_id, attempt=next_attempt)
                 self._resolve_verifying(run_id)
                 return
 

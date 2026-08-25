@@ -8,8 +8,8 @@ import pytest
 
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
-from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.adapters.sqlite_events import SQLiteEventStore
+from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.application.runtime import Runtime, UnsafeResumeStateError
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.events import (
@@ -21,7 +21,7 @@ from loopforge.domain.events import (
     ToolSucceeded,
 )
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
-from loopforge.domain.reliability import ReliabilityPolicy, ToolFailureClass
+from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.tooling import (
     ApprovalClass,
     IdempotencyClass,

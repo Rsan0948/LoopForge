@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import sqlite3
-from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import UTC, datetime
 from pathlib import Path
 

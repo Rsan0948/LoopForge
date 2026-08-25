@@ -30,9 +30,12 @@ class ControlPolicy:
 
     def __post_init__(self) -> None:
         if self.no_progress_limit <= 0:
-            raise ValueError("no_progress_limit must be positive")
+            msg = "no_progress_limit must be positive"
+            raise ValueError(msg)
 
-    def evaluate(self, state: RunState, *, now: datetime | None = None) -> ControlDecision:
+    def evaluate(  # noqa: PLR0911 - flat prioritized rule chain keeps stop precedence explicit
+        self, state: RunState, *, now: datetime | None = None
+    ) -> ControlDecision:
         if state.last_verification_passed is True:
             return ControlDecision(
                 ControlDecisionKind.STOP_SUCCESS,

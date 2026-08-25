@@ -13,9 +13,7 @@ class StreamVersionConflictError(RuntimeError):
         self.run_id = run_id
         self.expected = expected
         self.actual = actual
-        super().__init__(
-            f"stream {run_id} version conflict: expected {expected}, actual {actual}"
-        )
+        super().__init__(f"stream {run_id} version conflict: expected {expected}, actual {actual}")
 
 
 class DuplicateEventError(RuntimeError):

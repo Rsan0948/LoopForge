@@ -11,17 +11,17 @@ pushable).
 
 Known gaps versus the original PACS-005 tree:
 
-- `tests/unit/`, `tests/security/`, and `tests/resilience/test_fault_injection_lab.py`
-  were lost with the damaged bundle chunks. Of the original 125 tests, 18 survive.
+- The original `tests/unit/`, `tests/security/`, and `tests/resilience/` files were
+  lost with the damaged bundle chunks. All three suites were rebuilt during the
+  2026-08-23 hygiene pass (696 tests passing, 95.75% branch coverage, all lint/type
+  gates green — see BUILD_STATUS.md). The rebuilt tests pin current behavior and
+  recovered semantics; they are not the byte-identical originals.
 - `docs/process/manual-pacs.md`, `docs/process/remaining-pacs-plan.md`, and
   `docs/process/cycles/PACS-005-security-sandbox-contract.md` were regenerated from
   the originating chat session; content is substantively correct but not
   byte-identical to the originals.
 - `docs/process/fault-injection-laboratory.md` content was recovered; its original
   directory placement is uncertain (currently under `docs/process/`).
-
-Claims below of "125 tests passing / 93% coverage / security suite 22/22" describe
-the original PACS-005 build, not the current tree.
 
 ## Read this first
 
@@ -49,12 +49,15 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence at PACS-005:
-- 125 tests passing
-- 93% branch-aware coverage
-- security suite 22/22
-- deterministic demo, compile, architecture DAG, diff and line-length checks passing
-- Ruff/Pyright/Import Linter are configured but were unavailable in the prior execution environment; do not claim they ran until they actually do
+Current checked evidence (restoration + hygiene pass, 2026-08-23; superseded the PACS-005
+numbers below, which describe the original pre-restoration build):
+- 696 tests passing, 9 platform-gated skips
+- 95.75% branch-aware coverage
+- ruff format/check, pyright strict, and import-linter all executed and green
+- deterministic demo, compile, architecture DAG checks passing
+
+Historical PACS-005 evidence: 125 tests passing, 93% coverage, security suite 22/22,
+with Ruff/Pyright/Import Linter unavailable in that environment.
 
 ## Mandatory source documents
 

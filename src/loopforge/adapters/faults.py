@@ -76,4 +76,5 @@ class FaultInjectingTools:
             )
         if fault.kind is ToolFaultKind.CRASH_AFTER_SUCCESS:
             raise InjectedProcessCrash(fault.message or "injected crash after side effect")
-        raise AssertionError(f"unsupported fault: {fault.kind}")
+        msg = f"unsupported fault: {fault.kind}"
+        raise AssertionError(msg)

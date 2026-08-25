@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -71,6 +72,9 @@ class ToolMetadata:
         if not self.name.strip():
             msg = "tool metadata name cannot be empty"
             raise ValueError(msg)
+        if not math.isfinite(self.timeout_seconds):
+            msg_2 = "timeout_seconds must be finite"
+            raise ValueError(msg_2)
         if self.timeout_seconds <= 0:
             msg = "timeout_seconds must be positive"
             raise ValueError(msg)
@@ -88,19 +92,25 @@ class ToolMetadata:
             )
             raise ValueError(msg)
 
-        if self.side_effect in {SideEffectClass.PURE, SideEffectClass.READ_ONLY}:
-            if self.idempotency is IdempotencyClass.NONE:
-                msg = "pure/read-only tools cannot declare idempotency=none"
-                raise ValueError(msg)
+        if (
+            self.side_effect in {SideEffectClass.PURE, SideEffectClass.READ_ONLY}
+            and self.idempotency is IdempotencyClass.NONE
+        ):
+            msg = "pure/read-only tools cannot declare idempotency=none"
+            raise ValueError(msg)
 
-        if self.retry is not RetryClass.NEVER and self.side_effect in {
-            SideEffectClass.LOCAL_WRITE,
-            SideEffectClass.EXTERNAL_WRITE,
-            SideEffectClass.IRREVERSIBLE,
-        }:
-            if self.idempotency not in {IdempotencyClass.NATURAL, IdempotencyClass.KEYED}:
-                msg = "retryable side-effecting tools require natural or keyed idempotency"
-                raise ValueError(msg)
+        if (
+            self.retry is not RetryClass.NEVER
+            and self.side_effect
+            in {
+                SideEffectClass.LOCAL_WRITE,
+                SideEffectClass.EXTERNAL_WRITE,
+                SideEffectClass.IRREVERSIBLE,
+            }
+            and self.idempotency not in {IdempotencyClass.NATURAL, IdempotencyClass.KEYED}
+        ):
+            msg = "retryable side-effecting tools require natural or keyed idempotency"
+            raise ValueError(msg)
 
         if (
             self.side_effect is SideEffectClass.IRREVERSIBLE

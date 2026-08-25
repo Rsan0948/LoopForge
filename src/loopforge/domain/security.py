@@ -51,7 +51,8 @@ class SandboxCapabilities:
         prefer the explicit SandboxRequirements value for code-owned workload contracts.
         """
         if requirements is not None and legacy:
-            raise ValueError("pass either SandboxRequirements or keyword requirements, not both")
+            msg = "pass either SandboxRequirements or keyword requirements, not both"
+            raise ValueError(msg)
         required = requirements or SandboxRequirements(**legacy)
         missing = [
             field.name

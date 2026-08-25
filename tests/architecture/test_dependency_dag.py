@@ -59,6 +59,8 @@ def test_domain_has_no_external_runtime_dependencies() -> None:
                     root = alias.name.split(".")[0]
                     allowed = {
                         "__future__",
+                        "collections",
+                        "math",
                         "dataclasses",
                         "datetime",
                         "enum",
@@ -71,6 +73,8 @@ def test_domain_has_no_external_runtime_dependencies() -> None:
                 root = node.module.split(".")[0]
                 allowed = {
                     "__future__",
+                    "collections",
+                    "math",
                     "dataclasses",
                     "datetime",
                     "enum",

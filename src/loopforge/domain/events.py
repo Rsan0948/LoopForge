@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -62,7 +63,8 @@ class ToolExecutionStarted(DomainEvent):
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
         if self.attempt <= 0:
-            raise ValueError("tool attempt must be positive")
+            msg_2 = "tool attempt must be positive"
+            raise ValueError(msg_2)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -74,7 +76,8 @@ class ToolSucceeded(DomainEvent):
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
         if self.attempt <= 0:
-            raise ValueError("tool attempt must be positive")
+            msg_3 = "tool attempt must be positive"
+            raise ValueError(msg_3)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -88,7 +91,8 @@ class ToolFailed(DomainEvent):
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
         if self.attempt <= 0:
-            raise ValueError("tool attempt must be positive")
+            msg_4 = "tool attempt must be positive"
+            raise ValueError(msg_4)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -101,9 +105,14 @@ class RetryScheduled(DomainEvent):
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
         if self.next_attempt <= 1:
-            raise ValueError("retry next_attempt must be greater than one")
+            msg_5 = "retry next_attempt must be greater than one"
+            raise ValueError(msg_5)
+        if not math.isfinite(self.delay_seconds):
+            msg_7 = "retry delay must be finite"
+            raise ValueError(msg_7)
         if self.delay_seconds < 0:
-            raise ValueError("retry delay cannot be negative")
+            msg_6 = "retry delay cannot be negative"
+            raise ValueError(msg_6)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

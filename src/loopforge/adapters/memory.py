@@ -29,7 +29,8 @@ class InMemoryEventStore:
             )
             raise ValueError(msg)
         if event.event_id in self._event_ids:
-            raise DuplicateEventError(f"duplicate event id: {event.event_id}")
+            msg_2 = f"duplicate event id: {event.event_id}"
+            raise DuplicateEventError(msg_2)
         self._events[event.run_id].append(event)
         self._event_ids.add(event.event_id)
         return expected_version + 1

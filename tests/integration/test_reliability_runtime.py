@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -18,8 +19,10 @@ from loopforge.domain.events import (
     ActionProposed,
     ActionRejected,
     CircuitOpened,
+    Event,
     RetryScheduled,
     ToolExecutionStarted,
+    ToolFailed,
 )
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy, RetrySettings, ToolFailureClass
@@ -136,7 +139,7 @@ def test_restart_from_ambiguous_keyed_execution_replays_same_attempt_safely(tmp_
     )
     run_id = runtime.start("resume ambiguous write")
 
-    def append(event) -> None:
+    def append(event: Callable[[int], Event]) -> None:
         version = store.current_version(run_id)
         store.append(event(version + 1), expected_version=version)
 
@@ -302,7 +305,7 @@ def test_resume_honors_remaining_persisted_retry_backoff(tmp_path: Path) -> None
     )
     run_id = runtime.start("resume retry")
 
-    def append(event) -> None:
+    def append(event: Callable[[int], Event]) -> None:
         version = store.current_version(run_id)
         store.append(event(version + 1), expected_version=version)
 
@@ -336,8 +339,6 @@ def test_resume_honors_remaining_persisted_retry_backoff(tmp_path: Path) -> None
             idempotency_key=None,
         )
     )
-    from loopforge.domain.events import ToolFailed
-
     append(
         lambda sequence: ToolFailed(
             event_id=EventId("rf"),

@@ -24,13 +24,17 @@ class RetrySettings:
 
     def __post_init__(self) -> None:
         if self.max_attempts <= 0:
-            raise ValueError("max_attempts must be positive")
+            msg = "max_attempts must be positive"
+            raise ValueError(msg)
         if self.base_delay_seconds < 0 or self.max_delay_seconds < 0:
-            raise ValueError("retry delays cannot be negative")
+            msg_2 = "retry delays cannot be negative"
+            raise ValueError(msg_2)
         if self.max_delay_seconds < self.base_delay_seconds:
-            raise ValueError("max_delay_seconds cannot be below base_delay_seconds")
+            msg_3 = "max_delay_seconds cannot be below base_delay_seconds"
+            raise ValueError(msg_3)
         if not 0 <= self.jitter_fraction <= 1:
-            raise ValueError("jitter_fraction must be between 0 and 1")
+            msg_4 = "jitter_fraction must be between 0 and 1"
+            raise ValueError(msg_4)
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +52,8 @@ class ReliabilityPolicy:
 
     def __post_init__(self) -> None:
         if self.circuit_failure_threshold <= 0:
-            raise ValueError("circuit_failure_threshold must be positive")
+            msg_5 = "circuit_failure_threshold must be positive"
+            raise ValueError(msg_5)
 
     def retry_decision(
         self,
@@ -69,11 +74,6 @@ class ReliabilityPolicy:
             IdempotencyClass.KEYED,
         }:
             return RetryDecision(False, "RETRY_AMBIGUOUS_NOT_IDEMPOTENT")
-        if metadata.retry is RetryClass.TRANSIENT_ONLY and failure_class not in {
-            ToolFailureClass.TRANSIENT,
-            ToolFailureClass.AMBIGUOUS_OUTCOME,
-        }:
-            return RetryDecision(False, "RETRY_FAILURE_NOT_TRANSIENT")
 
         next_attempt = attempt + 1
         delay = self._delay(action_id=action_id, next_attempt=next_attempt)
@@ -102,9 +102,7 @@ class ReliabilityPolicy:
         return max(0.0, capped + jitter)
 
 
-def idempotency_key_for(
-    metadata: ToolMetadata, run_id: RunId, action_id: ActionId
-) -> str | None:
+def idempotency_key_for(metadata: ToolMetadata, run_id: RunId, action_id: ActionId) -> str | None:
     if metadata.idempotency is IdempotencyClass.KEYED:
         return f"loopforge:{run_id}:{action_id}"
     return None
