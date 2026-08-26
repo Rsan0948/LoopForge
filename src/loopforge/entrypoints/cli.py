@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 
+from loopforge.adapters.context import BasicContextBuilder
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
@@ -75,6 +76,7 @@ def _demo() -> int:
         control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
         permissions=PermissionPolicy(frozenset({Permission.READ, Permission.LOCAL_WRITE})),
         reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(SystemClock()),
         clock=SystemClock(),
         sleeper=SystemSleeper(),
     )

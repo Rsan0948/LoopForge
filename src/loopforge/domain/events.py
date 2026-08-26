@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ContextItemSnapshot
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.tooling import ToolMetadata
 from loopforge.domain.types import ActionId, EventId, RunId, StopReason, UsageDelta
@@ -138,6 +139,17 @@ class ReflectionRecorded(DomainEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ContextAssembled(DomainEvent):
+    """Durable record of the exact context artifact sent to the model.
+
+    Secret-sensitivity items are rejected at construction (see
+    ContextItemSnapshot); redaction before telemetry export is a later cycle.
+    """
+
+    context_items: tuple[ContextItemSnapshot, ...]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class BudgetDebited(DomainEvent):
     usage: UsageDelta
 
@@ -173,6 +185,7 @@ Event = (
     | VerificationPassed
     | VerificationFailed
     | ReflectionRecorded
+    | ContextAssembled
     | BudgetDebited
     | ApprovalRequested
     | ApprovalGranted

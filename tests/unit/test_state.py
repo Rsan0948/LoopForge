@@ -8,6 +8,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
@@ -16,6 +17,7 @@ from loopforge.domain.events import (
     ApprovalRequested,
     BudgetDebited,
     CircuitOpened,
+    ContextAssembled,
     Event,
     PlanCreated,
     ReflectionRecorded,
@@ -29,6 +31,7 @@ from loopforge.domain.events import (
     VerificationPassed,
 )
 from loopforge.domain.reliability import ToolFailureClass
+from loopforge.domain.security import TrustClass
 from loopforge.domain.state import (
     InvalidTransitionError,
     RunState,
@@ -39,6 +42,7 @@ from loopforge.domain.state import (
 )
 from loopforge.domain.tooling import (
     ApprovalClass,
+    DataSensitivity,
     IdempotencyClass,
     RetryClass,
     SideEffectClass,
@@ -47,6 +51,7 @@ from loopforge.domain.tooling import (
 from loopforge.domain.types import (
     ActionId,
     BudgetLimit,
+    ContextItemId,
     EventId,
     Permission,
     RiskLevel,
@@ -79,6 +84,28 @@ def _proposal(action_id: str = "a1", tool_name: str = "inspect") -> ActionPropos
 
 def _event_id(sequence: int) -> EventId:
     return EventId(f"e{sequence}")
+
+
+def _context_assembled(sequence: int) -> ContextAssembled:
+    return ContextAssembled(
+        event_id=_event_id(sequence),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=sequence,
+        context_items=(
+            ContextItemSnapshot(
+                item_id=ContextItemId(f"{RUN}:objective"),
+                content="repair",
+                trust=TrustClass.AUTHORIZED_HUMAN,
+                source=ContextSource(
+                    origin=TrustClass.AUTHORIZED_HUMAN,
+                    reference=f"run:{RUN}:objective",
+                ),
+                sensitivity=DataSensitivity.INTERNAL,
+                created_at=NOW,
+            ),
+        ),
+    )
 
 
 def _started(sequence: int, *, run_id: RunId = RUN) -> RunStarted:
@@ -690,6 +717,27 @@ def test_reflecting_run_can_replan_back_to_ready() -> None:
     assert state.plan == "smaller diff"
 
 
+def test_context_assembled_projects_last_context_items_and_stays_ready() -> None:
+    event = _context_assembled(3)
+
+    state = reduce_event(_state_at("ready"), event)
+
+    assert state.status is RunStatus.READY
+    assert state.last_context_items == event.context_items
+
+
+def test_context_assembled_provenance_survives_replay() -> None:
+    events: tuple[Event, ...] = (_started(1), _planned(2), _context_assembled(3))
+
+    state = replay(RUN, events)
+
+    items = state.last_context_items
+    assert items is not None
+    assert items[0].trust is TrustClass.AUTHORIZED_HUMAN
+    assert items[0].source.origin is TrustClass.AUTHORIZED_HUMAN
+    assert items[0].source.reference == f"run:{RUN}:objective"
+
+
 # --- projections: budget and approval ---
 
 
@@ -787,6 +835,11 @@ def test_terminal_run_cannot_transition_back_to_active() -> None:
         ("acting", _verification_passed(9)),
         ("acting", _verification_failed(9)),
         ("verifying", _reflection(9)),
+        ("created", _context_assembled(9)),
+        ("planning", _context_assembled(9)),
+        ("acting", _context_assembled(9)),
+        ("verifying", _context_assembled(9)),
+        ("reflecting", _context_assembled(9)),
         ("created", _budget(9)),
         ("planning", _approval_requested(9)),
         ("ready", _approval_granted(9)),

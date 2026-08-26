@@ -2,7 +2,7 @@
 
 LoopForge separates **authority** from **intelligence**.
 
-The model may propose an action. It does not own permission, tool risk classification, retry/idempotency semantics, execution, state mutation, verification, budget enforcement, or terminal decisions.
+The model may propose an action. It does not own permission, tool risk classification, retry/idempotency semantics, execution, state mutation, verification, budget enforcement, or terminal decisions. The model boundary receives a typed, immutable `ModelContext` artifact assembled by the runtime (provenance, trust class, sensitivity per item); it never receives raw `RunState`, and lower-trust content can never silently elevate to policy authority.
 
 ## Dependency direction
 

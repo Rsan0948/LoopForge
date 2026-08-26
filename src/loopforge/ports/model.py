@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from loopforge.domain.actions import ActionProposal
-from loopforge.domain.state import RunState
+from loopforge.domain.context import ModelContext
 from loopforge.domain.types import UsageDelta
 
 
@@ -19,4 +19,4 @@ class ModelContractError(TypeError):
 
 
 class ModelPort(Protocol):
-    def propose_action(self, state: RunState) -> ModelTurn: ...
+    def propose_action(self, context: ModelContext) -> ModelTurn: ...

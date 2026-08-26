@@ -1,4 +1,38 @@
-# Build status — PACS-005 complete + restoration/hygiene pass green
+# Build status — PACS-006 complete
+
+PACS-006 establishes the context authority model: typed, provenance-aware `ContextItem` /
+`ModelContext` artifacts, code-owned trust/authority ordering with a guarded `promote` path, the
+`ContextBuilderPort` boundary, and a durable `ContextAssembled` event so the exact model context
+survives serialization and replay. The model boundary now receives `ModelContext`, never raw
+`RunState`. No subsequent PACS cycle is active until manually initiated.
+
+Verified in this environment (2026-08-25, includes post-cycle hardening pass):
+
+- `uv run pytest -q` — **805 passing, 9 skipped** (macOS `RLIMIT_AS` platform-gated skips)
+- branch-aware coverage — **96.31% overall**; configured 90% gate satisfied; all context
+  modules and the `ContextAssembled` codec paths at 100% branch coverage
+- `ruff format --check .` / `ruff check .` — clean
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- deterministic CLI demo — `status=succeeded`
+- `compileall` — clean
+
+Post-cycle hardening fixed and pinned (see `tests/regression/test_hardening_regressions.py`):
+snapshot re-validation at the serialization boundary, supersession-cycle rejection, and honest
+"unknown" verifier-outcome labeling.
+
+## Implemented through PACS-006
+
+- typed immutable context artifacts with provenance (`ContextSource`), trust (`TrustClass`),
+  sensitivity (`DataSensitivity`), supersession, and freshness semantics
+- `TRUST_AUTHORITY` ordering and guarded `promote`: untrusted/model-inference content can never
+  elevate to runtime-policy or authorized-human authority, and only ever with an explicit basis
+- `ContextBuilderPort` boundary + deterministic `BasicContextBuilder` reference adapter
+- durable `ContextAssembled` event (strict codec, SECRET-sensitivity persistence rejected)
+- model boundary consumes `ModelContext`; builder contract violations fail with
+  `ContextContractError`
+
+# Historical: PACS-005 complete + restoration/hygiene pass green
 
 PACS-005 establishes LoopForge's explicit security/trust vocabulary, provider-independent sandbox
 contract, capability negotiation, and first constrained local execution adapter. No subsequent PACS
@@ -34,7 +68,7 @@ Test suites rebuilt after the bundle loss: `tests/unit/` (domain + adapters + co
 capability-binding), `tests/resilience/` (fault-injection laboratory),
 `tests/regression/` (hardening pins).
 
-## Implemented through PACS-005
+## Implemented through PACS-005 (historical)
 
 - deterministic event-sourced runtime and SQLite compare-and-append persistence
 - runtime-owned retry/backoff/idempotency, action journal, and tool-scoped circuit breaking

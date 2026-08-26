@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from loopforge.adapters.context import BasicContextBuilder
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
 from loopforge.adapters.sqlite_events import SQLiteEventStore
@@ -68,6 +69,7 @@ def _runtime(path: Path, *, action_id: str = "a1") -> Runtime:
         control=ControlPolicy(BudgetLimit(5.0, 10)),
         permissions=PermissionPolicy(frozenset({Permission.READ})),
         reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(SystemClock()),
         clock=SystemClock(),
         sleeper=SystemSleeper(),
     )

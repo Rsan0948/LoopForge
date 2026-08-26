@@ -32,10 +32,11 @@ This is the concise release roadmap. See `docs/product/master-build-map.md` for 
 
 ## v0.3 — Context + observability
 
-- typed context items with provenance/trust metadata
-- context builder + compaction contracts
-- prompt versioning/cache telemetry
-- OpenTelemetry traces/metrics
+- [x] typed context items with provenance/trust metadata (PACS-006)
+- [x] context builder boundary + durable context assembly record (PACS-006)
+- context selection/compaction contracts and prompt versioning (PACS-007)
+- OpenTelemetry traces/metrics (PACS-008)
+- execution provenance graph projection
 - execution provenance graph projection
 
 ## v0.4 — Software-repair workload

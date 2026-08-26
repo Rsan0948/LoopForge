@@ -18,6 +18,7 @@ from loopforge.adapters.json_events import (
     _to_jsonable,  # pyright: ignore[reportPrivateUsage]
 )
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ContextAuthorityError, ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
@@ -26,6 +27,7 @@ from loopforge.domain.events import (
     ApprovalRequested,
     BudgetDebited,
     CircuitOpened,
+    ContextAssembled,
     Event,
     PlanCreated,
     ReflectionRecorded,
@@ -39,6 +41,7 @@ from loopforge.domain.events import (
     VerificationPassed,
 )
 from loopforge.domain.reliability import ToolFailureClass
+from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
     ApprovalClass,
     DataSensitivity,
@@ -49,6 +52,7 @@ from loopforge.domain.tooling import (
 )
 from loopforge.domain.types import (
     ActionId,
+    ContextItemId,
     EventId,
     Permission,
     RiskLevel,
@@ -256,6 +260,48 @@ EXAMPLES: tuple[Event, ...] = (
         summary="score withheld",
         score=None,
     ),
+    ContextAssembled(
+        event_id=EventId("e20"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=20,
+        context_items=(
+            ContextItemSnapshot(
+                item_id=ContextItemId("run-json:objective"),
+                content="repair auth",
+                trust=TrustClass.AUTHORIZED_HUMAN,
+                source=ContextSource(
+                    origin=TrustClass.AUTHORIZED_HUMAN,
+                    reference="run:run-json:objective",
+                    detail="operator-supplied run objective",
+                ),
+                sensitivity=DataSensitivity.INTERNAL,
+                created_at=NOW,
+            ),
+        ),
+    ),
+    # Nullable-field variant exercising supersedes/expires_at serialization.
+    ContextAssembled(
+        event_id=EventId("e21"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=21,
+        context_items=(
+            ContextItemSnapshot(
+                item_id=ContextItemId("run-json:plan"),
+                content="inspect then patch",
+                trust=TrustClass.RUNTIME_POLICY,
+                source=ContextSource(
+                    origin=TrustClass.RUNTIME_POLICY,
+                    reference="run:run-json:plan",
+                ),
+                sensitivity=DataSensitivity.PUBLIC,
+                created_at=NOW,
+                supersedes=ContextItemId("run-json:objective"),
+                expires_at=NOW + timedelta(hours=1),
+            ),
+        ),
+    ),
 )
 
 (
@@ -278,6 +324,8 @@ EXAMPLES: tuple[Event, ...] = (
     RUN_STOPPED,
     TOOL_EXECUTION_STARTED_UNKEYED,
     VERIFICATION_FAILED_UNSCORED,
+    CONTEXT_ASSEMBLED,
+    CONTEXT_ASSEMBLED_SUPERSEDING,
 ) = EXAMPLES
 
 
@@ -319,7 +367,7 @@ def _legacy_tool_failed_payload(retryable: Any) -> str:
 
 def test_examples_cover_every_registered_event_type() -> None:
     assert {type(event).__name__ for event in EXAMPLES} == set(_EVENT_TYPES)
-    assert len(_EVENT_TYPES) == 17
+    assert len(_EVENT_TYPES) == 18
 
 
 @pytest.mark.parametrize(
@@ -887,3 +935,137 @@ def test_event_round_trip_is_a_canonical_fixed_point(event: Event) -> None:
     assert decoded == event
     assert CODEC.encode(decoded) == payload
     assert payload == json.dumps(json.loads(payload), sort_keys=True, separators=(",", ":"))
+
+
+# --- ContextAssembled decode hardening -------------------------------------------
+
+
+def _mutated_context_item(key: str, value: Any, *, section: str | None = None) -> str:
+    envelope = _envelope(CONTEXT_ASSEMBLED)
+    body = cast(dict[str, Any], envelope["event"])
+    items = cast(list[Any], body["context_items"])
+    target = cast(dict[str, Any], items[0])
+    if section is not None:
+        target = cast(dict[str, Any], target[section])
+    if value is _MISSING:
+        target.pop(key)
+    else:
+        target[key] = value
+    return json.dumps(envelope)
+
+
+@pytest.mark.parametrize("value", ["nope", 42, {"item": 1}, True])
+def test_decode_rejects_non_array_context_items(value: Any) -> None:
+    payload = _mutated_body(CONTEXT_ASSEMBLED, "context_items", value)
+    with pytest.raises(TypeError, match="context_items must be a JSON array"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("value", ["nope", 42, [1]])
+def test_decode_rejects_non_object_context_item(value: Any) -> None:
+    payload = _mutated_body(CONTEXT_ASSEMBLED, "context_items", [value])
+    with pytest.raises(TypeError, match="context item snapshot must be a JSON object"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("key", ["item_id", "content", "trust", "sensitivity", "created_at"])
+def test_decode_rejects_missing_required_context_item_fields(key: str) -> None:
+    payload = _mutated_context_item(key, _MISSING)
+    with pytest.raises(TypeError, match=f"{key} must be a string"):
+        CODEC.decode(payload)
+
+
+def test_decode_rejects_missing_context_item_source() -> None:
+    payload = _mutated_context_item("source", _MISSING)
+    with pytest.raises(TypeError, match="source must be a JSON object"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("value", [42, True, ["x"]])
+def test_decode_rejects_mistyped_context_item_supersedes(value: Any) -> None:
+    payload = _mutated_context_item("supersedes", value)
+    with pytest.raises(TypeError, match="supersedes must be a string or null"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("value", [42, False, {"at": "now"}])
+def test_decode_rejects_mistyped_context_item_expires_at(value: Any) -> None:
+    payload = _mutated_context_item("expires_at", value)
+    with pytest.raises(TypeError, match="expires_at must be a string or null"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("value", [42, True, ["detail"]])
+def test_decode_rejects_mistyped_context_source_detail(value: Any) -> None:
+    payload = _mutated_context_item("detail", value, section="source")
+    with pytest.raises(TypeError, match="source detail must be a string or null"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("key", ["origin", "reference"])
+def test_decode_rejects_mistyped_context_source_fields(key: str) -> None:
+    payload = _mutated_context_item(key, 42, section="source")
+    with pytest.raises(TypeError, match=f"{key} must be a string"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("value", ["god_mode", "RUNTIME_POLICY", ""])
+def test_decode_rejects_unknown_context_trust_values(value: str) -> None:
+    payload = _mutated_context_item("trust", value)
+    with pytest.raises(ValueError, match="is not a valid TrustClass"):
+        CODEC.decode(payload)
+
+
+def test_decode_rejects_unknown_context_sensitivity() -> None:
+    payload = _mutated_context_item("sensitivity", "cosmic")
+    with pytest.raises(ValueError, match="is not a valid DataSensitivity"):
+        CODEC.decode(payload)
+
+
+def test_decode_rejects_secret_context_items() -> None:
+    payload = _mutated_context_item("sensitivity", "secret")
+    with pytest.raises(ContextAuthorityError, match="must never be persisted"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("key", ["created_at", "expires_at"])
+def test_decode_rejects_naive_context_item_datetimes(key: str) -> None:
+    payload = _mutated_context_item(key, "2026-08-22T12:30:15")
+    with pytest.raises(ValueError, match=f"{key} must be timezone-aware"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("key", ["created_at", "expires_at"])
+def test_decode_rejects_malformed_context_item_datetimes(key: str) -> None:
+    payload = _mutated_context_item(key, "not-a-date")
+    with pytest.raises(ValueError, match="Invalid isoformat string"):
+        CODEC.decode(payload)
+
+
+def test_decode_rejects_context_trust_origin_mismatch() -> None:
+    payload = _mutated_context_item("origin", "untrusted_content", section="source")
+    with pytest.raises(ValueError, match="trust must match the origin"):
+        CODEC.decode(payload)
+
+
+def test_decode_rejects_context_item_expiry_before_creation() -> None:
+    payload = _mutated_context_item("expires_at", "2020-01-01T00:00:00+00:00")
+    with pytest.raises(ValueError, match="expires_at must be after created_at"):
+        CODEC.decode(payload)
+
+
+def test_decode_accepts_null_supersedes_and_expires_at() -> None:
+    decoded = CODEC.decode(CODEC.encode(CONTEXT_ASSEMBLED))
+
+    assert isinstance(decoded, ContextAssembled)
+    assert decoded.context_items[0].supersedes is None
+    assert decoded.context_items[0].expires_at is None
+
+
+def test_decode_preserves_supersedes_and_expires_at() -> None:
+    decoded = CODEC.decode(CODEC.encode(CONTEXT_ASSEMBLED_SUPERSEDING))
+
+    assert isinstance(decoded, ContextAssembled)
+    item = decoded.context_items[0]
+    assert item.supersedes == ContextItemId("run-json:objective")
+    assert item.expires_at == NOW + timedelta(hours=1)

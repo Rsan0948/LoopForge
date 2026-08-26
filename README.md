@@ -49,8 +49,11 @@ This first milestone deliberately contains **no live LLM integration**. It estab
 - explicit trust/sandbox capability vocabulary
 - constrained local sandbox reference adapter with fixed commands, filtered environment,
   file-API path/symlink defense, process timeout, resource limits, and bounded output
+- typed, provenance-aware model context artifacts (`ContextItem`/`ModelContext`) with
+  code-owned trust authority, guarded elevation, and a durable `ContextAssembled` record;
+  the model boundary consumes `ModelContext`, never raw run state
 
-A live model should be one of the later adapters, not the foundation of correctness. PACS-004 completed the systematic fault-injection laboratory. PACS-005 established the sandbox/security contract and first constrained local adapter. That local adapter explicitly does **not** claim child-process filesystem, network, or kernel isolation; hostile repository execution still requires a later container/VM adapter.
+A live model should be one of the later adapters, not the foundation of correctness. PACS-004 completed the systematic fault-injection laboratory. PACS-005 established the sandbox/security contract and first constrained local adapter. PACS-006 established the context authority model. That local adapter explicitly does **not** claim child-process filesystem, network, or kernel isolation; hostile repository execution still requires a later container/VM adapter.
 
 ## Architecture
 

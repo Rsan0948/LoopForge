@@ -11,6 +11,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
@@ -19,6 +20,7 @@ from loopforge.domain.events import (
     ApprovalRequested,
     BudgetDebited,
     CircuitOpened,
+    ContextAssembled,
     DomainEvent,
     Event,
     PlanCreated,
@@ -33,8 +35,10 @@ from loopforge.domain.events import (
     VerificationPassed,
 )
 from loopforge.domain.reliability import ToolFailureClass
+from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
     ApprovalClass,
+    DataSensitivity,
     IdempotencyClass,
     RetryClass,
     SideEffectClass,
@@ -42,6 +46,7 @@ from loopforge.domain.tooling import (
 )
 from loopforge.domain.types import (
     ActionId,
+    ContextItemId,
     EventId,
     Permission,
     RiskLevel,
@@ -71,6 +76,7 @@ ALL_EVENT_CLASSES: tuple[type[DomainEvent], ...] = (
     ApprovalRequested,
     ApprovalGranted,
     RunStopped,
+    ContextAssembled,
 )
 
 
@@ -96,6 +102,21 @@ def _metadata() -> ToolMetadata:
         idempotency=IdempotencyClass.NATURAL,
         approval=ApprovalClass.NONE,
         timeout_seconds=5.0,
+    )
+
+
+def _context_snapshot() -> ContextItemSnapshot:
+    return ContextItemSnapshot(
+        item_id=ContextItemId("run-1:objective"),
+        content="repair auth",
+        trust=TrustClass.AUTHORIZED_HUMAN,
+        source=ContextSource(
+            origin=TrustClass.AUTHORIZED_HUMAN,
+            reference="run:run-1:objective",
+            detail="operator-supplied run objective",
+        ),
+        sensitivity=DataSensitivity.INTERNAL,
+        created_at=NOW,
     )
 
 
@@ -251,6 +272,13 @@ def _all_events() -> tuple[Event, ...]:
             sequence=16,
             reason=StopReason.SUCCESS_VERIFIED,
             summary="done",
+        ),
+        ContextAssembled(
+            event_id=EventId("e17"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=17,
+            context_items=(_context_snapshot(),),
         ),
     )
 

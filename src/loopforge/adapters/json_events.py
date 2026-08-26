@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Final, cast
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
@@ -16,6 +17,7 @@ from loopforge.domain.events import (
     ApprovalRequested,
     BudgetDebited,
     CircuitOpened,
+    ContextAssembled,
     DomainEvent,
     Event,
     PlanCreated,
@@ -30,6 +32,7 @@ from loopforge.domain.events import (
     VerificationPassed,
 )
 from loopforge.domain.reliability import ToolFailureClass
+from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
     ApprovalClass,
     DataSensitivity,
@@ -40,6 +43,7 @@ from loopforge.domain.tooling import (
 )
 from loopforge.domain.types import (
     ActionId,
+    ContextItemId,
     EventId,
     Permission,
     RiskLevel,
@@ -66,6 +70,7 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         VerificationPassed,
         VerificationFailed,
         ReflectionRecorded,
+        ContextAssembled,
         BudgetDebited,
         ApprovalRequested,
         ApprovalGranted,
@@ -268,6 +273,55 @@ def _construct_reflection_recorded(base: dict[str, Any], data: dict[str, Any]) -
     return ReflectionRecorded(**base, reflection=_required_str(data, "reflection"))
 
 
+def _construct_context_assembled(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    items_raw: Any = data.get("context_items")
+    if not isinstance(items_raw, list):
+        msg = "context_items must be a JSON array"
+        raise TypeError(msg)
+    items = cast(list[Any], items_raw)
+    return ContextAssembled(
+        **base,
+        context_items=tuple(_context_item_snapshot(item) for item in items),
+    )
+
+
+def _context_item_snapshot(data: Any) -> ContextItemSnapshot:
+    if not isinstance(data, dict):
+        msg = "context item snapshot must be a JSON object"
+        raise TypeError(msg)
+    item = cast(dict[str, Any], data)
+    supersedes_raw = item.get("supersedes")
+    if supersedes_raw is not None and not isinstance(supersedes_raw, str):
+        msg_2 = "supersedes must be a string or null"
+        raise TypeError(msg_2)
+    expires_raw = item.get("expires_at")
+    if expires_raw is not None and not isinstance(expires_raw, str):
+        msg_3 = "expires_at must be a string or null"
+        raise TypeError(msg_3)
+    return ContextItemSnapshot(
+        item_id=ContextItemId(_required_str(item, "item_id")),
+        content=_required_str(item, "content"),
+        trust=TrustClass(_required_str(item, "trust")),
+        source=_context_source(_required_object(item, "source")),
+        sensitivity=DataSensitivity(_required_str(item, "sensitivity")),
+        created_at=datetime.fromisoformat(_required_str(item, "created_at")),
+        supersedes=ContextItemId(supersedes_raw) if isinstance(supersedes_raw, str) else None,
+        expires_at=datetime.fromisoformat(expires_raw) if isinstance(expires_raw, str) else None,
+    )
+
+
+def _context_source(data: dict[str, Any]) -> ContextSource:
+    detail = data.get("detail")
+    if detail is not None and not isinstance(detail, str):
+        msg = "source detail must be a string or null"
+        raise TypeError(msg)
+    return ContextSource(
+        origin=TrustClass(_required_str(data, "origin")),
+        reference=_required_str(data, "reference"),
+        detail=detail if isinstance(detail, str) else "",
+    )
+
+
 def _construct_budget_debited(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return BudgetDebited(**base, usage=_usage(_required_object(data, "usage")))
 
@@ -306,6 +360,7 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "VerificationPassed": _construct_verification_passed,
     "VerificationFailed": _construct_verification_failed,
     "ReflectionRecorded": _construct_reflection_recorded,
+    "ContextAssembled": _construct_context_assembled,
     "BudgetDebited": _construct_budget_debited,
     "ApprovalRequested": _construct_approval_requested,
     "ApprovalGranted": _construct_approval_granted,

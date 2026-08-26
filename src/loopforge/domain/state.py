@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ContextItemSnapshot
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
@@ -12,6 +13,7 @@ from loopforge.domain.events import (
     ApprovalRequested,
     BudgetDebited,
     CircuitOpened,
+    ContextAssembled,
     Event,
     PlanCreated,
     ReflectionRecorded,
@@ -61,6 +63,7 @@ class RunState:
     best_verification_score: float | None = None
     consecutive_no_progress: int = 0
     last_reflection: str | None = None
+    last_context_items: tuple[ContextItemSnapshot, ...] | None = None
     tool_failure_streaks: tuple[ToolFailureStreak, ...] = ()
     open_circuit_tools: tuple[str, ...] = ()
     cost_usd: float = 0.0
@@ -97,6 +100,7 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
     VerificationPassed: {RunStatus.VERIFYING},
     VerificationFailed: {RunStatus.VERIFYING},
     ReflectionRecorded: {RunStatus.REFLECTING},
+    ContextAssembled: {RunStatus.READY},
     BudgetDebited: {
         RunStatus.PLANNING,
         RunStatus.READY,
@@ -298,6 +302,8 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             )
         case ReflectionRecorded(reflection=reflection):
             return replace(base, last_reflection=reflection, status=RunStatus.REFLECTING)
+        case ContextAssembled(context_items=context_items):
+            return replace(base, last_context_items=context_items)
         case BudgetDebited(usage=usage):
             return replace(
                 base,

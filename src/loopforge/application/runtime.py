@@ -6,12 +6,14 @@ from datetime import datetime
 from uuid import uuid4
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ModelContext, snapshot_of
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
     ActionRejected,
     BudgetDebited,
     CircuitOpened,
+    ContextAssembled,
     Event,
     PlanCreated,
     RetryScheduled,
@@ -32,6 +34,7 @@ from loopforge.domain.state import RunState, replay
 from loopforge.domain.tooling import IdempotencyClass, SideEffectClass, ToolMetadata
 from loopforge.domain.types import ActionId, EventId, RunId, RunStatus, StopReason, UsageDelta
 from loopforge.ports.clock import ClockPort, SleeperPort
+from loopforge.ports.context import ContextBuilderPort, ContextContractError
 from loopforge.ports.model import ModelContractError, ModelPort, ModelTurn
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.tools import (
@@ -63,6 +66,7 @@ class Runtime:
     control: ControlPolicy
     permissions: PermissionPolicy
     reliability: ReliabilityPolicy
+    context: ContextBuilderPort
     clock: ClockPort
     sleeper: SleeperPort
 
@@ -126,7 +130,26 @@ class Runtime:
                 self._stop(run_id, decision.stop_reason, decision.reason_code)
                 return self.state_for(run_id)
 
-            turn = self.model.propose_action(current)
+            model_context = self.context.build_context(current)
+            # Boundary validation is intentional: adapters may violate port return types.
+            if not isinstance(model_context, ModelContext):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg_12 = (
+                    f"context builder returned {type(model_context).__name__}, "
+                    "expected ModelContext"
+                )
+                raise ContextContractError(msg_12)
+            self._persist(
+                run_id,
+                lambda event_id, rid, occurred_at, sequence, ctx=model_context: ContextAssembled(
+                    event_id=event_id,
+                    run_id=rid,
+                    occurred_at=occurred_at,
+                    sequence=sequence,
+                    context_items=tuple(snapshot_of(item) for item in ctx.items),
+                ),
+            )
+
+            turn = self.model.propose_action(model_context)
             # Boundary validation is intentional: adapters may violate port return types.
             if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
                 msg_7 = f"model adapter returned {type(turn).__name__}, expected ModelTurn"

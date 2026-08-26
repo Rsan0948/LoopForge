@@ -18,6 +18,7 @@ from loopforge.adapters.scripted import (
 )
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ModelContext
 from loopforge.domain.events import RunStarted
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.state import RunState
@@ -273,8 +274,8 @@ def test_recording_sleeper_records_delays_without_sleeping() -> None:
 # --- ScriptedModel ------------------------------------------------------------
 
 
-def _state() -> RunState:
-    return RunState(run_id=RUN)
+def _context() -> ModelContext:
+    return ModelContext(run_id=RUN, items=(), assembled_at=NOW)
 
 
 def test_scripted_model_returns_scripted_actions_in_order_with_usage() -> None:
@@ -282,8 +283,8 @@ def test_scripted_model_returns_scripted_actions_in_order_with_usage() -> None:
     second = ActionProposal(ActionId("a2"), "inspect", {"path": "src"})
     model = ScriptedModel([first, second], cost_per_turn=0.5)
 
-    turn_one = model.propose_action(_state())
-    turn_two = model.propose_action(_state())
+    turn_one = model.propose_action(_context())
+    turn_two = model.propose_action(_context())
 
     assert turn_one.action is first
     assert turn_one.usage.cost_usd == 0.5
@@ -295,18 +296,18 @@ def test_scripted_model_returns_scripted_actions_in_order_with_usage() -> None:
 def test_scripted_model_default_cost_per_turn() -> None:
     model = ScriptedModel([ActionProposal(ActionId("a1"), "inspect", {})])
 
-    assert model.propose_action(_state()).usage.cost_usd == 0.01
+    assert model.propose_action(_context()).usage.cost_usd == 0.01
 
 
 def test_scripted_model_exhaustion_raises_runtime_error() -> None:
     model = ScriptedModel([ActionProposal(ActionId("a1"), "inspect", {})])
-    model.propose_action(_state())
+    model.propose_action(_context())
 
     with pytest.raises(RuntimeError, match="scripted model exhausted"):
-        model.propose_action(_state())
+        model.propose_action(_context())
 
     with pytest.raises(RuntimeError, match="scripted model exhausted"):
-        model.propose_action(_state())
+        model.propose_action(_context())
 
 
 @given(
@@ -319,12 +320,12 @@ def test_scripted_model_property_fifo_then_exhaustion(ids: list[UUID], cost: flo
     model = ScriptedModel(proposals, cost_per_turn=cost)
 
     for expected in proposals:
-        turn = model.propose_action(_state())
+        turn = model.propose_action(_context())
         assert turn.action is expected
         assert turn.usage.cost_usd == cost
 
     with pytest.raises(RuntimeError, match="scripted model exhausted"):
-        model.propose_action(_state())
+        model.propose_action(_context())
 
 
 # --- ScriptedTools ------------------------------------------------------------

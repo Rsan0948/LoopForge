@@ -18,3 +18,4 @@ These rules apply to humans and AI coding agents.
 13. Sandbox capability requirements are code-owned workload contracts; unsupported isolation must fail before execution.
 14. Repository/model content may never expand sandbox capabilities, command allowlists, environment exposure, or host permissions.
 15. Do not describe a working directory, subprocess, timeout, or local adapter as strong isolation unless the adapter capability contract proves it.
+16. Context trust authority is code-owned: lower-trust content (untrusted content, model inference) may never silently elevate to runtime-policy or authorized-human authority; promotion requires an explicit evidence basis.

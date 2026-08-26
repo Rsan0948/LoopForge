@@ -4,6 +4,7 @@ from collections import deque
 from datetime import datetime
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context import ModelContext
 from loopforge.domain.state import RunState
 from loopforge.domain.tooling import ToolMetadata
 from loopforge.domain.types import UsageDelta
@@ -17,8 +18,8 @@ class ScriptedModel:
         self._actions = deque(actions)
         self._cost_per_turn = cost_per_turn
 
-    def propose_action(self, state: RunState) -> ModelTurn:
-        del state
+    def propose_action(self, context: ModelContext) -> ModelTurn:
+        del context
         if not self._actions:
             msg = "scripted model exhausted"
             raise RuntimeError(msg)

@@ -2,6 +2,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
+from loopforge.adapters.context import BasicContextBuilder
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import (
@@ -107,6 +108,7 @@ def test_ambiguous_remote_success_retries_with_same_key_without_duplicate_side_e
         reliability=ReliabilityPolicy(
             retry=RetrySettings(max_attempts=3, base_delay_seconds=0, max_delay_seconds=0)
         ),
+        context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=sleeper,
     )
@@ -134,6 +136,7 @@ def test_restart_from_ambiguous_keyed_execution_replays_same_attempt_safely(tmp_
         control=ControlPolicy(BudgetLimit(5.0, 10)),
         permissions=PermissionPolicy(frozenset({Permission.EXTERNAL_WRITE})),
         reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(clock),
         clock=clock,
         sleeper=RecordingSleeper(),
     )
@@ -184,6 +187,7 @@ def test_restart_from_ambiguous_keyed_execution_replays_same_attempt_safely(tmp_
         control=ControlPolicy(BudgetLimit(5.0, 10)),
         permissions=PermissionPolicy(frozenset({Permission.EXTERNAL_WRITE})),
         reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(clock),
         clock=clock,
         sleeper=RecordingSleeper(),
     ).resume(run_id)
@@ -232,6 +236,7 @@ def test_circuit_opens_after_consecutive_failures_and_blocks_same_tool() -> None
         reliability=ReliabilityPolicy(
             retry=RetrySettings(max_attempts=1), circuit_failure_threshold=2
         ),
+        context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
     )
@@ -269,6 +274,7 @@ def test_repeated_non_improving_verification_stops_as_stalled() -> None:
         control=ControlPolicy(BudgetLimit(5.0, 10), no_progress_limit=2),
         permissions=PermissionPolicy(frozenset({Permission.READ})),
         reliability=ReliabilityPolicy(circuit_failure_threshold=10),
+        context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
     )
@@ -300,6 +306,7 @@ def test_resume_honors_remaining_persisted_retry_backoff(tmp_path: Path) -> None
         control=ControlPolicy(BudgetLimit(5.0, 10)),
         permissions=PermissionPolicy(frozenset({Permission.READ})),
         reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
     )
@@ -376,6 +383,7 @@ def test_resume_honors_remaining_persisted_retry_backoff(tmp_path: Path) -> None
         control=ControlPolicy(BudgetLimit(5.0, 10)),
         permissions=PermissionPolicy(frozenset({Permission.READ})),
         reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=sleeper,
     ).resume(run_id)

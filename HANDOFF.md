@@ -37,7 +37,13 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-005.
+Completed: PACS-001 through PACS-006.
+
+PACS-006 (context authority model, 2026-08-25) added typed/provenance-aware `ContextItem` /
+`ModelContext` artifacts, the guarded trust-elevation path, `ContextBuilderPort`, and the durable
+`ContextAssembled` event; the model boundary now consumes `ModelContext` instead of raw
+`RunState`. See `docs/process/cycles/PACS-006-context-authority-model.md`. (Checkpoint commit
+pending operator action; working tree contains the full PACS-006 diff.)
 
 Recent commits, newest first:
 - `624658d` security: enforce sandbox capability requirements
@@ -49,8 +55,13 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (restoration + hygiene pass, 2026-08-23; superseded the PACS-005
-numbers below, which describe the original pre-restoration build):
+Current checked evidence (PACS-006 + post-cycle hardening pass, 2026-08-25):
+- 805 tests passing, 9 platform-gated skips
+- 96.31% branch-aware coverage
+- ruff format/check, pyright strict, and import-linter all executed and green
+- deterministic demo, compile, architecture DAG checks passing
+
+Historical evidence (restoration + hygiene pass, 2026-08-23):
 - 696 tests passing, 9 platform-gated skips
 - 95.75% branch-aware coverage
 - ruff format/check, pyright strict, and import-linter all executed and green
@@ -71,13 +82,13 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-005-security-sandbox-contract.md`
+- `docs/process/cycles/PACS-006-context-authority-model.md`
 
 ## Next authorized work
 
-None. PACS-006 through PACS-017 are PLANNED, not active.
+None. PACS-007 through PACS-017 are PLANNED, not active.
 
-The operator must manually initiate PACS-006 or another explicitly named scope.
+The operator must manually initiate PACS-007 or another explicitly named scope.
 
 ## Planned path to v1.0
 
