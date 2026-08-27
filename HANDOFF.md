@@ -42,8 +42,7 @@ Completed: PACS-001 through PACS-006.
 PACS-006 (context authority model, 2026-08-25) added typed/provenance-aware `ContextItem` /
 `ModelContext` artifacts, the guarded trust-elevation path, `ContextBuilderPort`, and the durable
 `ContextAssembled` event; the model boundary now consumes `ModelContext` instead of raw
-`RunState`. See `docs/process/cycles/PACS-006-context-authority-model.md`. (Checkpoint commit
-pending operator action; working tree contains the full PACS-006 diff.)
+`RunState`. See `docs/process/cycles/PACS-006-context-authority-model.md`. Checkpoint commit: `10ee331`.
 
 Recent commits, newest first:
 - `624658d` security: enforce sandbox capability requirements
