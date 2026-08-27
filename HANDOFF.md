@@ -48,8 +48,7 @@ workload). It composes `ConstrainedLocalSandbox` for the file API (defenses unch
 advertises `process_filesystem_isolated=True`/`network_isolated=True` while keeping
 `kernel_isolated=False`, and proves fail-closed capability negotiation in both directions. Live
 isolation tests are capability-gated so deterministic CI passes daemon-free. See
-`docs/process/cycles/PACS-009-hardened-container-sandbox.md` and ADR-0009. Checkpoint commit:
-not yet committed at handoff write time (awaiting operator confirmation).
+`docs/process/cycles/PACS-009-hardened-container-sandbox.md` and ADR-0009. Checkpoint commit: `e3963e5` (includes the operator-initiated post-cycle hardening pass).
 
 PACS-008 (observability foundation, 2026-08-27) added an OpenTelemetry-compatible telemetry
 vocabulary and data model, a `TelemetryPort` with a fail-safe emission boundary, deterministic
