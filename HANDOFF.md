@@ -48,8 +48,7 @@ attempt/verification), token/cost/cache accounting, OTLP/JSON converters proven 
 `TelemetrySandbox` span decorator. Telemetry is a non-authoritative projection: it is emitted
 only after durable appends, never feeds back into runtime decisions, and adapter failures
 cannot corrupt run state. See
-`docs/process/cycles/PACS-008-observability-foundation.md`. Checkpoint commit: pending
-operator-confirmed commit at tip `596acb3` + this diff.
+`docs/process/cycles/PACS-008-observability-foundation.md`. Checkpoint commit: `a4e1bea`.
 
 PACS-007 (context lifecycle and prompt contracts, 2026-08-27) added deterministic context
 selection with hard token budgeting, explicit per-item accounting, preservation contracts,
