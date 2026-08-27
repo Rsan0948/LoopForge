@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 import signal
 import subprocess
@@ -39,8 +40,8 @@ class SandboxLimits:
             self.max_memory_bytes,
             self.max_open_files,
         )
-        if min(values) <= 0:
-            msg = "sandbox limits must be positive"
+        if not all(map(math.isfinite, values)) or min(values) <= 0:
+            msg = "sandbox limits must be positive and finite"
             raise ValueError(msg)
 
 
@@ -59,8 +60,13 @@ class CommandSpec:
         if not Path(self.argv[0]).is_absolute():
             msg_3 = "sandbox command executable must be an absolute path"
             raise ValueError(msg_3)
-        if self.timeout_seconds <= 0 or self.cpu_seconds <= 0:
-            msg_4 = "command time limits must be positive"
+        if (
+            not math.isfinite(self.timeout_seconds)
+            or not math.isfinite(self.cpu_seconds)
+            or self.timeout_seconds <= 0
+            or self.cpu_seconds <= 0
+        ):
+            msg_4 = "command time limits must be positive and finite"
             raise ValueError(msg_4)
         if not self.allowed_exit_codes:
             msg_5 = "allowed_exit_codes cannot be empty"
@@ -117,6 +123,11 @@ class ConstrainedLocalSandbox:
     def capabilities(self) -> SandboxCapabilities:
         return self._CAPABILITIES
 
+    @property
+    def root(self) -> Path:
+        """Resolved workspace root this sandbox is confined to."""
+        return self._root
+
     def read_text(self, relative_path: str) -> str:
         path = self._safe_path(relative_path, allow_missing=False)
         if not path.is_file():
@@ -157,6 +168,12 @@ class ConstrainedLocalSandbox:
         except KeyError as exc:
             msg_16 = f"command is not allowlisted: {command_name}"
             raise SandboxPolicyError(msg_16) from exc
+        effective_timeout = spec.timeout_seconds
+        if timeout_seconds is not None:
+            if not math.isfinite(timeout_seconds) or timeout_seconds <= 0:
+                msg_20 = "runtime timeout must be positive and finite"
+                raise SandboxPolicyError(msg_20)
+            effective_timeout = min(effective_timeout, timeout_seconds)
 
         with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
             launcher = Path(__file__).with_name("_sandbox_exec.py")
@@ -181,12 +198,6 @@ class ConstrainedLocalSandbox:
                 start_new_session=True,
                 close_fds=True,
             )
-            effective_timeout = spec.timeout_seconds
-            if timeout_seconds is not None:
-                if timeout_seconds <= 0:
-                    msg_20 = "runtime timeout must be positive"
-                    raise SandboxPolicyError(msg_20)
-                effective_timeout = min(effective_timeout, timeout_seconds)
             try:
                 process.wait(timeout=effective_timeout)
             except subprocess.TimeoutExpired as exc:

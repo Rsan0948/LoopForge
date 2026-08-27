@@ -49,3 +49,35 @@ The PACS-003 reliability policy remains authoritative about whether a retry is p
 hardened userspace contract for local trusted commands but advertises no network, child-filesystem, or
 kernel isolation. A future container/VM adapter must implement the same port and advertise stronger
 capabilities only when they are actually enforced.
+
+## Container adapter boundary (PACS-009)
+
+`ContainerSandbox` (`adapters/container_sandbox.py`) implements the same port for untrusted
+repository/build workloads. Commands execute inside hardened Docker containers driven through the
+Docker CLI (`shell=False`, zero new dependencies, auditable argv):
+
+- only the configured workspace is bind-mounted (at `/workspace`); the container root filesystem is
+  read-only and `/tmp` is a size-bounded `noexec,nosuid` tmpfs;
+- the only supported `ContainerNetworkPolicy` is deny-all (`--network none`); egress allowlists are a
+  future code-owned extension;
+- `--cap-drop ALL`, `--security-opt no-new-privileges`, `--init`, `--pull never`, `--log-driver none`;
+- memory/swap (pinned equal), pids, CPU-seconds, and open-file limits are enforced by the container
+  runtime; captured stdout/stderr stay adapter-bounded;
+- wall-clock timeout kills the named container, destroying its PID namespace so no child workload
+  survives; `destroy()`/context-manager exit kills any in-flight container; Docker CLI failures
+  (exit 125 with the `docker:` marker) surface as `SandboxError`, never as workload exit codes;
+- the environment is explicit (`--env` pairs from the code-owned mapping); the host process
+  environment is never inherited.
+
+The file API (`read_text`/`write_text`) delegates to a composed `ConstrainedLocalSandbox`, so the
+traversal/symlink/byte-limit defenses are identical to the local adapter. `ContainerSandboxConfig`
+is frozen and validated at construction: image, command allowlist, environment, network policy,
+resource ceilings, and the Docker executable are bootstrap authority that repository or model
+content can never widen (AGENTS.md rule 14).
+
+The adapter advertises `process_filesystem_isolated=True` and `network_isolated=True` because it
+enforces them, and keeps `kernel_isolated=False`: containers share a kernel with the runtime host,
+and the Docker Desktop Linux VM is an implementation detail, not an enforced contract. Workloads
+requiring kernel isolation still fail closed against this adapter. Live isolation behavior is
+demonstrated by capability-gated security tests that skip with reason codes when no Docker daemon
+or pinned test image is available, keeping deterministic CI hermetic (ADR-0009).

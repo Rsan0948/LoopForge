@@ -37,7 +37,19 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-008.
+Completed: PACS-001 through PACS-009.
+
+PACS-009 (hardened container sandbox, 2026-08-27) added `ContainerSandbox`: a Docker-CLI-driven
+`SandboxPort` adapter that executes untrusted repository/build workloads in hardened containers
+(workspace-only bind mount, read-only rootfs, deny-all network policy, dropped capabilities,
+`no-new-privileges`, memory/pids/CPU/nofile/tmpfs limits, explicit environment filtering, bounded
+output, PID-namespace-destroying timeout kills, and `destroy()` that leaves no running child
+workload). It composes `ConstrainedLocalSandbox` for the file API (defenses unchanged), honestly
+advertises `process_filesystem_isolated=True`/`network_isolated=True` while keeping
+`kernel_isolated=False`, and proves fail-closed capability negotiation in both directions. Live
+isolation tests are capability-gated so deterministic CI passes daemon-free. See
+`docs/process/cycles/PACS-009-hardened-container-sandbox.md` and ADR-0009. Checkpoint commit:
+not yet committed at handoff write time (awaiting operator confirmation).
 
 PACS-008 (observability foundation, 2026-08-27) added an OpenTelemetry-compatible telemetry
 vocabulary and data model, a `TelemetryPort` with a fail-safe emission boundary, deterministic
@@ -71,7 +83,17 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-008, 2026-08-27):
+Current checked evidence (PACS-009 + post-cycle hardening pass, 2026-08-27):
+- 1091 tests passing, 9 platform-gated skips (13 live container tests executed against a real
+  Docker runtime; daemon-free run skips them with reason codes and stays green)
+- 97.86% branch-aware coverage (`adapters/container_sandbox.py` at 100%)
+- ruff format/check, pyright strict, and import-linter all executed and green
+- deterministic demo with correlated telemetry narrative, compile, architecture DAG checks passing
+- post-cycle hardening fixed and pinned: raw `OSError` from a missing Docker binary, the
+  kill-before-start race (now a bounded retry loop), comma-containing workspace roots corrupting
+  `--mount` parsing, and NaN/Infinity bypass of timeout/limit validation in both sandbox adapters
+
+Historical evidence (PACS-008, 2026-08-27):
 - 1013 tests passing, 9 platform-gated skips
 - 97.73% branch-aware coverage
 - ruff format/check, pyright strict, and import-linter all executed and green
@@ -110,13 +132,13 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-008-observability-foundation.md`
+- `docs/process/cycles/PACS-009-hardened-container-sandbox.md`
 
 ## Next authorized work
 
-None. PACS-009 through PACS-017 are PLANNED, not active.
+None. PACS-010 through PACS-017 are PLANNED, not active.
 
-The operator must manually initiate PACS-009 or another explicitly named scope.
+The operator must manually initiate PACS-010 or another explicitly named scope.
 
 ## Planned path to v1.0
 

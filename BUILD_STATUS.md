@@ -1,4 +1,70 @@
-# Build status — PACS-008 complete
+# Build status — PACS-009 complete
+
+PACS-009 establishes the hardened container sandbox: `ContainerSandbox`, a `SandboxPort` adapter
+that executes allowlisted commands inside hardened Docker containers via the Docker CLI (zero new
+dependencies, auditable argv). Workloads run with only the workspace bind-mounted (`/workspace`),
+a read-only rootfs, size-bounded noexec/nosuid tmpfs, deny-all networking (`ContainerNetworkPolicy`
+`NONE`), dropped capabilities, `no-new-privileges`, memory/swap/pids/CPU/nofile limits, explicit
+`--env` filtering (host environment never inherited), bounded captured output, and wall-clock
+timeouts that kill the named container — destroying its PID namespace so no child workload
+survives; `destroy()`/context-manager exit guarantees the same. The file API composes
+`ConstrainedLocalSandbox`, retaining its traversal/symlink/byte-limit defenses unchanged. The
+adapter truthfully advertises `process_filesystem_isolated=True` and `network_isolated=True`
+(enforced on every run) and keeps `kernel_isolated=False` (shared-kernel containers; no VM-grade
+claim), so network-isolation workloads bind here but not to the local adapter, and
+kernel-isolation requirements fail closed against both. Live isolation evidence is
+capability-gated (`_REQUIRES_DOCKER` probe with reason-coded skips), keeping deterministic CI
+hermetic without a daemon. See `docs/process/cycles/PACS-009-hardened-container-sandbox.md` and
+ADR-0009. No subsequent PACS cycle is active until manually initiated.
+
+Verified in this environment (2026-08-27, Docker Desktop 29.2.1 live; includes post-cycle
+hardening pass):
+
+- `uv run pytest -q --cov` — **1091 passing, 9 skipped** (skips are the pre-existing macOS
+  `RLIMIT_AS` platform gates; all 13 live container tests executed against the real runtime)
+- branch-aware coverage — **97.86% overall**; configured 90% gate satisfied;
+  `adapters/container_sandbox.py` at 100% branch coverage
+- hermetic-CI proof — with no `docker` on `PATH`: 1078 passing, 22 reason-coded skips
+- `ruff format --check .` / `ruff check .` — clean (103 files)
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- deterministic CLI demo — `status=succeeded` with the correlated telemetry narrative
+- `compileall` — clean
+
+Post-cycle hardening fixed and pinned (operator-initiated; see
+`tests/regression/test_hardening_regressions.py` and `tests/security/test_container_sandbox.py`):
+missing/unexecutable Docker binary leaked a raw `OSError` instead of `SandboxError`; a wall
+timeout firing during container startup could miss a single-shot `docker kill` and leave the
+workload running unsupervised (kill is now retried on a bounded deadline until the container
+dies or the CLI exits); a comma in the resolved workspace root silently corrupted `--mount`
+bind parsing (now rejected); and non-finite (NaN/Infinity) values bypassed `<= 0` validation in
+`CommandSpec`, `SandboxLimits`, `ContainerSandboxConfig`, and both adapters' runtime timeout
+(Infinity would have silently disabled the wall timeout) — the local adapter also now validates
+the runtime timeout before spawning instead of after.
+
+## Implemented through PACS-009
+
+- `ContainerSandbox` + frozen validated `ContainerSandboxConfig` (image/allowlist/environment/
+  network policy/resource ceilings are bootstrap authority; invalid configs unconstructable;
+  injection-safe environment variable names enforced)
+- hardened `docker run` argv: `--rm --init --pull never --network none --read-only --cap-drop ALL
+  --security-opt no-new-privileges --log-driver none`, workspace-only bind mount, bounded tmpfs,
+  memory/swap/pids/CPU/nofile limits, sorted explicit `--env` pairs
+- structural cleanup: timeout kills the named container (PID namespace destroyed), stubborn CLI
+  process group SIGKILLed as client-side fallback; `destroy()`/`__exit__` kill in-flight
+  containers; Docker CLI failures (exit 125 + `docker:` marker) surface as `SandboxError`, never
+  confusable with workload exit codes
+- capability negotiation proven in both directions: fail-closed binding for network/filesystem
+  isolation against the local adapter, fail-closed kernel-isolation requirements against the
+  container adapter; `TelemetrySandbox` wrapping preserves the stronger capability report
+- `tests/security/test_container_sandbox.py` — 50 tests: constructor/config validation, exact
+  capability profile, file-API defenses, deterministic argv pin, daemon-free plumbing fakes
+  (timeout→kill, CLI failure, destroy, stubborn-CLI fallback), and 13 live gated tests
+  demonstrating escape resistance, network denial, environment filtering, external
+  timeout/CPU/pids/memory/tmpfs enforcement, bounded output, exit-code mapping, missing-image
+  failure, and no-survivor destruction
+
+# Historical: PACS-008 complete
 
 PACS-008 establishes the observability foundation: an OpenTelemetry-compatible telemetry
 vocabulary (`Span`/`LogRecord`/`MetricSample`, closed `SpanName`/`MetricName` vocabularies,

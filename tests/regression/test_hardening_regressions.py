@@ -18,6 +18,7 @@ from typing import BinaryIO
 import pytest
 
 from loopforge.adapters import _sandbox_exec
+from loopforge.adapters.container_sandbox import ContainerSandbox, ContainerSandboxConfig
 from loopforge.adapters.context import (
     BasicContextBuilder,
     BudgetedContextBuilder,
@@ -27,7 +28,11 @@ from loopforge.adapters.json_events import (
     JsonEventCodec,
     UnsupportedEventSchemaError,
 )
-from loopforge.adapters.local_sandbox import CommandSpec, ConstrainedLocalSandbox
+from loopforge.adapters.local_sandbox import (
+    CommandSpec,
+    ConstrainedLocalSandbox,
+    SandboxLimits,
+)
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import (
     FixedClock,
@@ -92,7 +97,11 @@ from loopforge.domain.types import (
     UsageDelta,
 )
 from loopforge.ports.context import ContextContractError
-from loopforge.ports.sandbox import SandboxError
+from loopforge.ports.sandbox import (
+    SandboxError,
+    SandboxPathError,
+    SandboxPolicyError,
+)
 from loopforge.ports.tools import ToolExecutionRequest
 
 NOW = datetime(2026, 1, 1, tzinfo=UTC)
@@ -758,3 +767,97 @@ def test_stable_only_template_renders_items_as_dynamic_suffix() -> None:
 def test_chars_per_token_counter_rejects_negative_granularity() -> None:
     with pytest.raises(ValueError, match="chars_per_token must be positive"):
         CharsPerTokenCounter(-1)
+
+
+# --- PACS-009 post-cycle hardening: sandbox finite-value and runtime-failure pins ---
+
+
+def _cs_config(**changes: object) -> ContainerSandboxConfig:
+    base = ContainerSandboxConfig(
+        image="alpine:3.21",
+        commands=(CommandSpec(name="true", argv=("/bin/true",), timeout_seconds=5.0),),
+    )
+    return replace(base, **changes)
+
+
+# Defect: NaN bypasses `<= 0` validation (comparisons are False), and an infinite
+# wall-clock timeout would silently disable timeout enforcement.
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_command_spec_rejects_non_finite_timeout(bad: float) -> None:
+    with pytest.raises(ValueError, match="command time limits must be positive and finite"):
+        CommandSpec(name="x", argv=("/bin/true",), timeout_seconds=bad)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_command_spec_rejects_non_finite_cpu_seconds(bad: float) -> None:
+    with pytest.raises(ValueError, match="command time limits must be positive and finite"):
+        CommandSpec(
+            name="x",
+            argv=("/bin/true",),
+            timeout_seconds=5.0,
+            cpu_seconds=bad,  # pyright: ignore[reportArgumentType]  # intentional invalid type
+        )
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_sandbox_limits_reject_non_finite_values(bad: float) -> None:
+    with pytest.raises(ValueError, match="sandbox limits must be positive and finite"):
+        SandboxLimits(
+            max_output_bytes=bad  # pyright: ignore[reportArgumentType]  # intentional invalid type
+        )
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_local_run_rejects_non_finite_runtime_timeout_before_spawning(
+    tmp_path: Path, bad: float
+) -> None:
+    sandbox = ConstrainedLocalSandbox(
+        tmp_path,
+        commands=[CommandSpec(name="true", argv=("/bin/true",), timeout_seconds=5.0)],
+    )
+    with pytest.raises(SandboxPolicyError, match="runtime timeout must be positive and finite"):
+        sandbox.run("true", timeout_seconds=bad)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_container_run_rejects_non_finite_runtime_timeout(tmp_path: Path, bad: float) -> None:
+    sandbox = ContainerSandbox(tmp_path, config=_cs_config())
+    with pytest.raises(SandboxPolicyError, match="runtime timeout must be positive and finite"):
+        sandbox.run("true", timeout_seconds=bad)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_container_config_rejects_non_finite_pids_limit(bad: float) -> None:
+    with pytest.raises(ValueError, match="container pids/tmpfs limits must be positive and finite"):
+        _cs_config(pids_limit=bad)
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf])
+def test_container_config_rejects_non_finite_tmpfs_bytes(bad: float) -> None:
+    with pytest.raises(ValueError, match="container pids/tmpfs limits must be positive and finite"):
+        _cs_config(tmpfs_bytes=bad)
+
+
+# Defect: a missing/unexecutable docker binary leaked a raw FileNotFoundError from
+# subprocess.Popen instead of the SandboxError the port contract requires.
+
+
+def test_missing_docker_executable_raises_sandbox_error_not_oserror(tmp_path: Path) -> None:
+    sandbox = ContainerSandbox(
+        tmp_path, config=_cs_config(docker_executable="/definitely/missing/docker")
+    )
+    with pytest.raises(SandboxError, match="container runtime failed to start"):
+        sandbox.run("true")
+
+
+# Defect: a comma in the resolved workspace root silently corrupts `--mount`
+# type=bind CSV parsing; the root is now rejected at construction.
+
+
+def test_container_sandbox_rejects_comma_in_workspace_root(tmp_path: Path) -> None:
+    root = tmp_path / "comma,dir"
+    root.mkdir()
+    with pytest.raises(SandboxPathError, match="must not contain"):
+        ContainerSandbox(root, config=_cs_config())
