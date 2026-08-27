@@ -43,7 +43,7 @@ PACS-007 (context lifecycle and prompt contracts, 2026-08-27) added deterministi
 selection with hard token budgeting, explicit per-item accounting, preservation contracts,
 structured compaction/pruning, role-specific assembly (`ModelRole`), and versioned prompt
 templates whose id/version are persisted on every `ContextAssembled` event. See
-`docs/process/cycles/PACS-007-context-lifecycle-and-prompt-contracts.md`.
+`docs/process/cycles/PACS-007-context-lifecycle-and-prompt-contracts.md`. Checkpoint commit: `1dcad71`.
 
 PACS-006 (context authority model, 2026-08-25) added typed/provenance-aware `ContextItem` /
 `ModelContext` artifacts, the guarded trust-elevation path, `ContextBuilderPort`, and the durable
