@@ -6,14 +6,17 @@ from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCoun
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
+from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
+from loopforge.domain.telemetry import LogRecord, MetricSample, Span, TelemetryRecord
 from loopforge.domain.tooling import (
     ApprovalClass,
+    DataSensitivity,
     IdempotencyClass,
     RetryClass,
     SideEffectClass,
@@ -28,6 +31,7 @@ def _metadata(
     *,
     risk: RiskLevel,
     side_effect: SideEffectClass,
+    sensitivity: DataSensitivity = DataSensitivity.INTERNAL,
 ) -> ToolMetadata:
     required_permission = {
         RiskLevel.READ_ONLY: Permission.READ,
@@ -44,10 +48,56 @@ def _metadata(
         idempotency=IdempotencyClass.NATURAL,
         approval=ApprovalClass.NONE,
         timeout_seconds=5.0,
+        sensitivity=sensitivity,
     )
 
 
+def _format_attributes(record: Span | LogRecord | MetricSample) -> str:
+    if not record.attributes:
+        return "-"
+    return " ".join(f"{key}={value}" for key, value in record.attributes.items())
+
+
+def format_telemetry_narrative(records: tuple[TelemetryRecord, ...]) -> str:
+    """Render the recorded telemetry as a causally correlated trace/log narrative.
+
+    The narrative is a human-readable view of the non-authoritative telemetry
+    projection: spans nest under the run root by parent id, and logs/metrics
+    carry the same run/cycle/action/verification correlation identifiers.
+    """
+    lines = ["telemetry narrative (non-authoritative projection; event store is authoritative):"]
+    lines.append("trace:")
+    lines.extend(
+        f"  span {record.name} id={record.span_id} "
+        f"parent={record.parent_span_id or '-'} status={record.status.value} "
+        f"cycle={record.correlation.cycle or '-'} "
+        f"action={record.correlation.action_id or '-'} "
+        f"attrs={_format_attributes(record)}"
+        for record in records
+        if isinstance(record, Span)
+    )
+    lines.append("logs:")
+    lines.extend(
+        f"  {record.severity.value} {record.message} "
+        f"run={record.correlation.run_id} cycle={record.correlation.cycle or '-'} "
+        f"action={record.correlation.action_id or '-'} "
+        f"verification={record.correlation.verification_id or '-'} "
+        f"attrs={_format_attributes(record)}"
+        for record in records
+        if isinstance(record, LogRecord)
+    )
+    lines.append("metrics:")
+    lines.extend(
+        f"  {record.name} {record.kind.value}={record.value} "
+        f"cycle={record.correlation.cycle or '-'}"
+        for record in records
+        if isinstance(record, MetricSample)
+    )
+    return "\n".join(lines)
+
+
 def _demo() -> int:
+    telemetry = InMemoryTelemetry()
     runtime = Runtime(
         model=ScriptedModel(
             [
@@ -66,10 +116,14 @@ def _demo() -> int:
                     risk=RiskLevel.READ_ONLY,
                     side_effect=SideEffectClass.READ_ONLY,
                 ),
+                # The fix tool handles sensitive repository content: its
+                # observation must be redacted in telemetry while remaining
+                # intact in the authoritative event store.
                 _metadata(
                     "fix",
                     risk=RiskLevel.LOCAL_WRITE,
                     side_effect=SideEffectClass.LOCAL_WRITE,
+                    sensitivity=DataSensitivity.SENSITIVE,
                 ),
             ],
         ),
@@ -86,12 +140,14 @@ def _demo() -> int:
         ),
         clock=SystemClock(),
         sleeper=SystemSleeper(),
+        telemetry=telemetry,
     )
     state = runtime.run("Repair authentication regression")
     print(
         f"run={state.run_id} status={state.status.value} "
         f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
     )
+    print(format_telemetry_narrative(telemetry.records))
     return 0
 
 

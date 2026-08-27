@@ -9,6 +9,7 @@ RunId = NewType("RunId", str)
 EventId = NewType("EventId", str)
 ActionId = NewType("ActionId", str)
 WorkerId = NewType("WorkerId", str)
+VerificationId = NewType("VerificationId", str)
 ContextItemId = NewType("ContextItemId", str)
 
 

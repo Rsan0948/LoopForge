@@ -27,8 +27,45 @@ def test_demo_command_completes_and_reports_succeeded_run(
     captured = capsys.readouterr()
     assert captured.err == ""
     lines = captured.out.splitlines()
-    assert len(lines) == 1
     assert DEMO_LINE.fullmatch(lines[0]) is not None
+
+
+def test_demo_prints_causally_correlated_telemetry_narrative(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "demo")
+
+    assert main() == 0
+
+    captured = capsys.readouterr()
+    lines = captured.out.splitlines()
+    run_id = DEMO_LINE.fullmatch(lines[0]).group(0).split(" ", 1)[0].removeprefix("run=")  # pyright: ignore[reportOptionalMemberAccess]
+
+    assert "non-authoritative projection; event store is authoritative" in lines[1]
+    sections = [line for line in lines if line in {"trace:", "logs:", "metrics:"}]
+    assert sections == ["trace:", "logs:", "metrics:"]
+
+    span_lines = [line for line in lines if line.startswith("  span ")]
+    # One correlated trace: every span belongs to the demo run, and the run
+    # root span closes the successful run.
+    assert span_lines
+    assert all(f"id={run_id}:span:" in line or f"id={run_id}:span:0" in line for line in span_lines)
+    assert any(
+        line.startswith("  span loopforge.run ") and "status=ok" in line for line in span_lines
+    )
+    assert any("span loopforge.cycle" in line for line in span_lines)
+    assert any("span loopforge.tool.execute" in line and "action=a2" in line for line in span_lines)
+
+    log_lines = [line for line in lines if line.startswith(("  info ", "  debug ", "  warn "))]
+    assert all(f"run={run_id}" in line for line in log_lines)
+    # The sensitive fix tool's observation is redacted before export, while the
+    # internal inspect observation remains visible.
+    assert any("loopforge.tool.observation=[redacted]" in line for line in log_lines)
+    assert any("loopforge.tool.observation=tests still failing" in line for line in log_lines)
+
+    metric_lines = [line for line in lines if line.startswith("  loopforge.")]
+    assert any("loopforge.runs.completed counter=1.0" in line for line in metric_lines)
+    assert any("loopforge.cycles counter=1.0" in line for line in metric_lines)
 
 
 def test_demo_run_ids_are_unique_across_invocations(
@@ -146,4 +183,4 @@ def test_module_main_guard_runs_demo_and_exits_zero(
 
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
-    assert DEMO_LINE.fullmatch(captured.out.strip()) is not None
+    assert DEMO_LINE.fullmatch(captured.out.splitlines()[0]) is not None

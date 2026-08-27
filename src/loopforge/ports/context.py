@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from loopforge.domain.context import ModelContext, ModelRole
-from loopforge.domain.context_lifecycle import ContextTokenBudget
+from loopforge.domain.context_lifecycle import ContextAccounting, ContextTokenBudget
 from loopforge.domain.state import RunState
 
 
@@ -36,3 +36,15 @@ class ContextBuilderPort(Protocol):
         role: ModelRole = ModelRole.CONTROLLER,
         token_budget: ContextTokenBudget | None = None,
     ) -> ModelContext: ...
+
+
+@runtime_checkable
+class ContextAccountingSource(Protocol):
+    """Optional seam for builders that expose per-build budget accounting.
+
+    The runtime uses this to emit context size/compaction telemetry from the
+    accounting ledger without coupling the builder contract to observability.
+    """
+
+    @property
+    def last_accounting(self) -> ContextAccounting | None: ...

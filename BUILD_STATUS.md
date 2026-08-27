@@ -1,4 +1,50 @@
-# Build status — PACS-007 complete
+# Build status — PACS-008 complete
+
+PACS-008 establishes the observability foundation: an OpenTelemetry-compatible telemetry
+vocabulary (`Span`/`LogRecord`/`MetricSample`, closed `SpanName`/`MetricName` vocabularies,
+`CorrelationIds` for run/worker/cycle/action/tool/attempt/verification), a `TelemetryPort`
+protocol with a fail-safe emission boundary, and runtime instrumentation that projects spans
+for policy decisions, context builds, model turns, tool execution, verification, persistence,
+retry, and the root run — plus structured logs and metrics for runs, duration, outcomes,
+cycles, retries, circuits, stalls, budget stops, tool failures, verification failures, context
+size/compaction, approvals, and token/cost/cache usage. Redaction is code-owned and happens
+before emission (SENSITIVE/SECRET → `[redacted]`, fail-closed for unknown sensitivity); the
+event store remains the only authoritative history and telemetry never feeds back into runtime
+state or decisions; adapter failures are swallowed and counted, never corrupting run state.
+No subsequent PACS cycle is active until manually initiated.
+
+Verified in this environment (2026-08-27):
+
+- `uv run pytest -q --cov` — **1013 passing, 9 skipped** (macOS `RLIMIT_AS` platform-gated skips)
+- branch-aware coverage — **97.73% overall**; configured 90% gate satisfied; `domain/telemetry.py`,
+  `ports/telemetry.py`, and `adapters/telemetry.py` at 100% branch coverage
+- `ruff format --check .` / `ruff check .` — clean
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- deterministic CLI demo — `status=succeeded` plus a causally correlated trace/log/metric
+  narrative with `[redacted]` on the sensitive tool observation
+- `compileall` — clean
+
+## Implemented through PACS-008
+
+- OTel-compatible telemetry data model with zero new dependencies; OTLP/JSON-shaped converters
+  (`to_otlp_span`/`to_otlp_metric`/`to_otlp_log`) prove wire compatibility offline and reject
+  unredacted `SensitiveText`
+- `TelemetryPort` + `FailSafeTelemetry` boundary: pre-emission redaction, exception
+  containment with a `dropped_records` counter; `NoOpTelemetry` and deterministic
+  `InMemoryTelemetry` adapters
+- deterministic per-run traces: trace id = run id, root run span emitted once at terminal stop
+  with stop-reason-derived status, cycle spans parenting operation spans, per-run monotonic
+  span ids; verification correlation ids derived from the authoritative event sequence
+- event projector mapping all 18 domain event types to structured logs and the full required
+  metric set; context size/compaction gauges/counters from the
+  `ContextAccountingSource.last_accounting` seam (PACS-007)
+- `TelemetrySandbox` decorator emitting sandbox-execution spans (fail-safe, standalone or
+  run-correlated)
+- CLI demo narrative (`format_telemetry_narrative`) demonstrating causal correlation and
+  pre-export redaction against the authoritative event store
+
+# Historical: PACS-007 complete
 
 PACS-007 establishes the context lifecycle and prompt contracts: deterministic context selection
 with a hard token budget, explicit per-item budget accounting, preservation contracts for

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
 
+from loopforge.application.telemetry import RuntimeTelemetry
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext, snapshot_of
 from loopforge.domain.events import (
@@ -31,12 +32,22 @@ from loopforge.domain.reliability import (
     idempotency_key_for,
 )
 from loopforge.domain.state import RunState, replay
+from loopforge.domain.telemetry import SpanName, SpanStatusCode
 from loopforge.domain.tooling import IdempotencyClass, SideEffectClass, ToolMetadata
-from loopforge.domain.types import ActionId, EventId, RunId, RunStatus, StopReason, UsageDelta
+from loopforge.domain.types import (
+    ActionId,
+    EventId,
+    RunId,
+    RunStatus,
+    StopReason,
+    UsageDelta,
+    VerificationId,
+)
 from loopforge.ports.clock import ClockPort, SleeperPort
 from loopforge.ports.context import ContextBuilderPort, ContextContractError
 from loopforge.ports.model import ModelContractError, ModelPort, ModelTurn
 from loopforge.ports.state_store import StateStorePort
+from loopforge.ports.telemetry import TelemetryPort
 from loopforge.ports.tools import (
     ToolContractError,
     ToolExecutionRequest,
@@ -69,6 +80,14 @@ class Runtime:
     context: ContextBuilderPort
     clock: ClockPort
     sleeper: SleeperPort
+    telemetry: TelemetryPort | None = None
+    _telemetry: RuntimeTelemetry = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # Telemetry is optional and always fail-safe: when no adapter is wired
+        # the runtime emits into a no-op sink, and adapter failures can never
+        # corrupt run state or change run outcomes.
+        self._telemetry = RuntimeTelemetry(self.telemetry, self.clock)
 
     def run(self, objective: str) -> RunState:
         run_id = self.start(objective)
@@ -122,126 +141,169 @@ class Runtime:
             )
         return self._drive(run_id)
 
-    def _drive(self, run_id: RunId) -> RunState:
+    def _drive(self, run_id: RunId) -> RunState:  # noqa: PLR0912, PLR0915 - the drive loop is intentionally one flat orchestration of the authorized cycle; span instrumentation pushes it over the thresholds
         while True:
             current = self.state_for(run_id)
-            decision = self.control.evaluate(current, now=self.clock.now())
-            if decision.stop_reason is not None:
-                self._stop(run_id, decision.stop_reason, decision.reason_code)
-                return self.state_for(run_id)
-
-            model_context = self.context.build_context(current)
-            # Boundary validation is intentional: adapters may violate port return types.
-            if not isinstance(model_context, ModelContext):  # pyright: ignore[reportUnnecessaryIsInstance]
-                msg_12 = (
-                    f"context builder returned {type(model_context).__name__}, "
-                    "expected ModelContext"
-                )
-                raise ContextContractError(msg_12)
-            if model_context.run_id != run_id:
-                msg_13 = (
-                    f"context builder assembled context for run {model_context.run_id}, "
-                    f"expected {run_id}"
-                )
-                raise ContextContractError(msg_13)
-            self._persist(
+            cycle = current.iteration + 1
+            self._telemetry.set_cycle(cycle)
+            with self._telemetry.span(
                 run_id,
-                lambda event_id, rid, occurred_at, sequence, ctx=model_context: ContextAssembled(
-                    event_id=event_id,
-                    run_id=rid,
-                    occurred_at=occurred_at,
-                    sequence=sequence,
-                    context_items=tuple(snapshot_of(item) for item in ctx.items),
-                    prompt_template_id=(
-                        ctx.prompt_template.template_id if ctx.prompt_template is not None else None
-                    ),
-                    prompt_template_version=(
-                        ctx.prompt_template.version if ctx.prompt_template is not None else None
-                    ),
-                ),
-            )
-
-            turn = self.model.propose_action(model_context)
-            # Boundary validation is intentional: adapters may violate port return types.
-            if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
-                msg_7 = f"model adapter returned {type(turn).__name__}, expected ModelTurn"
-                raise ModelContractError(msg_7)
-            if not isinstance(turn.action, ActionProposal) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                turn.usage, UsageDelta
+                name=SpanName.CYCLE,
+                attributes={"loopforge.cycle": cycle},
             ):
-                msg_8 = "model turn contains invalid action or usage payload"
-                raise ModelContractError(msg_8)
-            self._persist(
-                run_id,
-                lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
-                    event_id=event_id,
-                    run_id=rid,
-                    occurred_at=occurred_at,
-                    sequence=sequence,
-                    usage=usage,
-                ),
-            )
+                with self._telemetry.span(run_id, name=SpanName.POLICY_DECISION) as policy_span:
+                    decision = self.control.evaluate(current, now=self.clock.now())
+                    policy_span.attributes["loopforge.policy.kind"] = decision.kind.value
+                    policy_span.attributes["loopforge.policy.reason_code"] = decision.reason_code
+                if decision.stop_reason is not None:
+                    self._stop(run_id, decision.stop_reason, decision.reason_code)
+                    return self.state_for(run_id)
 
-            after_debit = self.state_for(run_id)
-            budget_decision = self.control.evaluate(after_debit, now=self.clock.now())
-            if budget_decision.stop_reason is not None:
-                self._stop(run_id, budget_decision.stop_reason, budget_decision.reason_code)
-                return self.state_for(run_id)
-
-            action = turn.action
-            self._persist(
-                run_id,
-                lambda event_id, rid, occurred_at, sequence, action=action: ActionProposed(
-                    event_id=event_id,
-                    run_id=rid,
-                    occurred_at=occurred_at,
-                    sequence=sequence,
-                    proposal=action,
-                ),
-            )
-
-            try:
-                metadata = self.tools.metadata_for(action.tool_name)
-                if not isinstance(metadata, ToolMetadata):  # pyright: ignore[reportUnnecessaryIsInstance]
-                    msg_11 = (
-                        f"tool metadata adapter returned {type(metadata).__name__}, "
-                        "expected ToolMetadata"
+                with self._telemetry.span(run_id, name=SpanName.CONTEXT_BUILD) as context_span:
+                    model_context = self.context.build_context(current)
+                    # Boundary validation is intentional: adapters may violate port return types.
+                    if not isinstance(model_context, ModelContext):  # pyright: ignore[reportUnnecessaryIsInstance]
+                        msg_12 = (
+                            f"context builder returned {type(model_context).__name__}, "
+                            "expected ModelContext"
+                        )
+                        raise ContextContractError(msg_12)
+                    if model_context.run_id != run_id:
+                        msg_13 = (
+                            f"context builder assembled context for run {model_context.run_id}, "
+                            f"expected {run_id}"
+                        )
+                        raise ContextContractError(msg_13)
+                    context_span.attributes["loopforge.context.item_count"] = len(
+                        model_context.items
                     )
-                    raise ToolContractError(msg_11)
-            except UnknownToolError:
-                self._reject(run_id, action, "BLOCK_UNKNOWN_TOOL")
-                continue
+                    context_span.attributes["loopforge.context.role"] = model_context.role.value
+                    if model_context.prompt_template is not None:
+                        context_span.attributes["loopforge.prompt.template_id"] = (
+                            model_context.prompt_template.template_id
+                        )
+                        context_span.attributes["loopforge.prompt.template_version"] = (
+                            model_context.prompt_template.version
+                        )
+                self._telemetry.emit_context_accounting(run_id, self.context)
+                self._persist(
+                    run_id,
+                    lambda event_id, rid, occurred_at, sequence, ctx=model_context: (
+                        ContextAssembled(
+                            event_id=event_id,
+                            run_id=rid,
+                            occurred_at=occurred_at,
+                            sequence=sequence,
+                            context_items=tuple(snapshot_of(item) for item in ctx.items),
+                            prompt_template_id=(
+                                ctx.prompt_template.template_id
+                                if ctx.prompt_template is not None
+                                else None
+                            ),
+                            prompt_template_version=(
+                                ctx.prompt_template.version
+                                if ctx.prompt_template is not None
+                                else None
+                            ),
+                        )
+                    ),
+                )
 
-            current = self.state_for(run_id)
-            if metadata.name in current.open_circuit_tools:
-                self._reject(run_id, action, "BLOCK_CIRCUIT_OPEN")
-                continue
-            if not self.permissions.authorizes(metadata):
-                self._reject(run_id, action, "BLOCK_PERMISSION_DENIED")
-                continue
+                with self._telemetry.span(run_id, name=SpanName.MODEL_TURN) as model_span:
+                    turn = self.model.propose_action(model_context)
+                    # Boundary validation is intentional: adapters may violate port return types.
+                    if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
+                        msg_7 = f"model adapter returned {type(turn).__name__}, expected ModelTurn"
+                        raise ModelContractError(msg_7)
+                    if not isinstance(turn.action, ActionProposal) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                        turn.usage, UsageDelta
+                    ):
+                        msg_8 = "model turn contains invalid action or usage payload"
+                        raise ModelContractError(msg_8)
+                    model_span.attributes["loopforge.usage.cost_usd"] = turn.usage.cost_usd
+                    model_span.attributes["loopforge.usage.input_tokens"] = turn.usage.input_tokens
+                    model_span.attributes["loopforge.usage.output_tokens"] = (
+                        turn.usage.output_tokens
+                    )
+                    model_span.attributes["loopforge.usage.cached_input_tokens"] = (
+                        turn.usage.cached_input_tokens
+                    )
+                self._persist(
+                    run_id,
+                    lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
+                        event_id=event_id,
+                        run_id=rid,
+                        occurred_at=occurred_at,
+                        sequence=sequence,
+                        usage=usage,
+                    ),
+                )
 
-            self._persist(
-                run_id,
-                lambda event_id, rid, occurred_at, sequence, action=action, metadata=metadata: (
-                    ActionAuthorized(
+                after_debit = self.state_for(run_id)
+                with self._telemetry.span(run_id, name=SpanName.POLICY_DECISION) as budget_span:
+                    budget_decision = self.control.evaluate(after_debit, now=self.clock.now())
+                    budget_span.attributes["loopforge.policy.kind"] = budget_decision.kind.value
+                    budget_span.attributes["loopforge.policy.reason_code"] = (
+                        budget_decision.reason_code
+                    )
+                if budget_decision.stop_reason is not None:
+                    self._stop(run_id, budget_decision.stop_reason, budget_decision.reason_code)
+                    return self.state_for(run_id)
+
+                action = turn.action
+                self._persist(
+                    run_id,
+                    lambda event_id, rid, occurred_at, sequence, action=action: ActionProposed(
                         event_id=event_id,
                         run_id=rid,
                         occurred_at=occurred_at,
                         sequence=sequence,
                         proposal=action,
-                        tool_metadata=metadata,
-                    )
-                ),
-            )
-            self._execute_current_action(run_id, attempt=1)
-            self._resolve_verifying(run_id)
-
-            verification_state = self.state_for(run_id)
-            if verification_state.status is RunStatus.REFLECTING:
-                self._persist_plan(
-                    run_id,
-                    "Previous verification failed; choose a new bounded action.",
+                    ),
                 )
+
+                try:
+                    metadata = self.tools.metadata_for(action.tool_name)
+                    if not isinstance(metadata, ToolMetadata):  # pyright: ignore[reportUnnecessaryIsInstance]
+                        msg_11 = (
+                            f"tool metadata adapter returned {type(metadata).__name__}, "
+                            "expected ToolMetadata"
+                        )
+                        raise ToolContractError(msg_11)
+                except UnknownToolError:
+                    self._reject(run_id, action, "BLOCK_UNKNOWN_TOOL")
+                    continue
+
+                current = self.state_for(run_id)
+                if metadata.name in current.open_circuit_tools:
+                    self._reject(run_id, action, "BLOCK_CIRCUIT_OPEN")
+                    continue
+                if not self.permissions.authorizes(metadata):
+                    self._reject(run_id, action, "BLOCK_PERMISSION_DENIED")
+                    continue
+
+                self._persist(
+                    run_id,
+                    lambda event_id, rid, occurred_at, sequence, action=action, metadata=metadata: (
+                        ActionAuthorized(
+                            event_id=event_id,
+                            run_id=rid,
+                            occurred_at=occurred_at,
+                            sequence=sequence,
+                            proposal=action,
+                            tool_metadata=metadata,
+                        )
+                    ),
+                )
+                self._execute_current_action(run_id, attempt=1)
+                self._resolve_verifying(run_id)
+
+                verification_state = self.state_for(run_id)
+                if verification_state.status is RunStatus.REFLECTING:
+                    self._persist_plan(
+                        run_id,
+                        "Previous verification failed; choose a new bounded action.",
+                    )
 
     def _resume_acting(self, run_id: RunId) -> None:
         state = self.state_for(run_id)
@@ -314,18 +376,31 @@ class Runtime:
         if metadata is None:
             msg_4 = "tool execution missing metadata"
             raise RuntimeError(msg_4)
-        result = self.tools.execute(
-            ToolExecutionRequest(
-                proposal=proposal,
-                attempt=attempt,
-                timeout_seconds=metadata.timeout_seconds,
-                idempotency_key=idempotency_key,
+        with self._telemetry.span(
+            run_id,
+            name=SpanName.TOOL_EXECUTE,
+            action_id=proposal.action_id,
+            tool_name=metadata.name,
+            attempt=attempt,
+            attributes={"loopforge.tool.timeout_seconds": metadata.timeout_seconds},
+        ) as tool_span:
+            if idempotency_key is not None:
+                tool_span.attributes["loopforge.tool.idempotency_key"] = idempotency_key
+            result = self.tools.execute(
+                ToolExecutionRequest(
+                    proposal=proposal,
+                    attempt=attempt,
+                    timeout_seconds=metadata.timeout_seconds,
+                    idempotency_key=idempotency_key,
+                )
             )
-        )
-        # Boundary validation is intentional: adapters may violate port return types.
-        if not isinstance(result, ToolResult):  # pyright: ignore[reportUnnecessaryIsInstance]
-            msg_5 = f"tool adapter returned {type(result).__name__}, expected ToolResult"
-            raise ToolContractError(msg_5)
+            # Boundary validation is intentional: adapters may violate port return types.
+            if not isinstance(result, ToolResult):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg_5 = f"tool adapter returned {type(result).__name__}, expected ToolResult"
+                raise ToolContractError(msg_5)
+            tool_span.attributes["loopforge.tool.ok"] = result.ok
+            if not result.ok:
+                tool_span.status = SpanStatusCode.ERROR
         self._record_tool_result(run_id, proposal.action_id, attempt, result)
 
     def _record_tool_result(
@@ -405,28 +480,51 @@ class Runtime:
             if retry.should_retry:
                 assert retry.next_attempt is not None
                 next_attempt = retry.next_attempt
-                self._persist(
+                with self._telemetry.span(
                     run_id,
-                    lambda event_id, rid, occurred_at, sequence: RetryScheduled(
-                        event_id=event_id,
-                        run_id=rid,
-                        occurred_at=occurred_at,
-                        sequence=sequence,
-                        action_id=proposal.action_id,
-                        next_attempt=next_attempt,
-                        delay_seconds=retry.delay_seconds,
-                        reason_code=retry.reason_code,
-                    ),
-                )
-                self.sleeper.sleep(retry.delay_seconds)
-                self._execute_current_action(run_id, attempt=next_attempt)
-                self._resolve_verifying(run_id)
+                    name=SpanName.RETRY,
+                    action_id=proposal.action_id,
+                    tool_name=metadata.name,
+                    attributes={
+                        "loopforge.retry.next_attempt": next_attempt,
+                        "loopforge.retry.delay_seconds": retry.delay_seconds,
+                        "loopforge.retry.reason_code": retry.reason_code,
+                    },
+                ):
+                    self._persist(
+                        run_id,
+                        lambda event_id, rid, occurred_at, sequence: RetryScheduled(
+                            event_id=event_id,
+                            run_id=rid,
+                            occurred_at=occurred_at,
+                            sequence=sequence,
+                            action_id=proposal.action_id,
+                            next_attempt=next_attempt,
+                            delay_seconds=retry.delay_seconds,
+                            reason_code=retry.reason_code,
+                        ),
+                    )
+                    self.sleeper.sleep(retry.delay_seconds)
+                    self._execute_current_action(run_id, attempt=next_attempt)
+                    self._resolve_verifying(run_id)
                 return
 
         self._verify_and_record(run_id)
 
     def _verify_and_record(self, run_id: RunId) -> None:
-        verification = self.verifier.verify(self.state_for(run_id))
+        # The verification correlation id derives from the sequence the
+        # verification event will be durably appended with, tying telemetry
+        # causally to the authoritative history.
+        verification_id = VerificationId(
+            f"{run_id}:verification:{self.store.current_version(run_id) + 1}"
+        )
+        with self._telemetry.span(
+            run_id, name=SpanName.VERIFY, verification_id=verification_id
+        ) as verify_span:
+            verification = self.verifier.verify(self.state_for(run_id))
+            verify_span.attributes["loopforge.verification.passed"] = verification.passed
+            if verification.score is not None:
+                verify_span.attributes["loopforge.verification.score"] = verification.score
         if verification.passed:
             self._persist(
                 run_id,
@@ -495,6 +593,17 @@ class Runtime:
                 summary=summary or reason_code,
             ),
         )
+        final = self.state_for(run_id)
+        self._telemetry.emit_run_span(
+            run_id,
+            started_at=final.started_at or self.clock.now(),
+            reason=reason,
+            attributes={
+                "loopforge.run.outcome": reason.value,
+                "loopforge.run.iterations": final.iteration,
+                "loopforge.run.cost_usd": final.cost_usd,
+            },
+        )
 
     def _persist(self, run_id: RunId, factory: EventFactory) -> None:
         expected_version = self.store.current_version(run_id)
@@ -504,4 +613,15 @@ class Runtime:
             self.clock.now(),
             expected_version + 1,
         )
-        self.store.append(event, expected_version=expected_version)
+        with self._telemetry.span(
+            run_id,
+            name=SpanName.PERSIST,
+            attributes={
+                "loopforge.event.type": type(event).__name__,
+                "loopforge.event.sequence": event.sequence,
+            },
+        ):
+            self.store.append(event, expected_version=expected_version)
+        # Telemetry is projected only after the authoritative event is durable;
+        # it never feeds back into runtime state or decisions.
+        self._telemetry.project_event(event)

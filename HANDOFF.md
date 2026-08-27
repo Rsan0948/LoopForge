@@ -37,7 +37,19 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-007.
+Completed: PACS-001 through PACS-008.
+
+PACS-008 (observability foundation, 2026-08-27) added an OpenTelemetry-compatible telemetry
+vocabulary and data model, a `TelemetryPort` with a fail-safe emission boundary, deterministic
+causally-correlated traces (run/cycle/operation spans), structured logs and metrics projected
+from the authoritative event stream, code-owned pre-emission redaction (`SensitiveText`,
+SENSITIVE/SECRET → `[redacted]`), correlation identifiers (run/worker/cycle/action/tool/
+attempt/verification), token/cost/cache accounting, OTLP/JSON converters proven offline, and a
+`TelemetrySandbox` span decorator. Telemetry is a non-authoritative projection: it is emitted
+only after durable appends, never feeds back into runtime decisions, and adapter failures
+cannot corrupt run state. See
+`docs/process/cycles/PACS-008-observability-foundation.md`. Checkpoint commit: pending
+operator-confirmed commit at tip `596acb3` + this diff.
 
 PACS-007 (context lifecycle and prompt contracts, 2026-08-27) added deterministic context
 selection with hard token budgeting, explicit per-item accounting, preservation contracts,
@@ -60,7 +72,13 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-007 + post-cycle hardening pass, 2026-08-27):
+Current checked evidence (PACS-008, 2026-08-27):
+- 1013 tests passing, 9 platform-gated skips
+- 97.73% branch-aware coverage
+- ruff format/check, pyright strict, and import-linter all executed and green
+- deterministic demo with correlated telemetry narrative, compile, architecture DAG checks passing
+
+Historical evidence (PACS-007 + post-cycle hardening pass, 2026-08-27):
 - 897 tests passing, 9 platform-gated skips
 - 97% branch-aware coverage
 - ruff format/check, pyright strict, and import-linter all executed and green
@@ -93,13 +111,13 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-007-context-lifecycle-and-prompt-contracts.md`
+- `docs/process/cycles/PACS-008-observability-foundation.md`
 
 ## Next authorized work
 
-None. PACS-008 through PACS-017 are PLANNED, not active.
+None. PACS-009 through PACS-017 are PLANNED, not active.
 
-The operator must manually initiate PACS-008 or another explicitly named scope.
+The operator must manually initiate PACS-009 or another explicitly named scope.
 
 ## Planned path to v1.0
 
