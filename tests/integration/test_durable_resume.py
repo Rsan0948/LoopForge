@@ -6,22 +6,29 @@ from pathlib import Path
 
 import pytest
 
-from loopforge.adapters.context import BasicContextBuilder
+from loopforge.adapters.context import (
+    BasicContextBuilder,
+    BudgetedContextBuilder,
+    CharsPerTokenCounter,
+)
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
 from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.application.runtime import Runtime, UnsafeResumeStateError
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
     BudgetDebited,
+    ContextAssembled,
     Event,
     ToolExecutionStarted,
     ToolSucceeded,
 )
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
+from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.tooling import (
     ApprovalClass,
@@ -220,3 +227,47 @@ def test_resume_from_verifying_checkpoint_does_not_repeat_tool_side_effect(tmp_p
     assert resumed.status is RunStatus.SUCCEEDED
     assert resumed.iteration == 1
     assert resumed.last_observation == "all tests pass"
+
+
+# --- PACS-007: prompt template metadata survives durable persistence ------------
+
+
+def test_budgeted_context_metadata_survives_sqlite_persistence_and_replay(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "runs.db"
+    runtime = Runtime(
+        model=ScriptedModel([ActionProposal(ActionId("a1"), "inspect", {})]),
+        tools=ScriptedTools(
+            [ToolResult(ok=True, observation="all tests pass")],
+            metadata=[_metadata()],
+        ),
+        verifier=ObservationContainsVerifier("all tests pass"),
+        store=SQLiteEventStore(path, codec=JsonEventCodec()),
+        control=ControlPolicy(BudgetLimit(5.0, 10)),
+        permissions=PermissionPolicy(frozenset({Permission.READ})),
+        reliability=ReliabilityPolicy(),
+        context=BudgetedContextBuilder(
+            SystemClock(),
+            CharsPerTokenCounter(),
+            template=default_controller_template(),
+            token_budget=ContextTokenBudget(max_tokens=4096, reserve_tokens=256),
+        ),
+        clock=SystemClock(),
+        sleeper=SystemSleeper(),
+    )
+
+    state = runtime.run("repair auth")
+
+    assert state.status is RunStatus.SUCCEEDED
+    # A fresh runtime over the same database replays the durable stream,
+    # including the prompt template execution metadata.
+    fresh = _runtime(path, action_id="unused")
+    replayed_events = fresh.store.events_for(state.run_id)
+    assembled = [event for event in replayed_events if isinstance(event, ContextAssembled)]
+    assert len(assembled) == 1
+    assert assembled[0].prompt_template_id == "loopforge.controller"
+    assert assembled[0].prompt_template_version == "1.0.0"
+    replayed = fresh.state_for(state.run_id)
+    assert replayed.status is RunStatus.SUCCEEDED
+    assert replayed.last_context_items == assembled[0].context_items

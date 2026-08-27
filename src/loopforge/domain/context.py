@@ -2,11 +2,37 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import datetime
+from enum import StrEnum
 from typing import Final
 
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import DataSensitivity
 from loopforge.domain.types import ContextItemId, RunId
+
+
+class ModelRole(StrEnum):
+    """The functional role a model turn's context is assembled for."""
+
+    CONTROLLER = "controller"
+    PLANNER = "planner"
+    REFLECTOR = "reflector"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PromptTemplateRef:
+    """Reference to the versioned prompt template used for a context assembly."""
+
+    template_id: str
+    version: str
+
+    def __post_init__(self) -> None:
+        if not self.template_id.strip():
+            msg = "prompt template id cannot be empty"
+            raise ValueError(msg)
+        if not self.version.strip():
+            msg_2 = "prompt template version cannot be empty"
+            raise ValueError(msg_2)
+
 
 TRUST_AUTHORITY: Final[dict[TrustClass, int]] = {
     TrustClass.RUNTIME_POLICY: 5,
@@ -174,6 +200,8 @@ class ModelContext:
     run_id: RunId
     items: tuple[ContextItem, ...]
     assembled_at: datetime
+    role: ModelRole = ModelRole.CONTROLLER
+    prompt_template: PromptTemplateRef | None = None
 
     def __post_init__(self) -> None:
         if self.assembled_at.tzinfo is None or self.assembled_at.utcoffset() is None:

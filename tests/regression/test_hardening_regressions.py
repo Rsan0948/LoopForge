@@ -9,21 +9,34 @@ from __future__ import annotations
 import json
 import math
 import subprocess
-from dataclasses import replace
-from datetime import UTC, datetime
+from collections.abc import Callable
+from dataclasses import FrozenInstanceError, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
 
 import pytest
 
 from loopforge.adapters import _sandbox_exec
-from loopforge.adapters.context import BasicContextBuilder
+from loopforge.adapters.context import (
+    BasicContextBuilder,
+    BudgetedContextBuilder,
+    CharsPerTokenCounter,
+)
 from loopforge.adapters.json_events import (
     JsonEventCodec,
     UnsupportedEventSchemaError,
 )
 from loopforge.adapters.local_sandbox import CommandSpec, ConstrainedLocalSandbox
-from loopforge.adapters.scripted import FixedClock
+from loopforge.adapters.memory import InMemoryEventStore
+from loopforge.adapters.scripted import (
+    FixedClock,
+    ObservationContainsVerifier,
+    RecordingSleeper,
+    ScriptedModel,
+    ScriptedTools,
+)
+from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import (
     ContextAuthorityError,
@@ -31,9 +44,28 @@ from loopforge.domain.context import (
     ContextItemSnapshot,
     ContextSource,
     ModelContext,
+    ModelRole,
     promote,
 )
+from loopforge.domain.context_lifecycle import (
+    TRUNCATION_MARKER,
+    ContextBudgetError,
+    ContextCandidate,
+    ContextSelection,
+    ContextTokenBudget,
+    DropReason,
+    PreservationClass,
+    select_context,
+    truncate_content,
+)
 from loopforge.domain.events import RetryScheduled, ToolFailed
+from loopforge.domain.policy import ControlPolicy, PermissionPolicy
+from loopforge.domain.prompts import (
+    PromptSection,
+    PromptTemplate,
+    default_controller_template,
+    render_prompt,
+)
 from loopforge.domain.reliability import (
     ReliabilityPolicy,
     ToolFailureClass,
@@ -56,8 +88,10 @@ from loopforge.domain.types import (
     Permission,
     RiskLevel,
     RunId,
+    RunStatus,
     UsageDelta,
 )
+from loopforge.ports.context import ContextContractError
 from loopforge.ports.sandbox import SandboxError
 from loopforge.ports.tools import ToolExecutionRequest
 
@@ -407,3 +441,320 @@ def test_builder_labels_unknown_verification_outcome_honestly() -> None:
 
     assert "(unknown)" in verification.source.detail
     assert "(failed)" not in verification.source.detail
+
+
+# --- PACS-007 context-lifecycle hardening ----------------------------------------
+# Defects and edge behaviors found in the post-cycle hardening pass on the
+# context lifecycle surface; pinned so they cannot silently return or drift.
+
+LIFE_RUN = RunId("run-lifecycle")
+LIFE_BUDGET = ContextTokenBudget(max_tokens=8192)
+
+
+def _lc_item(  # noqa: PLR0913 - test fixture builder mirrors the domain constructor
+    key: str,
+    content: str | None = None,
+    *,
+    trust: TrustClass = TrustClass.DETERMINISTIC_OBSERVATION,
+    created_at: datetime = NOW,
+    supersedes: ContextItemId | None = None,
+    expires_at: datetime | None = None,
+) -> ContextItem:
+    return ContextItem(
+        item_id=ContextItemId(f"{LIFE_RUN}:{key}"),
+        content=content if content is not None else f"content:{key}",
+        trust=trust,
+        source=ContextSource(origin=trust, reference=f"ref:{key}"),
+        sensitivity=DataSensitivity.INTERNAL,
+        created_at=created_at,
+        supersedes=supersedes,
+        expires_at=expires_at,
+    )
+
+
+def _lc_candidate(  # noqa: PLR0913 - test fixture builder mirrors the domain constructor
+    key: str,
+    content: str | None = None,
+    *,
+    trust: TrustClass = TrustClass.DETERMINISTIC_OBSERVATION,
+    created_at: datetime = NOW,
+    preserved: frozenset[PreservationClass] = frozenset(),
+    compactible: bool = True,
+    roles: frozenset[ModelRole] = frozenset(ModelRole),
+    supersedes: ContextItemId | None = None,
+    expires_at: datetime | None = None,
+) -> ContextCandidate:
+    return ContextCandidate(
+        item=_lc_item(
+            key,
+            content,
+            trust=trust,
+            created_at=created_at,
+            supersedes=supersedes,
+            expires_at=expires_at,
+        ),
+        preserved=preserved,
+        compactible=compactible,
+        roles=roles,
+    )
+
+
+def _four_chars_per_token(text: str) -> int:
+    return (len(text) + 3) // 4
+
+
+def _lc_select(
+    candidates: list[ContextCandidate],
+    max_tokens: int,
+    *,
+    role: ModelRole = ModelRole.CONTROLLER,
+    count_tokens: Callable[[str], int] | None = None,
+) -> ContextSelection:
+    counter = count_tokens or _four_chars_per_token
+    return select_context(
+        tuple(candidates),
+        budget=ContextTokenBudget(max_tokens=max_tokens),
+        role=role,
+        count_tokens=counter,
+        now=NOW,
+    )
+
+
+def _lc_builder(budget: ContextTokenBudget = LIFE_BUDGET) -> BudgetedContextBuilder:
+    return BudgetedContextBuilder(
+        FixedClock(NOW),
+        CharsPerTokenCounter(),
+        template=default_controller_template(),
+        token_budget=budget,
+    )
+
+
+# D1: the runtime previously accepted a ModelContext assembled for a DIFFERENT
+# run, persisting another run's context items under this run's ContextAssembled
+# event and feeding cross-run context to the model. The boundary now fails
+# closed on run identity, before persistence and before any model call.
+
+
+class _WrongRunBuilder:
+    def build_context(self, state: RunState) -> ModelContext:
+        del state
+        return ModelContext(run_id=RunId("other-run"), items=(), assembled_at=NOW)
+
+
+def test_runtime_rejects_context_assembled_for_a_different_run() -> None:
+    runtime = Runtime(
+        model=ScriptedModel([]),  # empty: any model call would raise instead
+        tools=ScriptedTools([], metadata=[]),
+        verifier=ObservationContainsVerifier("all tests pass"),
+        store=InMemoryEventStore(),
+        control=ControlPolicy(BudgetLimit(5.0, 10)),
+        permissions=PermissionPolicy(frozenset({Permission.READ})),
+        reliability=ReliabilityPolicy(),
+        context=_WrongRunBuilder(),  # pyright: ignore[reportArgumentType]
+        clock=FixedClock(NOW),
+        sleeper=RecordingSleeper(),
+    )
+
+    with pytest.raises(ContextContractError, match="assembled context for run other-run"):
+        runtime.run("probe")
+
+
+# D2: a misbehaving token counter returning negative counts previously flowed
+# into budgeting arithmetic and only failed later, deep inside ledger
+# validation. Counts are now validated at the measurement point.
+
+
+@pytest.mark.parametrize("preserved", [True, False])
+def test_selection_rejects_negative_token_counts(preserved: bool) -> None:
+    candidate = _lc_candidate(
+        "item",
+        preserved=frozenset({PreservationClass.OBJECTIVE}) if preserved else frozenset(),
+    )
+    with pytest.raises(ValueError, match="token counts cannot be negative"):
+        _lc_select([candidate], 100, count_tokens=lambda _text: -1)
+
+
+def test_selection_rejects_negative_counts_for_compacted_content() -> None:
+    def hostile(text: str) -> int:
+        return -1 if text.endswith(TRUNCATION_MARKER) else (len(text) + 3) // 4
+
+    with pytest.raises(ValueError, match="token counts cannot be negative"):
+        _lc_select([_lc_candidate("big", "b" * 400)], 10, count_tokens=hostile)
+
+
+# D5: a failed build previously left the previous successful build's accounting
+# ledger in place, so a failed turn would be misattributed the stale ledger.
+# A failed build now clears the ledger.
+
+
+def test_failed_build_clears_stale_accounting() -> None:
+    builder = _lc_builder()
+    state = RunState(run_id=LIFE_RUN, status=RunStatus.READY, objective="repair auth")
+    builder.build_context(state)
+    assert builder.last_accounting is not None
+
+    with pytest.raises(ContextBudgetError, match="consume the entire token budget"):
+        builder.build_context(state, token_budget=ContextTokenBudget(max_tokens=50))
+
+    assert builder.last_accounting is None
+
+
+# D6: truncate_content("", allowance=0) previously returned None even though
+# empty content fits a zero allowance, violating the documented
+# "returns the original content when it fits" contract.
+
+
+def test_truncate_returns_empty_content_that_fits_zero_allowance() -> None:
+    assert truncate_content("", allowance_tokens=0, count_tokens=len) == ""
+
+
+# Edge: preservation takes precedence over the compactible flag — a preserved
+# candidate marked compactible is still kept whole, never truncated.
+
+
+def test_preserved_candidate_is_never_truncated_even_when_compactible() -> None:
+    preserved = _lc_candidate(
+        "fact",
+        "x" * 400,
+        preserved=frozenset({PreservationClass.CONFIRMED_FACT}),
+        compactible=True,
+    )
+    selection = _lc_select([preserved], 120)
+    assert selection.items == (preserved.item,)
+    entry = selection.accounting.entries[0]
+    assert entry.kept
+    assert not entry.compacted
+
+
+# Edge: drop-reason precedence is deterministic — a candidate that is both
+# superseded and expired is recorded as SUPERSEDED (supersession prunes first).
+
+
+def test_superseded_takes_precedence_over_expired_in_ledger() -> None:
+    stale = _lc_candidate(
+        "stale",
+        created_at=NOW - timedelta(hours=2),
+        expires_at=NOW - timedelta(hours=1),
+    )
+    fresh = _lc_candidate("fresh", supersedes=stale.item.item_id)
+    selection = _lc_select([stale, fresh], 100)
+    reasons = {entry.item_id: entry.drop_reason for entry in selection.accounting.entries}
+    assert reasons[stale.item.item_id] is DropReason.SUPERSEDED
+    assert reasons[fresh.item.item_id] is None
+
+
+# Edge: a supersession cycle among candidates is pruned entirely (both members
+# are dead) instead of crashing or leaking into the assembly.
+
+
+def test_supersession_cycle_candidates_are_all_pruned_without_error() -> None:
+    first = _lc_candidate("a", supersedes=ContextItemId(f"{LIFE_RUN}:b"))
+    second = _lc_candidate("b", supersedes=ContextItemId(f"{LIFE_RUN}:a"))
+    selection = _lc_select([first, second], 100)
+    assert selection.items == ()
+    assert {entry.drop_reason for entry in selection.accounting.entries} == {DropReason.SUPERSEDED}
+
+
+# Edge: a superseder excluded by role scoping must not deactivate its target —
+# supersession is evaluated over role-eligible candidates only.
+
+
+def test_role_excluded_superseder_does_not_deactivate_target() -> None:
+    target = _lc_candidate("target")
+    superseder = _lc_candidate(
+        "superseder",
+        supersedes=target.item.item_id,
+        roles=frozenset({ModelRole.PLANNER}),
+    )
+    selection = _lc_select([target, superseder], 100, role=ModelRole.CONTROLLER)
+    assert selection.items == (target.item,)
+
+
+# Edge: an item whose token cost exactly equals the remaining budget is kept
+# whole; truncation applies only to strict overflow.
+
+
+def test_exact_fit_is_kept_whole_not_compacted() -> None:
+    exact = _lc_candidate("exact", "e" * 40)  # 10 tokens at 4 chars/token
+    selection = _lc_select([exact], 10)
+    assert selection.items == (exact.item,)
+    entry = selection.accounting.entries[0]
+    assert not entry.compacted
+    assert selection.accounting.used_tokens == 10
+
+
+# Invariant: any mix of pruning, truncation, and dropping still yields items
+# that satisfy the ModelContext construction contract.
+
+
+def test_selection_output_is_always_a_legal_model_context() -> None:
+    stale = _lc_candidate("stale")
+    fresh = _lc_candidate("fresh", supersedes=stale.item.item_id)
+    big = _lc_candidate("big", "b" * 400)
+    huge = _lc_candidate("huge", "h" * 400, compactible=False)
+    selection = _lc_select([stale, fresh, big, huge], 10)
+    context = ModelContext(run_id=LIFE_RUN, items=selection.items, assembled_at=NOW)
+    assert context.active_items(now=NOW) == context.items
+
+
+# Edge: reversible tool metadata in scope must not produce an irreversible-action
+# preservation item.
+
+
+def test_budgeted_builder_ignores_reversible_metadata() -> None:
+    state = RunState(
+        run_id=LIFE_RUN,
+        status=RunStatus.READY,
+        current_tool_metadata=_metadata(),
+    )
+    context = _lc_builder().build_context(state)
+    assert context.items == ()
+
+
+# Edge: a payload carrying a template id but missing the version key entirely
+# (not merely null) is rejected rather than partially decoded.
+
+
+def test_codec_rejects_template_id_when_version_key_is_missing() -> None:
+    envelope = json.loads(_context_assembled_payload(_context_item_payload()))
+    body = envelope["event"]
+    body["prompt_template_id"] = "loopforge.controller"
+    with pytest.raises(ValueError, match="must be recorded together"):
+        JsonEventCodec().decode(json.dumps(envelope))
+
+
+# Edge: the new ModelContext execution-metadata fields are as immutable as the
+# PACS-006 fields.
+
+
+def test_model_context_execution_metadata_fields_are_immutable() -> None:
+    context = ModelContext(run_id=LIFE_RUN, items=(), assembled_at=NOW)
+    with pytest.raises(FrozenInstanceError, match="cannot assign to field"):
+        context.role = ModelRole.PLANNER  # pyright: ignore[reportAttributeAccessIssue]
+    with pytest.raises(FrozenInstanceError, match="cannot assign to field"):
+        context.prompt_template = None  # pyright: ignore[reportAttributeAccessIssue]
+
+
+# Edge: a template with only stable sections renders items as the entire
+# dynamic suffix, keeping the stable prefix byte-identical.
+
+
+def test_stable_only_template_renders_items_as_dynamic_suffix() -> None:
+    template = PromptTemplate(
+        template_id="stable.only",
+        version="1.0.0",
+        sections=(PromptSection(name="mission", content="Mission text."),),
+    )
+    item = _lc_item("objective", "repair auth", trust=TrustClass.AUTHORIZED_HUMAN)
+    context = ModelContext(run_id=LIFE_RUN, items=(item,), assembled_at=NOW)
+    rendered = render_prompt(template, context, role=ModelRole.CONTROLLER)
+    assert rendered.stable_prefix == "Mission text."
+    assert rendered.dynamic_suffix == "- (authorized_human) repair auth"
+
+
+# Edge: the counter adapter rejects negative granularity, not just zero.
+
+
+def test_chars_per_token_counter_rejects_negative_granularity() -> None:
+    with pytest.raises(ValueError, match="chars_per_token must be positive"):
+        CharsPerTokenCounter(-1)

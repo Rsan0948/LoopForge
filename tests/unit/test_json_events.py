@@ -1069,3 +1069,86 @@ def test_decode_preserves_supersedes_and_expires_at() -> None:
     item = decoded.context_items[0]
     assert item.supersedes == ContextItemId("run-json:objective")
     assert item.expires_at == NOW + timedelta(hours=1)
+
+
+# --- ContextAssembled prompt template metadata ---------------------------------
+
+
+def test_context_assembled_round_trip_with_prompt_template_metadata() -> None:
+    event = ContextAssembled(
+        event_id=EventId("e30"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=30,
+        context_items=CONTEXT_ASSEMBLED.context_items,
+        prompt_template_id="loopforge.controller",
+        prompt_template_version="1.0.0",
+    )
+    decoded = CODEC.decode(CODEC.encode(event))
+    assert decoded == event
+
+
+def test_context_assembled_legacy_payload_without_template_metadata_decodes() -> None:
+    payload = _mutated_body(CONTEXT_ASSEMBLED, "prompt_template_id", _MISSING)
+    envelope = json.loads(payload)
+    body = cast(dict[str, Any], envelope["event"])
+    body.pop("prompt_template_version")
+    decoded = CODEC.decode(json.dumps(envelope))
+    assert isinstance(decoded, ContextAssembled)
+    assert decoded.prompt_template_id is None
+    assert decoded.prompt_template_version is None
+
+
+@pytest.mark.parametrize("value", [42, True, {"id": 1}])
+def test_decode_rejects_non_string_prompt_template_id(value: Any) -> None:
+    payload = _mutated_body(CONTEXT_ASSEMBLED, "prompt_template_id", value)
+    with pytest.raises(TypeError, match="prompt_template_id must be a string or null"):
+        CODEC.decode(payload)
+
+
+@pytest.mark.parametrize("value", [42, True, ["1.0.0"]])
+def test_decode_rejects_non_string_prompt_template_version(value: Any) -> None:
+    payload = _mutated_body(CONTEXT_ASSEMBLED, "prompt_template_version", value)
+    with pytest.raises(TypeError, match="prompt_template_version must be a string or null"):
+        CODEC.decode(payload)
+
+
+def test_decode_rejects_template_id_without_version() -> None:
+    payload = _mutated_body(CONTEXT_ASSEMBLED, "prompt_template_id", "loopforge.controller")
+    with pytest.raises(ValueError, match="must be recorded together"):
+        CODEC.decode(payload)
+
+
+def test_event_rejects_template_version_without_id() -> None:
+    with pytest.raises(ValueError, match="must be recorded together"):
+        ContextAssembled(
+            event_id=EventId("e31"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=31,
+            context_items=(),
+            prompt_template_version="1.0.0",
+        )
+
+
+def test_event_rejects_empty_template_id_or_version() -> None:
+    with pytest.raises(ValueError, match="prompt template id cannot be empty"):
+        ContextAssembled(
+            event_id=EventId("e32"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=32,
+            context_items=(),
+            prompt_template_id=" ",
+            prompt_template_version="1.0.0",
+        )
+    with pytest.raises(ValueError, match="prompt template version cannot be empty"):
+        ContextAssembled(
+            event_id=EventId("e33"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=33,
+            context_items=(),
+            prompt_template_id="loopforge.controller",
+            prompt_template_version="",
+        )

@@ -9,7 +9,11 @@ import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
-from loopforge.adapters.context import BasicContextBuilder
+from loopforge.adapters.context import (
+    BasicContextBuilder,
+    BudgetedContextBuilder,
+    CharsPerTokenCounter,
+)
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import (
     FixedClock,
@@ -27,11 +31,14 @@ from loopforge.domain.context import (
     ContextItemSnapshot,
     ContextSource,
     ModelContext,
+    PromptTemplateRef,
     promote,
     snapshot_of,
 )
+from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.events import ContextAssembled
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
+from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import RunState
@@ -454,6 +461,50 @@ def test_runtime_passes_context_artifact_to_model_and_persists_it() -> None:
         item.item_id for item in received.items
     ]
     assert state.last_context_items == persisted[0].context_items
+
+
+def test_runtime_records_prompt_template_metadata_with_budgeted_builder() -> None:
+    builder = BudgetedContextBuilder(
+        FixedClock(NOW),
+        CharsPerTokenCounter(),
+        template=default_controller_template(),
+        token_budget=ContextTokenBudget(max_tokens=4096, reserve_tokens=256),
+    )
+    model = _RecordingModel()
+    runtime = _runtime(builder, model)
+
+    state = runtime.run("repair auth")
+
+    assert state.status is RunStatus.SUCCEEDED
+    received = model.received[0]
+    assert received.prompt_template == PromptTemplateRef(
+        template_id="loopforge.controller", version="1.0.0"
+    )
+    persisted = [
+        event
+        for event in runtime.store.events_for(state.run_id)
+        if isinstance(event, ContextAssembled)
+    ]
+    assert len(persisted) == 1
+    assert persisted[0].prompt_template_id == "loopforge.controller"
+    assert persisted[0].prompt_template_version == "1.0.0"
+    # Template metadata survives replay alongside the exact context artifact.
+    assert state.last_context_items == persisted[0].context_items
+
+
+def test_runtime_records_null_template_metadata_without_template() -> None:
+    runtime = _runtime(BasicContextBuilder(FixedClock(NOW)), _RecordingModel())
+
+    state = runtime.run("repair auth")
+
+    persisted = [
+        event
+        for event in runtime.store.events_for(state.run_id)
+        if isinstance(event, ContextAssembled)
+    ]
+    assert len(persisted) == 1
+    assert persisted[0].prompt_template_id is None
+    assert persisted[0].prompt_template_version is None
 
 
 # --- Snapshot hardening: snapshots re-validate like items -----------------------

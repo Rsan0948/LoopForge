@@ -1,4 +1,48 @@
-# Build status — PACS-006 complete
+# Build status — PACS-007 complete
+
+PACS-007 establishes the context lifecycle and prompt contracts: deterministic context selection
+with a hard token budget, explicit per-item budget accounting, preservation contracts for
+objective/blockers/verifier failures/confirmed facts/pending approvals/irreversible actions,
+structured compaction that may drop or truncate content but never alters trust or provenance,
+role-specific assembly (`ModelRole`), and versioned prompt templates whose id/version are
+recorded on every durable `ContextAssembled` event. Trust authority from PACS-006 is unchanged:
+no new elevation path exists, and SECRET content still never persists. No subsequent PACS cycle
+is active until manually initiated.
+
+Verified in this environment (2026-08-27, includes post-cycle hardening pass):
+
+- `uv run pytest -q` — **897 passing, 9 skipped** (macOS `RLIMIT_AS` platform-gated skips)
+- branch-aware coverage — **97% overall**; configured 90% gate satisfied; all context, prompt,
+  and codec modules at 100% branch coverage
+- `ruff format --check .` / `ruff check .` — clean
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- deterministic CLI demo — `status=succeeded` through `BudgetedContextBuilder`
+- `compileall` — clean
+
+Post-cycle hardening fixed and pinned (see `tests/regression/test_hardening_regressions.py`):
+runtime rejection of context assembled for a different run, negative token-count validation at
+the measurement point, stale-ledger clearing after failed builds, and a `truncate_content`
+boundary-contract fix — plus edge pins for drop-reason precedence, supersession cycles,
+role-scoped supersession, exact-fit boundaries, and metadata immutability.
+
+## Implemented through PACS-007
+
+- `select_context` deterministic policy: role scoping → supersession/freshness pruning →
+  whole-or-fail preserved allocation → trust/recency-ranked greedy fill with marker truncation
+- explicit context-budget accounting (`ContextAccounting` ledger; over-budget ledgers are
+  unconstructable; template static text charged as overhead)
+- `PreservationClass` contracts; compaction drops/truncates content only, never elevates or
+  demotes trust; dangling supersession edges pruned as bookkeeping
+- `ModelRole` (controller/planner/reflector) role-specific assembly
+- versioned `PromptTemplate` / `RenderedPrompt` artifacts with construction-enforced
+  stable-prefix layout (provider-independent, cache-friendly)
+- `ContextBuilderPort.build_context(state, role, token_budget)` + `TokenCounterPort`;
+  `BudgetedContextBuilder` reference adapter with a `last_accounting` ledger seam for telemetry
+- `ContextAssembled` carries optional prompt template id/version as execution metadata
+  (schema-v1 backward compatible: legacy payloads decode to null)
+
+# Historical: PACS-006 complete
 
 PACS-006 establishes the context authority model: typed, provenance-aware `ContextItem` /
 `ModelContext` artifacts, code-owned trust/authority ordering with a guarded `promote` path, the

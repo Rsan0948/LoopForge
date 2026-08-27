@@ -144,9 +144,25 @@ class ContextAssembled(DomainEvent):
 
     Secret-sensitivity items are rejected at construction (see
     ContextItemSnapshot); redaction before telemetry export is a later cycle.
+    The prompt template id/version, when the builder used a versioned
+    template, are recorded here as execution metadata.
     """
 
     context_items: tuple[ContextItemSnapshot, ...]
+    prompt_template_id: str | None = None
+    prompt_template_version: str | None = None
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if (self.prompt_template_id is None) != (self.prompt_template_version is None):
+            msg = "prompt template id and version must be recorded together"
+            raise ValueError(msg)
+        if self.prompt_template_id is not None and not self.prompt_template_id.strip():
+            msg_2 = "prompt template id cannot be empty"
+            raise ValueError(msg_2)
+        if self.prompt_template_version is not None and not self.prompt_template_version.strip():
+            msg_3 = "prompt template version cannot be empty"
+            raise ValueError(msg_3)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

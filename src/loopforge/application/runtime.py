@@ -138,6 +138,12 @@ class Runtime:
                     "expected ModelContext"
                 )
                 raise ContextContractError(msg_12)
+            if model_context.run_id != run_id:
+                msg_13 = (
+                    f"context builder assembled context for run {model_context.run_id}, "
+                    f"expected {run_id}"
+                )
+                raise ContextContractError(msg_13)
             self._persist(
                 run_id,
                 lambda event_id, rid, occurred_at, sequence, ctx=model_context: ContextAssembled(
@@ -146,6 +152,12 @@ class Runtime:
                     occurred_at=occurred_at,
                     sequence=sequence,
                     context_items=tuple(snapshot_of(item) for item in ctx.items),
+                    prompt_template_id=(
+                        ctx.prompt_template.template_id if ctx.prompt_template is not None else None
+                    ),
+                    prompt_template_version=(
+                        ctx.prompt_template.version if ctx.prompt_template is not None else None
+                    ),
                 ),
             )
 

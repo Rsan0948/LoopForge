@@ -37,7 +37,13 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-006.
+Completed: PACS-001 through PACS-007.
+
+PACS-007 (context lifecycle and prompt contracts, 2026-08-27) added deterministic context
+selection with hard token budgeting, explicit per-item accounting, preservation contracts,
+structured compaction/pruning, role-specific assembly (`ModelRole`), and versioned prompt
+templates whose id/version are persisted on every `ContextAssembled` event. See
+`docs/process/cycles/PACS-007-context-lifecycle-and-prompt-contracts.md`.
 
 PACS-006 (context authority model, 2026-08-25) added typed/provenance-aware `ContextItem` /
 `ModelContext` artifacts, the guarded trust-elevation path, `ContextBuilderPort`, and the durable
@@ -54,7 +60,13 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-006 + post-cycle hardening pass, 2026-08-25):
+Current checked evidence (PACS-007 + post-cycle hardening pass, 2026-08-27):
+- 897 tests passing, 9 platform-gated skips
+- 97% branch-aware coverage
+- ruff format/check, pyright strict, and import-linter all executed and green
+- deterministic demo, compile, architecture DAG checks passing
+
+Historical evidence (PACS-006 + post-cycle hardening pass, 2026-08-25):
 - 805 tests passing, 9 platform-gated skips
 - 96.31% branch-aware coverage
 - ruff format/check, pyright strict, and import-linter all executed and green
@@ -81,13 +93,13 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-006-context-authority-model.md`
+- `docs/process/cycles/PACS-007-context-lifecycle-and-prompt-contracts.md`
 
 ## Next authorized work
 
-None. PACS-007 through PACS-017 are PLANNED, not active.
+None. PACS-008 through PACS-017 are PLANNED, not active.
 
-The operator must manually initiate PACS-007 or another explicitly named scope.
+The operator must manually initiate PACS-008 or another explicitly named scope.
 
 ## Planned path to v1.0
 

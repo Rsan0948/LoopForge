@@ -282,6 +282,8 @@ def _construct_context_assembled(base: dict[str, Any], data: dict[str, Any]) -> 
     return ContextAssembled(
         **base,
         context_items=tuple(_context_item_snapshot(item) for item in items),
+        prompt_template_id=_optional_str(data, "prompt_template_id"),
+        prompt_template_version=_optional_str(data, "prompt_template_version"),
     )
 
 
@@ -420,6 +422,16 @@ def _usage(data: dict[str, Any]) -> UsageDelta:
         output_tokens=_required_int(data, "output_tokens"),
         cached_input_tokens=_required_int(data, "cached_input_tokens"),
     )
+
+
+def _optional_str(data: dict[str, Any], key: str) -> str | None:
+    value = data.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        msg = f"{key} must be a string or null"
+        raise TypeError(msg)
+    return value
 
 
 def _required_str(data: dict[str, Any], key: str) -> str:

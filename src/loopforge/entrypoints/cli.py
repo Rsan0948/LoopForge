@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 
-from loopforge.adapters.context import BasicContextBuilder
+from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
+from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.tooling import (
     ApprovalClass,
@@ -76,7 +78,12 @@ def _demo() -> int:
         control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
         permissions=PermissionPolicy(frozenset({Permission.READ, Permission.LOCAL_WRITE})),
         reliability=ReliabilityPolicy(),
-        context=BasicContextBuilder(SystemClock()),
+        context=BudgetedContextBuilder(
+            SystemClock(),
+            CharsPerTokenCounter(),
+            template=default_controller_template(),
+            token_budget=ContextTokenBudget(max_tokens=4096, reserve_tokens=256),
+        ),
         clock=SystemClock(),
         sleeper=SystemSleeper(),
     )
