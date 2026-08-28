@@ -349,7 +349,10 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
         objective=(
             "Fix every currently failing CivicML test and keep the existing documented behavior. "
             "Use the real source and tests in this checkout. Iterate: inspect failures, make the "
-            "smallest correct edits, run the checks, and continue until all checks pass."
+            "smallest correct edits, run the checks, and continue until all checks pass. "
+            "Do not stop to summarize while checks fail: every turn must use a tool. Begin by "
+            "reading the failing test and its implementation, then edit the implementation or "
+            "test only when the evidence supports it."
         ),
         fixture=FixtureSpec(
             fixture_id="adopted-civicml",
