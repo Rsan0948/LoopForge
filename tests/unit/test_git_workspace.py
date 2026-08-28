@@ -64,6 +64,22 @@ def test_materialize_supports_explicit_workspace_id(tmp_path: Path) -> None:
     assert workspace.root.name == "assigned-1"
 
 
+def test_adopt_existing_uses_current_head_without_overwriting(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    original = manager.materialize(_fixture(), workspace_id=WorkspaceId("source"))
+    adopted = manager.adopt_existing(original.root, workspace_id=WorkspaceId("integration"))
+
+    assert adopted.workspace_id == "integration"
+    assert adopted.base_revision == original.base_revision
+    assert adopted.status().clean
+    assert (adopted.root / "module.py").read_text(encoding="utf-8") == "value = 1\n"
+
+
+def test_adopt_existing_rejects_non_repository(tmp_path: Path) -> None:
+    with pytest.raises(WorkspaceError, match="local Git worktree"):
+        _manager(tmp_path).adopt_existing(tmp_path / "missing")
+
+
 def test_materialize_rejects_invalid_ids_and_existing_workspaces(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     with pytest.raises(WorkspaceError, match="plain name without path separators"):

@@ -360,6 +360,33 @@ class GitWorkspaceManager:
             _metadata_fingerprint=metadata_fingerprint,
         )
 
+    def adopt_existing(
+        self, repository: str | Path, *, workspace_id: WorkspaceId | None = None
+    ) -> GitWorkspace:
+        """Adopt a clean existing local Git checkout as an integration workspace.
+
+        No files are copied or overwritten. The checkout must already be a Git
+        worktree; LoopForge records its current HEAD and metadata fingerprint,
+        then uses the same guarded Git surface as fixture repositories.
+        """
+        root = Path(repository).resolve()
+        if not root.is_dir() or not (root / _GIT_DIR_NAME).exists():
+            msg = "existing repository must be a local Git worktree"
+            raise WorkspaceError(msg)
+        assigned = workspace_id or WorkspaceId(root.name)
+        _validate_workspace_id(str(assigned))
+        try:
+            base_revision = _run_git(self._git, root, "rev-parse", "HEAD").strip()
+        except WorkspaceError:
+            raise
+        return GitWorkspace(
+            _root=root,
+            _git=self._git,
+            _workspace_id=assigned,
+            _base_revision=base_revision,
+            _metadata_fingerprint=_metadata_fingerprint(root),
+        )
+
     def add_worker_worktree(self, integration: GitWorkspace, *, worker_id: str) -> GitWorkspace:
         """Create an isolated linked worktree and worker branch."""
         _validate_workspace_id(worker_id)
