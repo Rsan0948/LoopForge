@@ -47,7 +47,7 @@ from loopforge.domain.tooling import (
     SideEffectClass,
     ToolMetadata,
 )
-from loopforge.domain.types import BudgetLimit, Permission, RiskLevel
+from loopforge.domain.types import BudgetLimit, Permission, RiskLevel, WorkspaceId
 from loopforge.ports.clock import ClockPort, SleeperPort
 from loopforge.ports.model import ModelPort
 from loopforge.ports.sandbox import SandboxPort
@@ -173,6 +173,36 @@ def build_trusted_repair_runtime(
         workspace.root,
         commands=repair_command_specs(task.commands),
         environment={},
+    )
+    return _repair_bundle(
+        task,
+        workspace=workspace,
+        sandbox=sandbox,
+        requirements=SandboxRequirements(),
+        deps=deps,
+    )
+
+
+def build_adopted_repair_runtime(
+    task: RepairTask,
+    *,
+    repository: str | Path,
+    deps: RepairRuntimeDeps,
+) -> RepairRuntimeBundle:
+    """Run a repair task against an existing checkout, without copying it.
+
+    This is the dogfood path: the checkout is adopted at its current HEAD and
+    all model edits remain visible in that checkout.  Callers must provide a
+    code-owned command allowlist and acceptance contract; repository content
+    cannot widen either one.
+    """
+    workspace = GitWorkspaceManager(Path(repository).parent).adopt_existing(
+        repository, workspace_id=WorkspaceId(task.task_id)
+    )
+    sandbox: SandboxPort = ConstrainedLocalSandbox(
+        workspace.root,
+        commands=repair_command_specs(task.commands),
+        environment={"CIVICML_ENV": "test"},
     )
     return _repair_bundle(
         task,

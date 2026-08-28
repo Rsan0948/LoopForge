@@ -30,15 +30,27 @@ from loopforge.domain.tooling import (
     ToolMetadata,
 )
 from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel, RunStatus
+from loopforge.domain.workspace import (
+    AcceptanceCriteria,
+    FixtureFile,
+    FixtureSpec,
+    PatchConstraints,
+)
 from loopforge.entrypoints.repair import (
     RepairRuntimeDeps,
+    build_adopted_repair_runtime,
     build_container_repair_runtime,
     build_trusted_repair_runtime,
 )
 from loopforge.ports.model import ModelPort
 from loopforge.ports.tools import ToolResult
 from loopforge.workloads.fixtures import adder_repair_task
-from loopforge.workloads.repair import RepairTask, repair_tool_specs
+from loopforge.workloads.repair import (
+    RepairCommand,
+    RepairCommandKind,
+    RepairTask,
+    repair_tool_specs,
+)
 
 _OLLAMA_API_KEY_ENV = "LOOPFORGE_OLLAMA_API_KEY"
 _DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
@@ -325,9 +337,81 @@ def _repair_demo(  # noqa: PLR0912, PLR0913 - CLI wiring keeps provider options 
     return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
+def _civicml_loop(repository: str, *, deepseek_model: str) -> int:
+    """Run DeepSeek repair iterations against an adopted CivicML checkout."""
+    root = Path(repository).resolve()
+    python = root / ".venv/bin/python"
+    if not python.is_file():
+        print(f"error: expected CivicML virtualenv interpreter at {python}")
+        return 2
+    task = RepairTask(
+        task_id="civicml-loop",
+        objective=(
+            "Fix every currently failing CivicML test and keep the existing documented behavior. "
+            "Use the real source and tests in this checkout. Iterate: inspect failures, make the "
+            "smallest correct edits, run the checks, and continue until all checks pass."
+        ),
+        fixture=FixtureSpec(
+            fixture_id="adopted-civicml",
+            files=(FixtureFile(path="pyproject.toml", content="adopted checkout"),),
+        ),
+        commands=(
+            RepairCommand(
+                kind=RepairCommandKind.TEST,
+                name="civicml_tests",
+                argv=(str(python), "-m", "pytest", "-q"),
+                timeout_seconds=300,
+                cpu_seconds=240,
+            ),
+            RepairCommand(
+                kind=RepairCommandKind.LINT,
+                name="civicml_ruff",
+                argv=(str(python), "-m", "ruff", "check", "."),
+                timeout_seconds=120,
+                cpu_seconds=120,
+            ),
+        ),
+        acceptance=AcceptanceCriteria(
+            required_commands=("civicml_tests", "civicml_ruff"),
+            patch=PatchConstraints(
+                require_change=True,
+                allowed_prefixes=(
+                    "apps", "packages", "tests", "pyproject.toml", "requirements.txt"
+                ),
+                max_changed_files=30,
+            ),
+        ),
+    )
+    model = build_deepseek_model(task, model_name=deepseek_model)
+    store = InMemoryEventStore()
+    deps = RepairRuntimeDeps(
+        store=store,
+        clock=SystemClock(),
+        sleeper=SystemSleeper(),
+        telemetry=InMemoryTelemetry(),
+        model=model,
+        model_tier=ModelTier.ADVANCED,
+        budget=BudgetLimit(max_cost_usd=5.0, max_iterations=30),
+    )
+    bundle = build_adopted_repair_runtime(task, repository=root, deps=deps)
+    try:
+        state = bundle.runtime.run(task.objective)
+    finally:
+        bundle.close()
+    print(
+        f"run={state.run_id} status={state.status.value} "
+        f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
+    )
+    print(f"verification={state.last_verification}")
+    return 0 if state.status is RunStatus.SUCCEEDED else 1
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="loopforge")
-    parser.add_argument("command", choices=["demo", "repair-demo"])
+    parser = argparse.ArgumentParser(
+        prog="loopforge", epilog="legacy commands: {demo,repair-demo}"
+    )
+    parser.add_argument("command", choices=["demo", "repair-demo", "civicml-loop"])
+    parser.add_argument("--repository", default="/Users/rubensanchez/Developer/civicml-loopforge")
     parser.add_argument(
         "--container",
         metavar="IMAGE",
@@ -378,6 +462,8 @@ def main() -> int:
             ollama_context_window=args.ollama_context_window,
             deepseek_model=args.deepseek_model,
         )
+    if args.command == "civicml-loop":
+        return _civicml_loop(args.repository, deepseek_model=args.deepseek_model)
     return 2
 
 
