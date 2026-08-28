@@ -5,6 +5,11 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.artifacts import (
+    ArtifactKind,
+    validate_artifact_content,
+    validate_artifact_label,
+)
 from loopforge.domain.context import ContextItemSnapshot
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.tooling import ToolMetadata
@@ -132,6 +137,14 @@ class VerificationFailed(DomainEvent):
     summary: str
     score: float | None = None
 
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if self.score is not None and (
+            not math.isfinite(self.score) or not 0.0 <= self.score <= 1.0
+        ):
+            msg_9 = "verification score must be a finite fraction in [0, 1]"
+            raise ValueError(msg_9)
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ReflectionRecorded(DomainEvent):
@@ -163,6 +176,29 @@ class ContextAssembled(DomainEvent):
         if self.prompt_template_version is not None and not self.prompt_template_version.strip():
             msg_3 = "prompt template version cannot be empty"
             raise ValueError(msg_3)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ArtifactRecorded(DomainEvent):
+    """Durable workload-evidence artifact recorded alongside verification.
+
+    Artifacts (for example, the exact workspace patch and changed-file
+    inventory) make a run's evidence replayable from the authoritative event
+    stream. They are evidence-only: the reducer projects them without any
+    control-state effect, and their kind vocabulary is code-owned and closed.
+    """
+
+    kind: ArtifactKind
+    label: str
+    content: str
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if not isinstance(self.kind, ArtifactKind):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_10 = "artifact kind must be an ArtifactKind"
+            raise TypeError(msg_10)
+        validate_artifact_label(self.label)
+        validate_artifact_content(self.content)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -202,6 +238,7 @@ Event = (
     | VerificationFailed
     | ReflectionRecorded
     | ContextAssembled
+    | ArtifactRecorded
     | BudgetDebited
     | ApprovalRequested
     | ApprovalGranted

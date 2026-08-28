@@ -44,20 +44,31 @@ from loopforge.ports.sandbox import (
 _TEST_IMAGE = "alpine:3.21"
 
 
+def _image_available() -> bool:
+    # Docker Desktop's containerd image store can fail short-name resolution in
+    # `image inspect` ("No such image") while `docker run` works; the canonical
+    # fully-qualified reference is the reliable probe.
+    for reference in (_TEST_IMAGE, f"docker.io/library/{_TEST_IMAGE}"):
+        try:
+            image = subprocess.run(
+                ["docker", "image", "inspect", reference],
+                capture_output=True,
+                check=False,
+                timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if image.returncode == 0:
+            return True
+    return False
+
+
 def _docker_ready() -> bool:
     try:
         info = subprocess.run(["docker", "info"], capture_output=True, check=False, timeout=15)
-        if info.returncode != 0:
-            return False
-        image = subprocess.run(
-            ["docker", "image", "inspect", _TEST_IMAGE],
-            capture_output=True,
-            check=False,
-            timeout=15,
-        )
     except (OSError, subprocess.TimeoutExpired):
         return False
-    return image.returncode == 0
+    return info.returncode == 0 and _image_available()
 
 
 _REQUIRES_DOCKER = pytest.mark.skipif(
@@ -152,6 +163,14 @@ def test_root_must_be_a_directory(tmp_path: Path) -> None:
 def test_image_must_be_a_clean_reference(tmp_path: Path, image: str) -> None:
     with pytest.raises(ValueError, match="container image must be a non-empty reference"):
         _sandbox(tmp_path, _config(image=image))
+
+
+@pytest.mark.parametrize("image", ["--privileged", "--network=host", "-v/host:/host"])
+def test_image_must_never_become_a_docker_flag(tmp_path: Path, image: str) -> None:
+    # A leading-dash reference would be parsed as a `docker run` flag,
+    # demoting the code-owned command argv to the image positional.
+    with pytest.raises(ValueError, match="must not start with '-'"):
+        _config(image=image)
 
 
 @pytest.mark.parametrize(

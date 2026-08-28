@@ -8,6 +8,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.artifacts import ArtifactKind
 from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
@@ -15,6 +16,7 @@ from loopforge.domain.events import (
     ActionRejected,
     ApprovalGranted,
     ApprovalRequested,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
@@ -717,6 +719,43 @@ def test_reflecting_run_can_replan_back_to_ready() -> None:
     assert state.plan == "smaller diff"
 
 
+def _artifact_recorded(sequence: int) -> ArtifactRecorded:
+    return ArtifactRecorded(
+        event_id=_event_id(sequence),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=sequence,
+        kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+        label="workspace:fixture",
+        content="workspace_id=fixture\n\ndiff --git a/adder.py b/adder.py",
+    )
+
+
+def test_artifact_recorded_is_evidence_only_while_verifying() -> None:
+    before = _state_at("verifying")
+
+    state = reduce_event(before, _artifact_recorded(7))
+
+    assert state.status is RunStatus.VERIFYING
+    assert state.version == before.version + 1
+    assert state.last_verification == before.last_verification
+    assert state.last_observation == before.last_observation
+    assert state.consecutive_no_progress == before.consecutive_no_progress
+
+
+def test_artifact_recorded_is_allowed_while_reflecting() -> None:
+    state = reduce_event(_state_at("reflecting"), _artifact_recorded(9))
+
+    assert state.status is RunStatus.REFLECTING
+
+
+def test_artifact_recorded_is_rejected_outside_verification() -> None:
+    with pytest.raises(
+        InvalidTransitionError, match="ArtifactRecorded is invalid while run is ready"
+    ):
+        reduce_event(_state_at("ready"), _artifact_recorded(3))
+
+
 def test_context_assembled_projects_last_context_items_and_stays_ready() -> None:
     event = _context_assembled(3)
 
@@ -1131,3 +1170,16 @@ def test_no_progress_tracking_matches_reference_model(
     assert state.best_verification_score == expected_best
     assert state.last_verification == expected_last
     assert state.consecutive_no_progress == expected_no_progress
+
+
+# --- PACS-010 hardening: catalog completeness and artifact projection pins ---
+
+
+def test_artifact_recorded_projects_a_content_fingerprint_for_dedup() -> None:
+    state = reduce_event(_state_at("verifying"), _artifact_recorded(7))
+
+    assert len(state.recorded_artifacts) == 1
+    fingerprint = state.recorded_artifacts[0]
+    assert fingerprint.kind == "workspace_snapshot"
+    assert fingerprint.label == "workspace:fixture"
+    assert fingerprint.content.startswith("workspace_id=fixture")

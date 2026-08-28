@@ -12,6 +12,7 @@ from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
     ActionRejected,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
@@ -43,6 +44,7 @@ from loopforge.domain.types import (
     UsageDelta,
     VerificationId,
 )
+from loopforge.ports.artifacts import ArtifactCollectorPort, ArtifactContractError, RunArtifact
 from loopforge.ports.clock import ClockPort, SleeperPort
 from loopforge.ports.context import ContextBuilderPort, ContextContractError
 from loopforge.ports.model import ModelContractError, ModelPort, ModelTurn
@@ -55,7 +57,7 @@ from loopforge.ports.tools import (
     ToolResult,
     UnknownToolError,
 )
-from loopforge.ports.verifier import VerifierPort
+from loopforge.ports.verifier import VerificationResult, VerifierContractError, VerifierPort
 
 EventFactory = Callable[[EventId, RunId, datetime, int], Event]
 
@@ -81,6 +83,7 @@ class Runtime:
     clock: ClockPort
     sleeper: SleeperPort
     telemetry: TelemetryPort | None = None
+    artifacts: ArtifactCollectorPort | None = None
     _telemetry: RuntimeTelemetry = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -144,6 +147,11 @@ class Runtime:
     def _drive(self, run_id: RunId) -> RunState:  # noqa: PLR0912, PLR0915 - the drive loop is intentionally one flat orchestration of the authorized cycle; span instrumentation pushes it over the thresholds
         while True:
             current = self.state_for(run_id)
+            if current.status.is_terminal:
+                # A seam invoked mid-cycle (for example fail-closed artifact
+                # recording after verification) may have already terminated
+                # the run; never stop it twice.
+                return current
             cycle = current.iteration + 1
             self._telemetry.set_cycle(cycle)
             with self._telemetry.span(
@@ -522,6 +530,13 @@ class Runtime:
             run_id, name=SpanName.VERIFY, verification_id=verification_id
         ) as verify_span:
             verification = self.verifier.verify(self.state_for(run_id))
+            # Boundary validation is intentional: adapters may violate port
+            # return types, and a malformed verdict must never be persisted.
+            if not isinstance(verification, VerificationResult):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg_15 = (
+                    f"verifier returned {type(verification).__name__}, expected VerificationResult"
+                )
+                raise VerifierContractError(msg_15)
             verify_span.attributes["loopforge.verification.passed"] = verification.passed
             if verification.score is not None:
                 verify_span.attributes["loopforge.verification.score"] = verification.score
@@ -536,18 +551,77 @@ class Runtime:
                     summary=verification.summary,
                 ),
             )
+        else:
+            self._persist(
+                run_id,
+                lambda event_id, rid, occurred_at, sequence: VerificationFailed(
+                    event_id=event_id,
+                    run_id=rid,
+                    occurred_at=occurred_at,
+                    sequence=sequence,
+                    summary=verification.summary,
+                    score=verification.score,
+                ),
+            )
+        self._record_artifacts(run_id)
+
+    def _record_artifacts(self, run_id: RunId) -> None:
+        """Persist workload-supplied evidence artifacts after verification.
+
+        The collector is an optional, workload-agnostic seam: the runtime core
+        has no knowledge of workspaces or patches, it only durably records
+        whatever typed artifacts the bound workload supplies. Evidence
+        collection is fail-closed: a collector failure terminates the run as
+        ``FAILURE`` with the reason recorded, so a run can never wedge
+        non-terminal (and re-raise on every resume) because evidence could not
+        be gathered. Byte-identical re-records (same kind, label, and content
+        as an already-recorded artifact) are skipped, keeping evidence
+        at-most-once across crash/resume between artifact appends while never
+        dropping fresh per-cycle evidence.
+        """
+        if self.artifacts is None:
             return
-        self._persist(
-            run_id,
-            lambda event_id, rid, occurred_at, sequence: VerificationFailed(
-                event_id=event_id,
-                run_id=rid,
-                occurred_at=occurred_at,
-                sequence=sequence,
-                summary=verification.summary,
-                score=verification.score,
-            ),
-        )
+        state = self.state_for(run_id)
+        try:
+            collected = self.artifacts.collect(state)
+            # Validate the whole batch before persisting anything: contract
+            # violations must not leave partial evidence behind.
+            validated = tuple(self._validate_artifact(item) for item in collected)
+        except Exception as exc:
+            self._stop(
+                run_id,
+                StopReason.FAILURE,
+                "ARTIFACT_COLLECTION_FAILED",
+                summary=f"artifact collection failed: {type(exc).__name__}: {exc}",
+            )
+            return
+        known = {
+            (fingerprint.kind, fingerprint.label, fingerprint.content)
+            for fingerprint in state.recorded_artifacts
+        }
+        for artifact in validated:
+            if (artifact.kind.value, artifact.label, artifact.content) in known:
+                continue
+            self._persist(
+                run_id,
+                lambda event_id, rid, occurred_at, sequence, artifact=artifact: ArtifactRecorded(
+                    event_id=event_id,
+                    run_id=rid,
+                    occurred_at=occurred_at,
+                    sequence=sequence,
+                    kind=artifact.kind,
+                    label=artifact.label,
+                    content=artifact.content,
+                ),
+            )
+
+    @staticmethod
+    def _validate_artifact(artifact: object) -> RunArtifact:
+        # Boundary validation is intentional: adapters may violate port return types.
+        if not isinstance(artifact, RunArtifact):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_14 = f"artifact collector returned {type(artifact).__name__}, expected RunArtifact"
+            raise ArtifactContractError(msg_14)
+        return artifact
 
     def _persist_plan(self, run_id: RunId, plan: str) -> None:
         self._persist(

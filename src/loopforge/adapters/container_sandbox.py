@@ -111,6 +111,11 @@ class ContainerSandboxConfig:
         if not self.image.strip() or any(char.isspace() for char in self.image):
             msg = "container image must be a non-empty reference without whitespace"
             raise ValueError(msg)
+        if self.image.startswith("-"):
+            # A leading-dash reference would be parsed as a `docker run` flag,
+            # demoting the code-owned command argv to the image positional.
+            msg_7 = "container image must not start with '-'"
+            raise ValueError(msg_7)
         if (
             not math.isfinite(self.pids_limit)
             or not math.isfinite(self.tmpfs_bytes)

@@ -11,6 +11,7 @@ ActionId = NewType("ActionId", str)
 WorkerId = NewType("WorkerId", str)
 VerificationId = NewType("VerificationId", str)
 ContextItemId = NewType("ContextItemId", str)
+WorkspaceId = NewType("WorkspaceId", str)
 
 
 class RunStatus(StrEnum):

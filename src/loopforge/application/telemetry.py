@@ -11,6 +11,7 @@ from loopforge.domain.events import (
     ActionRejected,
     ApprovalGranted,
     ApprovalRequested,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
@@ -440,6 +441,19 @@ class RuntimeTelemetry:
                     attributes=context_attributes,
                 )
                 self._metric(event, MetricName.CYCLES, 1.0)
+            case ArtifactRecorded(kind=kind, label=label, content=content):
+                # The artifact payload itself is workload evidence and is never
+                # copied into telemetry; only its code-owned shape is projected.
+                self._log(
+                    event,
+                    LogSeverity.INFO,
+                    "artifact recorded",
+                    attributes={
+                        "loopforge.artifact.kind": kind.value,
+                        "loopforge.artifact.label": SensitiveText(label),
+                        "loopforge.artifact.content_bytes": len(content.encode("utf-8")),
+                    },
+                )
             case BudgetDebited(usage=usage):
                 self._log(
                     event,

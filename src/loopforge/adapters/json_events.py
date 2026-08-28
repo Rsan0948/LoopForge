@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Final, cast
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.artifacts import ArtifactKind
 from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
@@ -15,6 +16,7 @@ from loopforge.domain.events import (
     ActionRejected,
     ApprovalGranted,
     ApprovalRequested,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
@@ -71,6 +73,7 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         VerificationFailed,
         ReflectionRecorded,
         ContextAssembled,
+        ArtifactRecorded,
         BudgetDebited,
         ApprovalRequested,
         ApprovalGranted,
@@ -324,6 +327,15 @@ def _context_source(data: dict[str, Any]) -> ContextSource:
     )
 
 
+def _construct_artifact_recorded(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ArtifactRecorded(
+        **base,
+        kind=ArtifactKind(_required_str(data, "kind")),
+        label=_required_str(data, "label"),
+        content=_required_str(data, "content"),
+    )
+
+
 def _construct_budget_debited(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return BudgetDebited(**base, usage=_usage(_required_object(data, "usage")))
 
@@ -363,6 +375,7 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "VerificationFailed": _construct_verification_failed,
     "ReflectionRecorded": _construct_reflection_recorded,
     "ContextAssembled": _construct_context_assembled,
+    "ArtifactRecorded": _construct_artifact_recorded,
     "BudgetDebited": _construct_budget_debited,
     "ApprovalRequested": _construct_approval_requested,
     "ApprovalGranted": _construct_approval_granted,

@@ -37,6 +37,11 @@ class SandboxCommandTools:
                 msg_4 = f"sandbox cannot satisfy tool {binding.metadata.name!r}: {exc}"
                 raise ValueError(msg_4) from exc
 
+    @property
+    def tool_names(self) -> tuple[str, ...]:
+        """Registered sandbox tool names, for composite dispatch wiring."""
+        return tuple(self._bindings)
+
     def metadata_for(self, tool_name: str) -> ToolMetadata:
         try:
             return self._bindings[tool_name].metadata

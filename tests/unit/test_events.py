@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import FrozenInstanceError
 from datetime import UTC, datetime, timedelta, timezone, tzinfo
 from typing import get_args
@@ -11,6 +12,7 @@ from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.artifacts import MAX_ARTIFACT_CONTENT_BYTES, ArtifactKind
 from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
@@ -18,6 +20,7 @@ from loopforge.domain.events import (
     ActionRejected,
     ApprovalGranted,
     ApprovalRequested,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
@@ -72,6 +75,7 @@ ALL_EVENT_CLASSES: tuple[type[DomainEvent], ...] = (
     VerificationPassed,
     VerificationFailed,
     ReflectionRecorded,
+    ArtifactRecorded,
     BudgetDebited,
     ApprovalRequested,
     ApprovalGranted,
@@ -243,6 +247,15 @@ def _all_events() -> tuple[Event, ...]:
             sequence=12,
             reflection="try a smaller diff",
         ),
+        ArtifactRecorded(
+            event_id=EventId("e18"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=18,
+            kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+            label="workspace:adder-regression",
+            content="workspace_id=adder-regression\n\ndiff --git a/adder.py b/adder.py",
+        ),
         BudgetDebited(
             event_id=EventId("e13"),
             run_id=RUN,
@@ -281,6 +294,19 @@ def _all_events() -> tuple[Event, ...]:
             context_items=(_context_snapshot(),),
         ),
     )
+
+
+def test_artifact_recorded_rejects_blank_label() -> None:
+    with pytest.raises(ValueError, match="artifact label cannot be empty"):
+        ArtifactRecorded(
+            event_id=EventId("e1"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=1,
+            kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+            label="  ",
+            content="evidence",
+        )
 
 
 def test_domain_event_accepts_positive_sequence_and_aware_timestamp() -> None:
@@ -733,3 +759,70 @@ def test_retry_scheduled_rejects_any_next_attempt_at_or_below_one(next_attempt: 
 def test_retry_scheduled_rejects_any_negative_delay(delay_seconds: float) -> None:
     with pytest.raises(ValueError, match="retry delay cannot be negative"):
         _retry_scheduled(next_attempt=2, delay_seconds=delay_seconds)
+
+
+# --- PACS-010 hardening: event-construction validation pins ---
+
+
+def _base_fields() -> dict[str, object]:
+    return {
+        "event_id": EventId("e1"),
+        "run_id": RUN,
+        "occurred_at": NOW,
+        "sequence": 1,
+    }
+
+
+def test_artifact_recorded_rejects_invalid_kind_label_and_oversized_content() -> None:
+    with pytest.raises(TypeError, match="kind must be an ArtifactKind"):
+        ArtifactRecorded(
+            **_base_fields(),  # pyright: ignore[reportArgumentType]  # dict[str, object] fixture unpacking
+            kind="workspace_snapshot",  # pyright: ignore[reportArgumentType]  # intentional invalid kind
+            label="a",
+            content="c",
+        )
+    with pytest.raises(ValueError, match="control characters"):
+        ArtifactRecorded(
+            **_base_fields(),  # pyright: ignore[reportArgumentType]
+            kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+            label="forged\nlabel",
+            content="c",
+        )
+    with pytest.raises(ValueError, match="byte budget"):
+        ArtifactRecorded(
+            **_base_fields(),  # pyright: ignore[reportArgumentType]
+            kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+            label="a",
+            content="x" * (MAX_ARTIFACT_CONTENT_BYTES + 1),
+        )
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -0.5, 1.5])
+def test_verification_failed_rejects_non_finite_or_out_of_range_scores(bad: float) -> None:
+    with pytest.raises(ValueError, match="finite fraction"):
+        VerificationFailed(
+            **_base_fields(),  # pyright: ignore[reportArgumentType]
+            summary="still broken",
+            score=bad,
+        )
+
+
+def test_verification_failed_accepts_boundary_scores() -> None:
+    for boundary in (0.0, 1.0):
+        event = VerificationFailed(
+            **_base_fields(),  # pyright: ignore[reportArgumentType]
+            summary="s",
+            score=boundary,
+        )
+        assert event.score == boundary
+
+
+def test_transition_table_covers_the_entire_event_catalog() -> None:
+    # Drift guard: a new event type without a reducer transition arm would
+    # otherwise surface as a raw KeyError at reduction time instead of a
+    # deliberate contract failure.
+    from loopforge.domain.state import (  # noqa: PLC0415 - private catalog pinned at the point of use, not at module scope
+        _ALLOWED_STATUS,  # pyright: ignore[reportPrivateUsage]  # catalog pinned directly
+    )
+
+    assert set(_ALLOWED_STATUS) == set(ALL_EVENT_CLASSES)

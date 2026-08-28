@@ -18,6 +18,7 @@ from loopforge.adapters.json_events import (
     _to_jsonable,  # pyright: ignore[reportPrivateUsage]
 )
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.artifacts import MAX_ARTIFACT_CONTENT_BYTES, ArtifactKind
 from loopforge.domain.context import ContextAuthorityError, ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
     ActionAuthorized,
@@ -25,6 +26,7 @@ from loopforge.domain.events import (
     ActionRejected,
     ApprovalGranted,
     ApprovalRequested,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
@@ -281,6 +283,15 @@ EXAMPLES: tuple[Event, ...] = (
         ),
     ),
     # Nullable-field variant exercising supersedes/expires_at serialization.
+    ArtifactRecorded(
+        event_id=EventId("e22"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=22,
+        kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+        label="workspace:adder-regression",
+        content="workspace_id=adder-regression\n\ndiff --git a/adder.py b/adder.py\n",
+    ),
     ContextAssembled(
         event_id=EventId("e21"),
         run_id=RUN,
@@ -325,6 +336,7 @@ EXAMPLES: tuple[Event, ...] = (
     TOOL_EXECUTION_STARTED_UNKEYED,
     VERIFICATION_FAILED_UNSCORED,
     CONTEXT_ASSEMBLED,
+    ARTIFACT_RECORDED,
     CONTEXT_ASSEMBLED_SUPERSEDING,
 ) = EXAMPLES
 
@@ -367,7 +379,7 @@ def _legacy_tool_failed_payload(retryable: Any) -> str:
 
 def test_examples_cover_every_registered_event_type() -> None:
     assert {type(event).__name__ for event in EXAMPLES} == set(_EVENT_TYPES)
-    assert len(_EVENT_TYPES) == 18
+    assert len(_EVENT_TYPES) == 19
 
 
 @pytest.mark.parametrize(
@@ -935,6 +947,43 @@ def test_event_round_trip_is_a_canonical_fixed_point(event: Event) -> None:
     assert decoded == event
     assert CODEC.encode(decoded) == payload
     assert payload == json.dumps(json.loads(payload), sort_keys=True, separators=(",", ":"))
+
+
+# --- ArtifactRecorded decode hardening -------------------------------------------
+
+
+def _artifact_envelope(**overrides: Any) -> str:
+    envelope = _envelope(ARTIFACT_RECORDED)
+    body = cast(dict[str, Any], envelope["event"])
+    body.update(overrides)
+    return json.dumps(envelope)
+
+
+@pytest.mark.parametrize("key", ["kind", "label", "content"])
+def test_decode_artifact_recorded_rejects_mistyped_required_strings(key: str) -> None:
+    with pytest.raises(TypeError, match=f"{key} must be a string"):
+        CODEC.decode(_artifact_envelope(**{key: 7}))
+
+
+def test_decode_artifact_recorded_rejects_unknown_kind() -> None:
+    with pytest.raises(ValueError, match="is not a valid ArtifactKind"):
+        CODEC.decode(_artifact_envelope(kind="model_claimed_success"))
+
+
+def test_decode_artifact_recorded_rejects_blank_label() -> None:
+    with pytest.raises(ValueError, match="artifact label cannot be empty"):
+        CODEC.decode(_artifact_envelope(label="  "))
+
+
+def test_decode_artifact_recorded_rejects_control_characters_in_label() -> None:
+    with pytest.raises(ValueError, match="control characters"):
+        CODEC.decode(_artifact_envelope(label="workspace:forged\nline"))
+
+
+def test_decode_artifact_recorded_rejects_content_beyond_the_byte_budget() -> None:
+    oversized = "x" * (MAX_ARTIFACT_CONTENT_BYTES + 1)
+    with pytest.raises(ValueError, match="byte budget"):
+        CODEC.decode(_artifact_envelope(content=oversized))
 
 
 # --- ContextAssembled decode hardening -------------------------------------------

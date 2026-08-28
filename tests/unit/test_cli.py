@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import runpy
+import subprocess
 import sys
 
 import pytest
@@ -9,6 +10,29 @@ from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
 from loopforge.entrypoints.cli import main
+
+
+def _rlimit_as_supported() -> bool:
+    probe = "import resource; resource.setrlimit(resource.RLIMIT_AS, (268435456, 268435456))"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+_REQUIRES_RLIMIT_AS = pytest.mark.skipif(
+    not _rlimit_as_supported(),
+    reason=(
+        "platform rejects setrlimit(RLIMIT_AS); local sandbox launcher cannot apply "
+        "resource limits, so the trusted repair demo fails closed"
+    ),
+)
 
 DEMO_LINE = re.compile(r"run=run_[0-9a-f]{12} status=succeeded iterations=2 cost=\$0\.02")
 
@@ -131,6 +155,26 @@ def test_extra_arguments_exit_with_usage_error(
     assert "unrecognized arguments: extra" in captured.err
 
 
+@_REQUIRES_RLIMIT_AS
+def test_repair_demo_repairs_fixture_and_prints_exact_patch_evidence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "repair-demo")
+
+    assert main() == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    lines = captured.out.splitlines()
+    assert lines[0].startswith("run=run_")
+    assert "status=succeeded" in lines[0]
+    assert "command:run_tests: passed (exit_code=0)" in captured.out
+    assert "evidence artifacts recorded: 2" in captured.out
+    assert "exact patch evidence:" in captured.out
+    assert "-    return left - right" in captured.out
+    assert "+    return left + right" in captured.out
+
+
 def test_help_exits_zero_and_documents_demo_command(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -143,7 +187,7 @@ def test_help_exits_zero_and_documents_demo_command(
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out.startswith("usage: loopforge")
-    assert "{demo}" in captured.out
+    assert "{demo,repair-demo}" in captured.out
 
 
 @example(command="DEMO")
@@ -184,3 +228,30 @@ def test_module_main_guard_runs_demo_and_exits_zero(
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
     assert DEMO_LINE.fullmatch(captured.out.splitlines()[0]) is not None
+
+
+# --- PACS-010 hardening: CLI input-validation pins ---
+
+
+def test_repair_demo_rejects_empty_container_image(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "repair-demo", "--container", "")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "non-empty image reference" in captured.out
+
+
+def test_repair_demo_rejects_flag_like_container_image(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The equals form forces argparse to accept the flag-like token as the value.
+    _argv(monkeypatch, "repair-demo", "--container=--privileged")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "invalid repair-demo configuration" in captured.out
+    assert "must not start with '-'" in captured.out

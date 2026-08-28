@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import tempfile
+from pathlib import Path
 
 from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
 from loopforge.adapters.memory import InMemoryEventStore
@@ -10,6 +12,7 @@ from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context_lifecycle import ContextTokenBudget
+from loopforge.domain.events import ArtifactRecorded
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -22,8 +25,14 @@ from loopforge.domain.tooling import (
     SideEffectClass,
     ToolMetadata,
 )
-from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel
+from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel, RunStatus
+from loopforge.entrypoints.repair import (
+    RepairRuntimeDeps,
+    build_container_repair_runtime,
+    build_trusted_repair_runtime,
+)
 from loopforge.ports.tools import ToolResult
+from loopforge.workloads.fixtures import adder_repair_task
 
 
 def _metadata(
@@ -151,12 +160,87 @@ def _demo() -> int:
     return 0
 
 
+def _repair_demo(container_image: str | None) -> int:
+    """Repair a fixture repository through the full runtime, deterministically.
+
+    Default is the trusted-development path: a code-defined fixture on the
+    local sandbox with a scripted model. ``--container IMAGE`` selects the
+    untrusted path explicitly: the same fixture executes through the hardened
+    container sandbox with code-owned isolation requirements. Success is
+    granted only by the independent verifier stack, and the exact patch plus
+    verification evidence are captured as durable, replayable events.
+    """
+    if container_image is not None and not container_image.strip():
+        print("error: --container requires a non-empty image reference")
+        return 2
+    if container_image is not None:
+        task = adder_repair_task(executable="/usr/local/bin/python")
+    else:
+        task = adder_repair_task()
+    with tempfile.TemporaryDirectory(prefix="loopforge-repair-") as directory:
+        store = InMemoryEventStore()
+        telemetry = InMemoryTelemetry()
+        deps = RepairRuntimeDeps(
+            store=store, clock=SystemClock(), sleeper=SystemSleeper(), telemetry=telemetry
+        )
+        try:
+            if container_image is not None:
+                bundle = build_container_repair_runtime(
+                    task,
+                    image=container_image,
+                    workspaces_dir=Path(directory),
+                    deps=deps,
+                )
+            else:
+                bundle = build_trusted_repair_runtime(
+                    task,
+                    workspaces_dir=Path(directory),
+                    deps=deps,
+                )
+        except ValueError as exc:
+            print(f"error: invalid repair-demo configuration: {exc}")
+            return 2
+        try:
+            state = bundle.runtime.run(task.objective)
+        finally:
+            bundle.close()
+        events = store.events_for(state.run_id)
+        artifacts = [event for event in events if isinstance(event, ArtifactRecorded)]
+        print(
+            f"run={state.run_id} status={state.status.value} "
+            f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
+        )
+        print(f"final verification: {state.last_verification}")
+        print(
+            f"workspace={bundle.workspace.workspace_id} "
+            f"base_revision={bundle.workspace.base_revision}"
+        )
+        print(f"evidence artifacts recorded: {len(artifacts)}")
+        if artifacts:
+            latest = artifacts[-1]
+            print(
+                f"latest artifact: kind={latest.kind.value} label={latest.label} "
+                f"bytes={len(latest.content.encode('utf-8'))}"
+            )
+            print("exact patch evidence:")
+            print(latest.content)
+        return 0 if state.status is RunStatus.SUCCEEDED else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="loopforge")
-    parser.add_argument("command", choices=["demo"])
+    parser.add_argument("command", choices=["demo", "repair-demo"])
+    parser.add_argument(
+        "--container",
+        metavar="IMAGE",
+        default=None,
+        help="run repair-demo through the hardened container sandbox using IMAGE",
+    )
     args = parser.parse_args()
     if args.command == "demo":
         return _demo()
+    if args.command == "repair-demo":
+        return _repair_demo(args.container)
     return 2
 
 

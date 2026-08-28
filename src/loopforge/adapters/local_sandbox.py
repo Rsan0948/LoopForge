@@ -23,6 +23,12 @@ from loopforge.ports.sandbox import (
     SandboxTimeoutError,
 )
 
+_GIT_DIR_NAME: Final = ".git"
+
+
+def _has_unsafe_characters(value: str) -> bool:
+    return any(ord(char) < 0x20 or ord(char) == 0x7F for char in value)
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SandboxLimits:
@@ -130,13 +136,29 @@ class ConstrainedLocalSandbox:
 
     def read_text(self, relative_path: str) -> str:
         path = self._safe_path(relative_path, allow_missing=False)
-        if not path.is_file():
-            msg_8 = "read target must be a regular file"
-            raise SandboxPathError(msg_8)
-        if path.stat().st_size > self._limits.max_read_bytes:
-            msg_9 = "read exceeds sandbox byte limit"
-            raise SandboxPolicyError(msg_9)
-        return path.read_text(encoding="utf-8")
+        try:
+            if not path.is_file():
+                msg_8 = "read target must be a regular file"
+                raise SandboxPathError(msg_8)
+            if path.stat().st_size > self._limits.max_read_bytes:
+                msg_9 = "read exceeds sandbox byte limit"
+                raise SandboxPolicyError(msg_9)
+            # newline="" keeps on-disk bytes (CRLF included) faithfully: reads,
+            # edits, and diffs must never silently rewrite line endings.
+            return path.read_text(encoding="utf-8", newline="")
+        except UnicodeDecodeError as exc:
+            msg_23 = "read target is not valid utf-8 text"
+            raise SandboxPolicyError(msg_23) from exc
+        except FileNotFoundError as exc:
+            # Vanished between path resolution and read: report, never crash.
+            msg_24 = "sandbox path does not exist"
+            raise SandboxPathError(msg_24) from exc
+        except PermissionError as exc:
+            msg_25 = "read target is not readable"
+            raise SandboxPolicyError(msg_25) from exc
+        except OSError as exc:
+            msg_26 = f"read failed: {exc}"
+            raise SandboxError(msg_26) from exc
 
     def write_text(self, relative_path: str, content: str) -> None:
         encoded = content.encode("utf-8")
@@ -149,13 +171,20 @@ class ConstrainedLocalSandbox:
         if path.exists() and (path.is_symlink() or not path.is_file()):
             msg_11 = "write target must be a regular non-symlink file"
             raise SandboxPathError(msg_11)
-        fd, temp_name = tempfile.mkstemp(prefix=".loopforge-", dir=path.parent)
+        try:
+            fd, temp_name = tempfile.mkstemp(prefix=".loopforge-", dir=path.parent)
+        except OSError as exc:
+            msg_27 = f"write failed: {exc}"
+            raise SandboxError(msg_27) from exc
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
             Path(temp_name).replace(path)
+        except OSError as exc:
+            msg_28 = f"write failed: {exc}"
+            raise SandboxError(msg_28) from exc
         finally:
             with suppress(FileNotFoundError):
                 Path(temp_name).unlink()
@@ -221,10 +250,20 @@ class ConstrainedLocalSandbox:
             )
 
     def _safe_path(self, relative_path: str, *, allow_missing: bool) -> Path:
+        if _has_unsafe_characters(relative_path):
+            msg_29 = "sandbox paths must not contain NUL or control characters"
+            raise SandboxPathError(msg_29)
         raw = Path(relative_path)
         if raw.is_absolute() or ".." in raw.parts:
             msg_12 = "sandbox paths must be relative and cannot contain '..'"
             raise SandboxPathError(msg_12)
+        if raw.parts and raw.parts[0] == _GIT_DIR_NAME:
+            # The file API has no legitimate business inside .git: a writable
+            # (or readable) repository-metadata directory would let workload
+            # content steer host-side Git execution (config, attributes,
+            # hooks) or read object stores.
+            msg_30 = "sandbox paths cannot target the Git metadata directory"
+            raise SandboxPathError(msg_30)
         candidate = self._root.joinpath(raw)
         self._assert_no_symlink_components(candidate.parent if allow_missing else candidate)
         if allow_missing and candidate.is_symlink():

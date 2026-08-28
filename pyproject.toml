@@ -73,6 +73,7 @@ name = "Core dependency layers"
 type = "layers"
 layers = [
   "loopforge.entrypoints",
+  "loopforge.workloads",
   "loopforge.application",
   "loopforge.ports",
   "loopforge.domain",

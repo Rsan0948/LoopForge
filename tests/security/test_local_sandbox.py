@@ -17,6 +17,7 @@ from loopforge.adapters.local_sandbox import (
 )
 from loopforge.domain.security import SandboxRequirements
 from loopforge.ports.sandbox import (
+    SandboxError,
     SandboxPathError,
     SandboxPolicyError,
     SandboxTimeoutError,
@@ -260,7 +261,7 @@ def test_write_failure_leaves_no_partial_file(
         raise OSError(msg)
 
     monkeypatch.setattr(Path, "replace", fail_replace)
-    with pytest.raises(OSError, match="simulated replace failure"):
+    with pytest.raises(SandboxError, match="simulated replace failure"):
         sandbox.write_text("data.txt", "replacement that must not land")
 
     assert (tmp_path / "data.txt").read_text(encoding="utf-8") == "original"

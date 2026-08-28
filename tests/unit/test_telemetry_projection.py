@@ -1,21 +1,24 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from typing import TypedDict
+from typing import TypedDict, get_args
 
 from loopforge.adapters.scripted import FixedClock
 from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.application.telemetry import RuntimeTelemetry
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.artifacts import ArtifactKind
 from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
     ActionRejected,
     ApprovalGranted,
     ApprovalRequested,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
+    Event,
     PlanCreated,
     ReflectionRecorded,
     RetryScheduled,
@@ -285,6 +288,27 @@ def test_reflection_recorded_projects_log() -> None:
     assert sink.logs[0].attributes["loopforge.reflection"] == "try harder"
 
 
+def test_artifact_recorded_projects_log_without_content_payload() -> None:
+    telemetry, sink = _telemetry()
+    telemetry.project_event(
+        ArtifactRecorded(
+            **_event_fields(11),
+            kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+            label="workspace:fixture",
+            content="exact patch bytes",
+        )
+    )
+    log = sink.logs[0]
+    assert log.message == "artifact recorded"
+    assert log.severity is LogSeverity.INFO
+    assert log.attributes["loopforge.artifact.kind"] == "workspace_snapshot"
+    assert log.attributes["loopforge.artifact.label"] == "workspace:fixture"
+    assert log.attributes["loopforge.artifact.content_bytes"] == len(b"exact patch bytes")
+    # The evidence payload itself never enters the telemetry projection.
+    assert "exact patch bytes" not in log.attributes.values()
+    assert sink.metrics == ()
+
+
 def test_context_assembled_projects_cycle_metric_and_template_metadata() -> None:
     telemetry, sink = _telemetry()
     telemetry.project_event(
@@ -398,3 +422,75 @@ def test_projected_records_carry_current_cycle_correlation() -> None:
     telemetry.set_cycle(4)
     telemetry.project_event(PlanCreated(**_event_fields(2), plan="p"))
     assert sink.logs[0].correlation.cycle == 4
+
+
+# --- PACS-010 hardening: projector exhaustiveness drift guard ---
+
+
+def _catalog_examples() -> dict[type[Event], Event]:
+    proposal = ActionProposal(ACTION_ID, "inspect", {})
+    return {
+        RunStarted: RunStarted(**_event_fields(1), objective="fix the bug"),
+        PlanCreated: PlanCreated(**_event_fields(2), plan="do things"),
+        ActionProposed: ActionProposed(**_event_fields(3), proposal=proposal),
+        ActionAuthorized: ActionAuthorized(
+            **_event_fields(4), proposal=proposal, tool_metadata=_metadata()
+        ),
+        ActionRejected: ActionRejected(
+            **_event_fields(5), proposal=proposal, reason_code="BLOCKED"
+        ),
+        ToolExecutionStarted: ToolExecutionStarted(
+            **_event_fields(6), action_id=ACTION_ID, attempt=1, idempotency_key=None
+        ),
+        ToolSucceeded: ToolSucceeded(
+            **_event_fields(7), action_id=ACTION_ID, attempt=1, observation="ok"
+        ),
+        ToolFailed: ToolFailed(
+            **_event_fields(8),
+            action_id=ACTION_ID,
+            attempt=1,
+            error_code="X",
+            error_message="boom",
+            failure_class=ToolFailureClass.TRANSIENT,
+        ),
+        RetryScheduled: RetryScheduled(
+            **_event_fields(9),
+            action_id=ACTION_ID,
+            next_attempt=2,
+            delay_seconds=0.5,
+            reason_code="RETRY",
+        ),
+        CircuitOpened: CircuitOpened(**_event_fields(10), tool_name="inspect", reason_code="X"),
+        VerificationPassed: VerificationPassed(**_event_fields(11), summary="passed"),
+        VerificationFailed: VerificationFailed(**_event_fields(12), summary="failed", score=0.5),
+        ReflectionRecorded: ReflectionRecorded(**_event_fields(13), reflection="try again"),
+        ContextAssembled: ContextAssembled(**_event_fields(14), context_items=()),
+        ArtifactRecorded: ArtifactRecorded(
+            **_event_fields(15),
+            kind=ArtifactKind.WORKSPACE_SNAPSHOT,
+            label="workspace:fixture",
+            content="evidence",
+        ),
+        BudgetDebited: BudgetDebited(
+            **_event_fields(16),
+            usage=UsageDelta(cost_usd=0.01, input_tokens=10, output_tokens=5),
+        ),
+        ApprovalRequested: ApprovalRequested(
+            **_event_fields(17), action_id=ACTION_ID, reason="risky"
+        ),
+        ApprovalGranted: ApprovalGranted(**_event_fields(18), action_id=ACTION_ID),
+        RunStopped: RunStopped(
+            **_event_fields(19), reason=StopReason.SUCCESS_VERIFIED, summary="done"
+        ),
+    }
+
+
+def test_projector_maps_every_event_type_in_the_union() -> None:
+    examples = _catalog_examples()
+    # Drift guard: adding a 20th event type fails this test until a projector
+    # arm (and its example here) exists — silent drops are not possible.
+    assert set(examples) == set(get_args(Event))
+    for event in examples.values():
+        telemetry, sink = _telemetry()
+        telemetry.project_event(event)
+        assert sink.logs, f"{type(event).__name__} projected no structured log"

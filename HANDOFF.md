@@ -37,7 +37,29 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-009.
+Completed: PACS-001 through PACS-010.
+
+PACS-010 (software-repair workload and deterministic verifier stack, 2026-08-27) made software
+repair the reference workload while keeping the runtime workload-agnostic: a
+`WorkspaceManagerPort` with a Git-backed adapter (status/diff/checkout, symlink-safe diff
+rendering), safe file read/search/edit tools, predefined sandbox commands, a deterministic
+`RepairVerifier` (command outcomes + patch constraints + contract-checked acceptance hooks;
+model output never overrides it), workspace snapshot/diff evidence as the durable, replayable
+19th event `ArtifactRecorded` (schema v1; telemetry sees metadata only), hermetic offline
+fixture repositories, and a `repair-demo [--container IMAGE]` CLI. Untrusted repair tools
+declare code-owned `SandboxRequirements(process_filesystem_isolated=True,
+network_isolated=True)` and fail closed anywhere `ContainerSandbox` is unavailable; fixture
+content enters context only as `TrustClass.UNTRUSTED_CONTENT`. Live container E2E repairs the
+adder-regression fixture in 2 iterations with the exact patch recorded. An operator-initiated
+post-cycle adversarial hardening pass fixed and pinned ~10 defect clusters — most severely,
+hostile repository content driving host-side Git execution (a planted `.git/config` textconv
+via the rw bind mount; now blocked by a materialize-time metadata fingerprint verified before
+every host Git invocation) — plus verifier/evidence blind spots (ignored files invisible to
+`status()`), fail-open verifier edges, a permanent VERIFYING wedge on artifact-collector
+failure, crash/resume evidence duplication, NaN scores encoding into undecodable streams, and
+docker-argv flag injection via leading-dash image names. See
+`docs/process/cycles/PACS-010-software-repair-workload.md`. Checkpoint **not yet committed**
+(awaiting operator confirmation).
 
 PACS-009 (hardened container sandbox, 2026-08-27) added `ContainerSandbox`: a Docker-CLI-driven
 `SandboxPort` adapter that executes untrusted repository/build workloads in hardened containers
@@ -82,7 +104,31 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-009 + post-cycle hardening pass, 2026-08-27):
+Current checked evidence (PACS-010 + post-cycle hardening pass, 2026-08-27, Docker Desktop
+29.2.1 live):
+- 1237 tests passing, 15 platform-gated skips (9 pre-existing `RLIMIT_AS` + 4 trusted-local
+  repair E2E + 1 repair-demo CLI smoke + 1 non-UTF-8-filesystem gate; **zero** docker-gated
+  skips — all 13 live container isolation tests and the live container repair E2E executed
+  against the real runtime)
+- 96.44% branch-aware coverage
+- ruff format/check, pyright strict, and import-linter all executed and green (layers contract
+  now includes `workloads`)
+- live CLI evidence: `repair-demo --container python:3.12-alpine` → `status=succeeded
+  iterations=2` with the exact `adder.py` patch and verifier evidence recorded
+- cycle discoveries fixed and pinned: `python -B` in all fixture commands (same-second edits
+  defeated by stale `__pycache__`), and fully-qualified-reference fallback in both live docker
+  image probes (containerd store short-name `inspect` resolution failure)
+- post-cycle hardening fixed and pinned (see `tests/regression/test_hardening_regressions.py`
+  PACS-010 section and the cycle record): `.git/config` tamper → host-Git refusal via
+  materialize-time metadata fingerprint + hermetic Git environment; ignored files reported as
+  worktree deviations and reclaimed by `clean -fdqx`; literal pathspec checkout from the base
+  revision; non-UTF-8/control-char filename handling; non-string tool-argument failures;
+  fail-closed verifier hooks and sanitized detail strings; vacuous acceptance-criteria
+  rejection; `ARTIFACT_COLLECTION_FAILED` terminal stop (+ double-stop guard); evidence
+  dedup by content fingerprint; artifact label/content and finite-score domain validation;
+  leading-dash container image rejection; clean CLI error for blank `--container`
+
+Historical evidence (PACS-009 + post-cycle hardening pass, 2026-08-27):
 - 1091 tests passing, 9 platform-gated skips (13 live container tests executed against a real
   Docker runtime; daemon-free run skips them with reason codes and stays green)
 - 97.86% branch-aware coverage (`adapters/container_sandbox.py` at 100%)
@@ -131,13 +177,14 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-009-hardened-container-sandbox.md`
+- `docs/process/cycles/PACS-010-software-repair-workload.md`
 
 ## Next authorized work
 
-None. PACS-010 through PACS-017 are PLANNED, not active.
+None. PACS-011 through PACS-017 are PLANNED, not active.
 
-The operator must manually initiate PACS-010 or another explicitly named scope.
+The PACS-010 checkpoint is reconciled but **uncommitted**; the operator must confirm the commit
+and manually initiate PACS-011 (first live model adapter) or another explicitly named scope.
 
 ## Planned path to v1.0
 

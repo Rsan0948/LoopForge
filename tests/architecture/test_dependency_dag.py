@@ -12,7 +12,8 @@ LAYER = {
     "domain": 0,
     "ports": 1,
     "application": 2,
-    "entrypoints": 3,
+    "workloads": 3,
+    "entrypoints": 4,
 }
 
 
@@ -42,7 +43,7 @@ def test_core_dependency_dag_has_no_upward_imports() -> None:
                 if target_layer in LAYER and LAYER[target_layer] > source_rank:
                     violations.append(f"{path.relative_to(SRC)} -> {module}")
                 if (
-                    source_layer in {"domain", "ports", "application"}
+                    source_layer in {"domain", "ports", "application", "workloads"}
                     and target_layer == "adapters"
                 ):
                     violations.append(f"{path.relative_to(SRC)} -> {module}")

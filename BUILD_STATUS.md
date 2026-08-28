@@ -1,4 +1,94 @@
-# Build status — PACS-009 complete
+# Build status — PACS-010 complete
+
+PACS-010 establishes the software-repair reference workload and deterministic verifier stack
+while keeping the runtime workload-agnostic. New ports (`WorkspaceManagerPort`,
+`RunArtifactPort`) bind a Git-backed workspace manager (status/diff/checkout, symlink-safe
+untracked diff rendering), safe file read/search/edit tools over the sandbox file API, and a
+composite tool executor. The `workloads/` package (new import-linter layer between `ports` and
+`application`) binds repair tools that declare code-owned
+`SandboxRequirements(process_filesystem_isolated=True, network_isolated=True)` — binding fails
+closed anywhere `ContainerSandbox` is unavailable — and composes a deterministic
+`RepairVerifier` (predefined sandbox commands + patch constraints + contract-checked
+acceptance hooks); verifier truth is code-owned and model output never overrides it. Fixture
+repository content enters model context only as `TrustClass.UNTRUSTED_CONTENT` (rule 16).
+Workspace snapshot/diff evidence persists as the 19th domain event `ArtifactRecorded` (schema
+v1 unchanged): durable, replayable through the codec, projected to telemetry as metadata only.
+A `repair-demo [--container IMAGE]` CLI wires the full stack; the live container run repairs
+the adder-regression fixture in 2 iterations with the exact patch recorded. See
+`docs/process/cycles/PACS-010-software-repair-workload.md` (realizes ADR-0005 on ADR-0008/0009).
+No subsequent PACS cycle is active until manually initiated.
+
+Verified in this environment (2026-08-27, Docker Desktop 29.2.1 live,
+`python:3.12-alpine` pulled; includes post-cycle hardening pass):
+
+- `uv run pytest -q --cov` — **1237 passing, 15 skipped** (skips are exactly the macOS
+  `RLIMIT_AS` platform gates — 9 pre-existing local-sandbox + 4 trusted-local repair E2E + 1
+  repair-demo CLI smoke — plus 1 non-UTF-8-filesystem gate; **zero** docker-gated skips — all
+  13 live container isolation tests and the live container repair E2E executed against the
+  real runtime)
+- branch-aware coverage — **96.44% overall**; configured 90% gate satisfied
+- `ruff format --check .` / `ruff check .` — clean (126 files)
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken (layers now include `workloads`)
+- live CLI evidence — `repair-demo --container python:3.12-alpine` → `status=succeeded
+  iterations=2`, verifier `command:run_tests: passed (exit_code=0); patch_constraints: passed
+  (files changed: adder.py)`, exact unified diff recorded (`return left - right` →
+  `return left + right`)
+
+Discoveries fixed and pinned this cycle: fixture commands run with `python -B` (same-second
+edits were defeated by stale `__pycache__` bytecode, silently failing verification); Docker
+Desktop's containerd image store fails short-name `docker image inspect` resolution, so both
+live docker probes (PACS-009 and PACS-010) fall back to the canonical fully-qualified reference
+— probe-only change, `docker run` argv untouched.
+
+Post-cycle hardening fixed and pinned (operator-initiated; see
+`tests/regression/test_hardening_regressions.py` PACS-010 section, the unit suites named in
+the cycle record, and `tests/security/test_local_sandbox.py`): hostile repository content
+could drive host-side Git execution — a model-planted `.git/config` textconv written through
+the rw bind mount would execute on the next host `git diff` — so the workspace adapter now
+verifies a materialize-time metadata fingerprint before every host Git invocation and runs
+Git with a hermetic environment (the file API also rejects `.git` paths); ignored files
+(`__pycache__/`) were invisible to `status()` and survived `reset()` (now reported as
+untracked deviations and reclaimed by `clean -fdqx`); `checkout()` reverted from the index
+with glob-able pathspecs (now reverts from the base revision with `:(literal)` pathspecs);
+non-UTF-8 filenames crashed output decoding and control-character filenames could forge lines
+in the rendered evidence document; non-string tool arguments crashed with `AttributeError`;
+verifier check-hook exceptions crashed the run instead of failing closed; hostile filenames
+could inject forged verifier-verdict lines into summaries/context/telemetry (detail strings
+now escaped and bounded); vacuous acceptance criteria were satisfiable by doing nothing;
+artifact-collector exceptions permanently wedged runs in VERIFYING (now a terminal
+`ARTIFACT_COLLECTION_FAILED` stop, plus a guard for the double-stop transition it exposed);
+crash/resume between artifact appends could duplicate byte-identical evidence (deduplicated
+by a `(kind, label, content)` fingerprint in `RunState.recorded_artifacts`); a NaN
+`VerificationFailed` score encoded into an undecodable event stream (finite scores now
+enforced at the domain and port boundaries); image names starting with `-` were interpolated
+into the `docker run` argv as flags; and `repair-demo --container ""` leaked an uncaught
+traceback (now exit 2 with a clean error, sandbox destroyed in `try/finally`).
+
+## Implemented through PACS-010
+
+- `domain/workspace.py` / `domain/artifacts.py` / `domain/verification.py`: workspace status,
+  diff and patch-constraint vocabulary (pure-string paths, no `pathlib` in domain),
+  `ArtifactKind`, `CheckOutcome` composition
+- 19th event `ArtifactRecorded` through all four touchpoints: `Event` union, reducer arm +
+  `_ALLOWED_STATUS`, JSON codec registry/constructor/dispatch, telemetry projector arm
+  (kind/label/content_bytes only — evidence never enters telemetry)
+- `ports/workspace.py` (`WorkspaceManagerPort`), `ports/artifacts.py` (`RunArtifactPort`,
+  `ArtifactContractError`); `Runtime` optional artifact seam records evidence after
+  verification, before terminal stop — runtime stays workload-agnostic
+- `adapters/git_workspace.py` (`GitWorkspaceManager`: offline hermetic fixture repos,
+  fail-loud rematerialization), `adapters/file_tools.py` (exact-match edit with
+  occurrence-count validation), `adapters/workspace_git_tools.py`,
+  `adapters/composite_tools.py`
+- `workloads/repair.py` + `workloads/fixtures.py`: tool/context/verifier binding,
+  adder-regression deterministic task, scripted repair actions for E2E
+- `entrypoints/repair.py` composition root + `repair-demo [--container IMAGE]` CLI
+- test suites: `test_workspace`, `test_file_tools`, `test_git_workspace`,
+  `test_workspace_tools`, `test_repair_verifier`, `test_repair_workload`,
+  `test_runtime_artifacts`, integration `test_repair_runtime` (scripted-model E2E incl. live
+  container variant), security `test_repair_isolation`, event-catalog updates (18→19)
+
+# Historical: PACS-009 complete
 
 PACS-009 establishes the hardened container sandbox: `ContainerSandbox`, a `SandboxPort` adapter
 that executes allowlisted commands inside hardened Docker containers via the Docker CLI (zero new
@@ -102,7 +192,7 @@ Verified in this environment (2026-08-27):
 - deterministic per-run traces: trace id = run id, root run span emitted once at terminal stop
   with stop-reason-derived status, cycle spans parenting operation spans, per-run monotonic
   span ids; verification correlation ids derived from the authoritative event sequence
-- event projector mapping all 18 domain event types to structured logs and the full required
+- event projector mapping all 18 domain event types (19 as of PACS-010) to structured logs and the full required
   metric set; context size/compaction gauges/counters from the
   `ContextAccountingSource.last_accounting` seam (PACS-007)
 - `TelemetrySandbox` decorator emitting sandbox-execution spans (fail-safe, standalone or

@@ -11,6 +11,7 @@ from loopforge.domain.events import (
     ActionRejected,
     ApprovalGranted,
     ApprovalRequested,
+    ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
@@ -39,6 +40,21 @@ class InvalidTransitionError(RuntimeError):
 class ToolFailureStreak:
     tool_name: str
     count: int
+
+
+@dataclass(frozen=True, slots=True)
+class ArtifactFingerprint:
+    """Projected identity of one recorded evidence artifact.
+
+    Content strings are shared references (already held by the decoded event
+    stream), so this projection adds no payload copies — it exists so the
+    runtime can skip byte-identical re-records after a crash/resume while
+    never dropping fresh per-cycle evidence.
+    """
+
+    kind: str
+    label: str
+    content: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +89,7 @@ class RunState:
     started_at: datetime | None = None
     last_occurred_at: datetime | None = None
     stop_reason: StopReason | None = None
+    recorded_artifacts: tuple[ArtifactFingerprint, ...] = ()
     version: int = 0
 
     @property
@@ -101,6 +118,7 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
     VerificationFailed: {RunStatus.VERIFYING},
     ReflectionRecorded: {RunStatus.REFLECTING},
     ContextAssembled: {RunStatus.READY},
+    ArtifactRecorded: {RunStatus.VERIFYING, RunStatus.REFLECTING},
     BudgetDebited: {
         RunStatus.PLANNING,
         RunStatus.READY,
@@ -304,6 +322,13 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             return replace(base, last_reflection=reflection, status=RunStatus.REFLECTING)
         case ContextAssembled(context_items=context_items):
             return replace(base, last_context_items=context_items)
+        case ArtifactRecorded(kind=kind, label=label, content=content):
+            # Evidence-only durability record: the exact artifact stays in the
+            # authoritative event stream. A (kind, label, content) fingerprint
+            # is projected so the runtime can keep evidence at-most-once
+            # across crash/resume without dropping fresh per-cycle evidence.
+            fingerprint = ArtifactFingerprint(kind=kind.value, label=label, content=content)
+            return replace(base, recorded_artifacts=(*base.recorded_artifacts, fingerprint))
         case BudgetDebited(usage=usage):
             return replace(
                 base,
