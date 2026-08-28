@@ -375,10 +375,7 @@ class GitWorkspaceManager:
             raise WorkspaceError(msg)
         assigned = workspace_id or WorkspaceId(root.name)
         _validate_workspace_id(str(assigned))
-        try:
-            base_revision = _run_git(self._git, root, "rev-parse", "HEAD").strip()
-        except WorkspaceError:
-            raise
+        base_revision = _run_git(self._git, root, "rev-parse", "HEAD").strip()
         return GitWorkspace(
             _root=root,
             _git=self._git,
