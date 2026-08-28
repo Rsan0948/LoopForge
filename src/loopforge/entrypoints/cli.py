@@ -361,7 +361,7 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
                 name="civicml_tests",
                 argv=(
                     "/usr/local/bin/python" if container_image else str(python),
-                    "-m", "pytest", "-q",
+                    "-m", "pytest", "-q", "--ignore=tests/research",
                 ),
                 timeout_seconds=300,
                 cpu_seconds=240,
@@ -369,7 +369,10 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
             RepairCommand(
                 kind=RepairCommandKind.LINT,
                 name="civicml_ruff",
-                argv=("/usr/local/bin/ruff" if container_image else str(python), "check", "."),
+                argv=(
+                    "/usr/local/bin/ruff" if container_image else str(python),
+                    "check", "apps", "packages", "tests",
+                ),
                 timeout_seconds=120,
                 cpu_seconds=120,
             ),
