@@ -65,8 +65,8 @@ exception-classification gaps (`httpx.DecodingError`, HTTP 408), NaN/inf cost ra
 dropped trust labels at the conversational boundary, rejected no-arg tool calls,
 constructor validation, unbounded durable stop text, failure-class coercion, and CLI
 error-path leaks; seven findings documented as designed. See
-`docs/process/cycles/PACS-011-first-live-model-adapter.md`. Checkpoint not yet committed
-(awaiting operator confirmation).
+`docs/process/cycles/PACS-011-first-live-model-adapter.md`. Checkpoint committed as
+`975cf12`.
 
 PACS-010 (software-repair workload and deterministic verifier stack, 2026-08-27) made software
 repair the reference workload while keeping the runtime workload-agnostic: a
@@ -227,9 +227,9 @@ Read the preceding cycle record before starting the next one:
 
 None. PACS-012 through PACS-017 are PLANNED, not active.
 
-The PACS-011 checkpoint is reconciled but **uncommitted**; the operator must confirm the
-commit and manually initiate PACS-012 (model capability registry and routing) or another
-explicitly named scope.
+The PACS-011 checkpoint is committed as `975cf12` (`feat: add first live model adapter
+(PACS-011)`). The operator may manually initiate PACS-012 (model capability registry and
+routing) or another explicitly named scope.
 
 ## Planned path to v1.0
 

@@ -262,7 +262,7 @@ every quality gate is green with hermetic, credential-free CI preserved. The pro
 text generation only: proposals are re-authorized against code-owned metadata every turn,
 verifier truth stays deterministic, and termination remains runtime-owned. No new ADR was
 required: the cycle realizes the PACS-011 scope of `remaining-pacs-plan.md` on
-ADR-0005/0008/0009. Checkpoint not yet committed (awaiting operator confirmation).
+ADR-0005/0008/0009. Checkpoint committed as `975cf12`.
 
 ## Follow-on implications
 
