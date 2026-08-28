@@ -26,7 +26,11 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+    WorkerMerged,
+    WorkerSpawned,
+    WorkerStopped,
 )
+from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
 from loopforge.domain.telemetry import (
     CorrelationIds,
     LogRecord,
@@ -42,7 +46,7 @@ from loopforge.domain.telemetry import (
     TelemetryAttributeValue,
 )
 from loopforge.domain.tooling import DataSensitivity
-from loopforge.domain.types import ActionId, RunId, StopReason, VerificationId
+from loopforge.domain.types import ActionId, RunId, StopReason, VerificationId, WorkerId
 from loopforge.ports.clock import ClockPort
 from loopforge.ports.context import ContextAccountingSource
 from loopforge.ports.telemetry import FailSafeTelemetry, TelemetryPort
@@ -89,9 +93,14 @@ class RuntimeTelemetry:
     boundary (redaction + exception containment).
     """
 
-    def __init__(self, sink: TelemetryPort | None, clock: ClockPort) -> None:
+    def __init__(
+        self, sink: TelemetryPort | None, clock: ClockPort, *, worker_id: WorkerId | None = None
+    ) -> None:
         self._sink = FailSafeTelemetry(sink if sink is not None else NullTelemetry())
         self._clock = clock
+        # Worker runtimes stamp every record with their worker identity
+        # (PACS-013); the single-worker runtime leaves it unset, unchanged.
+        self._worker_id = worker_id
         self._states: dict[RunId, _TraceState] = {}
         self._cycle: int | None = None
 
@@ -117,7 +126,7 @@ class RuntimeTelemetry:
             self._states[run_id] = _TraceState()
         return self._states[run_id]
 
-    def _correlation(
+    def _correlation(  # noqa: PLR0913 - keyword-only correlation plumbing is explicit
         self,
         run_id: RunId,
         *,
@@ -125,9 +134,11 @@ class RuntimeTelemetry:
         tool_name: str | None = None,
         attempt: int | None = None,
         verification_id: VerificationId | None = None,
+        worker_id: WorkerId | None = None,
     ) -> CorrelationIds:
         return CorrelationIds(
             run_id=run_id,
+            worker_id=worker_id if worker_id is not None else self._worker_id,
             cycle=self._cycle,
             action_id=action_id,
             tool_name=tool_name,
@@ -533,6 +544,63 @@ class RuntimeTelemetry:
                 if reason is StopReason.BUDGET_EXHAUSTED:
                     self._metric(event, MetricName.BUDGET_STOPS, 1.0)
 
+            case WorkerSpawned(
+                worker_id=worker_id,
+                worker_run_id=worker_run_id,
+                workspace_id=workspace_id,
+                budget_share_cost_usd=share,
+            ):
+                self._log(
+                    event,
+                    LogSeverity.INFO,
+                    "worker spawned",
+                    worker_id=worker_id,
+                    attributes={
+                        "loopforge.worker.run_id": str(worker_run_id),
+                        "loopforge.worker.workspace_id": str(workspace_id),
+                        "loopforge.worker.budget_share_cost_usd": share,
+                    },
+                )
+                self._metric(event, MetricName.WORKERS_SPAWNED, 1.0, worker_id=worker_id)
+            case WorkerStopped(worker_id=worker_id, outcome=outcome, summary=summary):
+                self._log(
+                    event,
+                    LogSeverity.INFO if outcome is WorkerOutcome.SUCCEEDED else LogSeverity.WARN,
+                    "worker stopped",
+                    worker_id=worker_id,
+                    attributes={
+                        "loopforge.worker.outcome": outcome.value,
+                        "loopforge.worker.summary": SensitiveText(summary),
+                    },
+                )
+                self._metric(
+                    event,
+                    MetricName.WORKERS_STOPPED,
+                    1.0,
+                    worker_id=worker_id,
+                    attributes={"loopforge.worker.outcome": outcome.value},
+                )
+            case WorkerMerged(worker_id=worker_id, outcome=outcome, revision=revision):
+                merge_attributes: dict[str, TelemetryAttributeValue | SensitiveText] = {
+                    "loopforge.merge.outcome": outcome.value
+                }
+                if revision is not None:
+                    merge_attributes["loopforge.merge.revision"] = revision
+                self._log(
+                    event,
+                    LogSeverity.INFO if outcome is MergeOutcome.MERGED else LogSeverity.ERROR,
+                    "worker merged",
+                    worker_id=worker_id,
+                    attributes=merge_attributes,
+                )
+                self._metric(
+                    event,
+                    MetricName.WORKERS_MERGED,
+                    1.0,
+                    worker_id=worker_id,
+                    attributes={"loopforge.merge.outcome": outcome.value},
+                )
+
     def _log(  # noqa: PLR0913 - keyword-only correlation plumbing keeps every call site explicit
         self,
         event: Event,
@@ -543,6 +611,7 @@ class RuntimeTelemetry:
         tool_name: str | None = None,
         attempt: int | None = None,
         verification_id: VerificationId | None = None,
+        worker_id: WorkerId | None = None,
         attributes: Mapping[str, TelemetryAttributeValue | SensitiveText] | None = None,
     ) -> None:
         self._sink.emit(
@@ -558,6 +627,7 @@ class RuntimeTelemetry:
                     tool_name=tool_name,
                     attempt=attempt,
                     verification_id=verification_id,
+                    worker_id=worker_id,
                 ),
             )
         )
@@ -573,6 +643,7 @@ class RuntimeTelemetry:
         tool_name: str | None = None,
         action_id: ActionId | None = None,
         verification_id: VerificationId | None = None,
+        worker_id: WorkerId | None = None,
         attributes: Mapping[str, TelemetryAttributeValue | SensitiveText] | None = None,
     ) -> None:
         self._sink.emit(
@@ -588,6 +659,7 @@ class RuntimeTelemetry:
                     action_id=action_id,
                     tool_name=tool_name,
                     verification_id=verification_id,
+                    worker_id=worker_id,
                 ),
             )
         )

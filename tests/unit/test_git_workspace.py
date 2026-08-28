@@ -309,3 +309,35 @@ def test_failed_materialize_removes_the_half_built_workspace(tmp_path: Path) -> 
     assert not (manager.workspaces_root / fixture.fixture_id).exists()
     # A retry with a working Git succeeds cleanly.
     assert manager.materialize(fixture).status().clean
+
+
+def test_worker_worktrees_are_isolated_and_merge_in_order(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    integration = manager.materialize(_fixture(), workspace_id=WorkspaceId("integration"))
+    worker = manager.add_worker_worktree(integration, worker_id="one")
+
+    assert (worker.root / ".git").is_file()
+    (worker.root / "module.py").write_text("value = 2\n", encoding="utf-8")
+    assert (integration.root / "module.py").read_text(encoding="utf-8") == "value = 1\n"
+
+    manager.commit_worker(worker, message="worker one repair")
+    revision = manager.merge_worker(integration, worker_id="one")
+
+    assert revision is not None
+    assert (integration.root / "module.py").read_text(encoding="utf-8") == "value = 2\n"
+
+
+def test_worker_merge_conflict_is_aborted(tmp_path: Path) -> None:
+    manager = _manager(tmp_path)
+    integration = manager.materialize(_fixture(), workspace_id=WorkspaceId("integration"))
+    first = manager.add_worker_worktree(integration, worker_id="one")
+    second = manager.add_worker_worktree(integration, worker_id="two")
+    (first.root / "module.py").write_text("value = 2\n", encoding="utf-8")
+    (second.root / "module.py").write_text("value = 3\n", encoding="utf-8")
+    manager.commit_worker(first, message="first")
+    manager.commit_worker(second, message="second")
+
+    assert manager.merge_worker(integration, worker_id="one") is not None
+    assert manager.merge_worker(integration, worker_id="two") is None
+    assert (integration.root / "module.py").read_text(encoding="utf-8") == "value = 2\n"
+    assert integration.status().clean

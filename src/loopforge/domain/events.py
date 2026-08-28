@@ -11,9 +11,24 @@ from loopforge.domain.artifacts import (
     validate_artifact_label,
 )
 from loopforge.domain.context import ContextItemSnapshot
+from loopforge.domain.orchestration import (
+    MergeOutcome,
+    WorkerOutcome,
+    validate_budget_share,
+    validate_worker_id,
+    validate_worker_text,
+)
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.tooling import ToolMetadata
-from loopforge.domain.types import ActionId, EventId, RunId, StopReason, UsageDelta
+from loopforge.domain.types import (
+    ActionId,
+    EventId,
+    RunId,
+    StopReason,
+    UsageDelta,
+    WorkerId,
+    WorkspaceId,
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -223,6 +238,83 @@ class RunStopped(DomainEvent):
     summary: str
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerSpawned(DomainEvent):
+    """Durable worker ownership record on the orchestrator's run stream.
+
+    Recorded when the orchestrator spawns a worker: which worker owns which
+    workspace, which run stream it drives, and its static cost-budget share
+    of the global limit (a share, never new authority — AGENTS.md rule 12).
+    """
+
+    worker_id: WorkerId
+    worker_run_id: RunId
+    workspace_id: WorkspaceId
+    objective: str
+    budget_share_cost_usd: float
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        validate_worker_id(str(self.worker_id))
+        validate_worker_id(str(self.workspace_id))
+        validate_worker_text(self.objective, "worker objective")
+        validate_budget_share(self.budget_share_cost_usd)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerStopped(DomainEvent):
+    """Durable record of a worker run reaching a terminal state."""
+
+    worker_id: WorkerId
+    outcome: WorkerOutcome
+    summary: str
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        validate_worker_id(str(self.worker_id))
+        if not isinstance(self.outcome, WorkerOutcome):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_11 = "worker outcome must be a WorkerOutcome"
+            raise TypeError(msg_11)
+        validate_worker_text(self.summary, "worker stop summary")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerMerged(DomainEvent):
+    """Durable reconciliation record for one worker's worktree branch.
+
+    ``MERGED`` carries the merge commit revision; ``CONFLICT`` carries none
+    (a conflicted merge is aborted, never silently resolved). Conflicting
+    state updates are therefore rejected explicitly and replayably.
+    """
+
+    worker_id: WorkerId
+    outcome: MergeOutcome
+    revision: str | None
+    detail: str
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        validate_worker_id(str(self.worker_id))
+        if not isinstance(self.outcome, MergeOutcome):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_12 = "merge outcome must be a MergeOutcome"
+            raise TypeError(msg_12)
+        if self.outcome is MergeOutcome.MERGED:
+            if self.revision is None or not self.revision.strip():
+                msg_13 = "a merged outcome must carry the merge revision"
+                raise ValueError(msg_13)
+        elif self.revision is not None:
+            msg_14 = "a conflict outcome cannot carry a merge revision"
+            raise ValueError(msg_14)
+        if self.revision is not None and _has_unsafe_revision(self.revision):
+            msg_15 = "merge revision must not contain control characters"
+            raise ValueError(msg_15)
+        validate_worker_text(self.detail, "worker merge detail")
+
+
+def _has_unsafe_revision(revision: str) -> bool:
+    return len(revision) > 128 or any(ord(char) < 0x20 or ord(char) == 0x7F for char in revision)
+
+
 Event = (
     RunStarted
     | PlanCreated
@@ -243,4 +335,7 @@ Event = (
     | ApprovalRequested
     | ApprovalGranted
     | RunStopped
+    | WorkerSpawned
+    | WorkerStopped
+    | WorkerMerged
 )

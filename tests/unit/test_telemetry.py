@@ -157,6 +157,9 @@ def test_metric_name_vocabulary_covers_every_required_metric() -> None:
         "loopforge.tokens.output",
         "loopforge.tokens.cached_input",
         "loopforge.cost.usd",
+        "loopforge.workers.spawned",
+        "loopforge.workers.stopped",
+        "loopforge.workers.merged",
     }
 
 

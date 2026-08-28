@@ -29,7 +29,11 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+    WorkerMerged,
+    WorkerSpawned,
+    WorkerStopped,
 )
+from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.telemetry import (
     REDACTION_PLACEHOLDER,
@@ -54,6 +58,8 @@ from loopforge.domain.types import (
     StopReason,
     UsageDelta,
     VerificationId,
+    WorkerId,
+    WorkspaceId,
 )
 
 NOW = datetime(2026, 8, 27, 12, 0, tzinfo=UTC)
@@ -481,6 +487,27 @@ def _catalog_examples() -> dict[type[Event], Event]:
         ApprovalGranted: ApprovalGranted(**_event_fields(18), action_id=ACTION_ID),
         RunStopped: RunStopped(
             **_event_fields(19), reason=StopReason.SUCCESS_VERIFIED, summary="done"
+        ),
+        WorkerSpawned: WorkerSpawned(
+            **_event_fields(20),
+            worker_id=WorkerId("worker-adder"),
+            worker_run_id=RunId("worker-run-1"),
+            workspace_id=WorkspaceId("ws-adder"),
+            objective="repair adder.py",
+            budget_share_cost_usd=0.5,
+        ),
+        WorkerStopped: WorkerStopped(
+            **_event_fields(21),
+            worker_id=WorkerId("worker-adder"),
+            outcome=WorkerOutcome.SUCCEEDED,
+            summary="worker finished",
+        ),
+        WorkerMerged: WorkerMerged(
+            **_event_fields(22),
+            worker_id=WorkerId("worker-adder"),
+            outcome=MergeOutcome.MERGED,
+            revision="a" * 40,
+            detail="merged worker branch",
         ),
     }
 

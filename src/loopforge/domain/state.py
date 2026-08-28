@@ -26,7 +26,11 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+    WorkerMerged,
+    WorkerSpawned,
+    WorkerStopped,
 )
+from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome, WorkerProjection
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.tooling import ToolMetadata
 from loopforge.domain.types import BudgetLimit, RunId, RunStatus, StopReason
@@ -90,6 +94,7 @@ class RunState:
     last_occurred_at: datetime | None = None
     stop_reason: StopReason | None = None
     recorded_artifacts: tuple[ArtifactFingerprint, ...] = ()
+    workers: tuple[WorkerProjection, ...] = ()
     version: int = 0
 
     @property
@@ -128,6 +133,9 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
     },
     ApprovalRequested: {RunStatus.READY},
     ApprovalGranted: {RunStatus.WAITING_FOR_APPROVAL},
+    WorkerSpawned: {RunStatus.READY, RunStatus.ACTING},
+    WorkerStopped: {RunStatus.ACTING},
+    WorkerMerged: {RunStatus.ACTING},
     RunStopped: {
         RunStatus.PLANNING,
         RunStatus.READY,
@@ -190,6 +198,44 @@ def _verification_progress(
     if state.last_verification is None or summary != state.last_verification:
         return state.best_verification_score, 0
     return state.best_verification_score, state.consecutive_no_progress + 1
+
+
+def _update_worker(
+    workers: tuple[WorkerProjection, ...],
+    worker_id: str,
+    *,
+    outcome: WorkerOutcome | None = None,
+    merge_outcome: MergeOutcome | None = None,
+) -> tuple[WorkerProjection, ...]:
+    """Roster bookkeeping: lifecycle events update exactly one known worker."""
+    for worker in workers:
+        if str(worker.worker_id) == worker_id:
+            updated = worker
+            if outcome is not None:
+                if updated.outcome is not None:
+                    msg_9 = f"worker {worker_id} already has a terminal outcome"
+                    raise InvalidTransitionError(msg_9)
+                updated = replace(updated, outcome=outcome)
+            if merge_outcome is not None:
+                if updated.merge_outcome is not None:
+                    msg_10 = f"worker {worker_id} already has a merge outcome"
+                    raise InvalidTransitionError(msg_10)
+                if updated.outcome is not WorkerOutcome.SUCCEEDED:
+                    msg_11 = f"only a succeeded worker may merge: {worker_id}"
+                    raise InvalidTransitionError(msg_11)
+                updated = replace(updated, merge_outcome=merge_outcome)
+            return tuple(updated if str(item.worker_id) == worker_id else item for item in workers)
+    msg_12 = f"unknown worker: {worker_id}"
+    raise InvalidTransitionError(msg_12)
+
+
+def _workers_resolved(workers: tuple[WorkerProjection, ...]) -> bool:
+    """Every worker stopped and every succeeded worker reconciled."""
+    return bool(workers) and all(
+        worker.outcome is not None
+        and (worker.outcome is not WorkerOutcome.SUCCEEDED or worker.merge_outcome is not None)
+        for worker in workers
+    )
 
 
 def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, PLR0912
@@ -351,6 +397,31 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 StopReason.CANCELLED: RunStatus.CANCELLED,
             }[reason]
             return replace(base, status=status, stop_reason=reason)
+        case WorkerSpawned(
+            worker_id=worker_id,
+            worker_run_id=worker_run_id,
+            workspace_id=workspace_id,
+            budget_share_cost_usd=share,
+        ):
+            if any(str(item.worker_id) == str(worker_id) for item in base.workers):
+                msg_13 = f"worker {worker_id} is already on the roster"
+                raise InvalidTransitionError(msg_13)
+            projection = WorkerProjection(
+                worker_id=worker_id,
+                worker_run_id=worker_run_id,
+                workspace_id=workspace_id,
+                budget_share_cost_usd=share,
+            )
+            return replace(base, workers=(*base.workers, projection), status=RunStatus.ACTING)
+        case WorkerStopped(worker_id=worker_id, outcome=outcome):
+            return replace(
+                base,
+                workers=_update_worker(base.workers, str(worker_id), outcome=outcome),
+            )
+        case WorkerMerged(worker_id=worker_id, outcome=outcome):
+            workers = _update_worker(base.workers, str(worker_id), merge_outcome=outcome)
+            status = RunStatus.VERIFYING if _workers_resolved(workers) else base.status
+            return replace(base, workers=workers, status=status)
 
 
 def replay(run_id: RunId, events: tuple[Event, ...]) -> RunState:

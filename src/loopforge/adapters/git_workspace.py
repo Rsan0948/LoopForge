@@ -49,6 +49,7 @@ import hashlib
 import os
 import shutil
 import subprocess
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -156,7 +157,7 @@ class GitWorkspace:
         return self._base_revision
 
     def status(self) -> WorkspaceStatus:
-        output = self._run(
+        output = self.run_git(
             "status",
             "--porcelain=v1",
             "-z",
@@ -179,7 +180,7 @@ class GitWorkspace:
         return WorkspaceStatus(changed=tuple(sorted(changed)), untracked=tuple(sorted(untracked)))
 
     def diff(self) -> str:
-        tracked = self._run("diff", "--no-color", "--no-ext-diff", self._base_revision, "--")
+        tracked = self.run_git("diff", "--no-color", "--no-ext-diff", self._base_revision, "--")
         parts = [tracked] if tracked.strip() else []
         for relative in self.status().untracked:
             rendered = self._render_new_file_diff(relative)
@@ -195,13 +196,13 @@ class GitWorkspace:
             _validate_checkout_path(path)
         # Restore from the base revision (index and worktree), never from the
         # possibly-staged index: revert converges to the recorded base.
-        self._run("checkout", self._base_revision, "--", *paths)
+        self.run_git("checkout", self._base_revision, "--", *paths)
 
     def reset(self) -> None:
-        self._run("reset", "--hard", "-q", self._base_revision)
+        self.run_git("reset", "--hard", "-q", self._base_revision)
         # -x: reclaim ignored files too, so planted hidden files cannot
         # survive a reset and influence later verification runs.
-        self._run("clean", "-fdqx")
+        self.run_git("clean", "-fdqx")
 
     def _render_new_file_diff(self, relative: str) -> str:  # noqa: PLR0911 - each early return is a deliberate hostile-content guard; folding them would obscure the defenses
         if _has_unsafe_characters(relative):
@@ -245,7 +246,7 @@ class GitWorkspace:
         )
         return "".join(rendered)
 
-    def _run(self, *args: str) -> str:
+    def run_git(self, *args: str) -> str:
         if _metadata_fingerprint(self._root) != self._metadata_fingerprint:
             msg = (
                 "repository metadata changed since materialization; "
@@ -263,6 +264,12 @@ def _metadata_fingerprint(root: Path) -> str:
     so creation, modification, deletion, or symlink swaps all fail closed.
     """
     digest = hashlib.sha256()
+    git_marker = root / _GIT_DIR_NAME
+    if git_marker.is_file() and not git_marker.is_symlink():
+        # Linked worktrees carry a `.git` pointer file. Pin the exact pointer
+        # so workspace content cannot redirect later host-side Git calls.
+        digest.update(b"worktree-pointer\x00")
+        digest.update(git_marker.read_bytes())
     for relative in ("config", "info/attributes"):
         candidate = root / _GIT_DIR_NAME / relative
         digest.update(relative.encode("utf-8"))
@@ -352,3 +359,44 @@ class GitWorkspaceManager:
             _base_revision=base_revision,
             _metadata_fingerprint=metadata_fingerprint,
         )
+
+    def add_worker_worktree(self, integration: GitWorkspace, *, worker_id: str) -> GitWorkspace:
+        """Create an isolated linked worktree and worker branch."""
+        _validate_workspace_id(worker_id)
+        target = self._root / f"worker-{worker_id}"
+        if target.exists():
+            msg = f"worker workspace already exists: {worker_id}"
+            raise WorkspaceError(msg)
+        branch = f"worker/{worker_id}"
+        integration.run_git(
+            "worktree", "add", "-q", "-b", branch, str(target), integration.base_revision
+        )
+        return GitWorkspace(
+            _root=target,
+            _git=self._git,
+            _workspace_id=WorkspaceId(worker_id),
+            _base_revision=integration.base_revision,
+            _metadata_fingerprint=_metadata_fingerprint(target),
+        )
+
+    @staticmethod
+    def commit_worker(workspace: GitWorkspace, *, message: str) -> str:
+        """Commit a verified worker patch and return its revision."""
+        if not message.strip():
+            msg = "worker commit message cannot be empty"
+            raise WorkspaceError(msg)
+        workspace.run_git("add", "-A")
+        workspace.run_git("commit", "-q", "-m", message)
+        return workspace.run_git("rev-parse", "HEAD").strip()
+
+    @staticmethod
+    def merge_worker(integration: GitWorkspace, *, worker_id: str) -> str | None:
+        """Merge one worker in spawn order; return None after an aborted conflict."""
+        _validate_workspace_id(worker_id)
+        try:
+            integration.run_git("merge", "--no-ff", "--no-edit", f"worker/{worker_id}")
+        except WorkspaceError:
+            with suppress(WorkspaceError):
+                integration.run_git("merge", "--abort")
+            return None
+        return integration.run_git("rev-parse", "HEAD").strip()

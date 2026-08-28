@@ -71,7 +71,7 @@ class _ResponseMessage(BaseModel):
     tool_calls: list[_ToolCall] | None = None
 
 
-class _ChatResponse(BaseModel):
+class ChatResponse(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
     message: _ResponseMessage
@@ -285,7 +285,7 @@ class OllamaModel:
             )
         return render_prompt(self._template, context, role=context.role)
 
-    def _post(self, payload: dict[str, object]) -> _ChatResponse:
+    def _post(self, payload: dict[str, object]) -> ChatResponse:
         try:
             raw = self._client.post(_CHAT_PATH, json=payload)
         except httpx.TimeoutException as exc:
@@ -319,7 +319,7 @@ class OllamaModel:
                 ModelFailureClass.PERMANENT, "MODEL_INVALID_RESPONSE", msg
             ) from exc
         try:
-            parsed = _ChatResponse.model_validate(data)
+            parsed = ChatResponse.model_validate(data)
         except ValidationError as exc:
             msg = f"provider response violated the chat schema: {exc.error_count()} errors"
             raise ModelTurnError(
@@ -349,7 +349,7 @@ class OllamaModel:
         msg = f"provider rejected the request (HTTP {status_code})"
         raise ModelTurnError(ModelFailureClass.PERMANENT, "MODEL_REQUEST_INVALID", msg)
 
-    def _parse_action(self, context: ModelContext, response: _ChatResponse) -> ActionProposal:
+    def _parse_action(self, context: ModelContext, response: ChatResponse) -> ActionProposal:
         calls = response.message.tool_calls or []
         if len(calls) != 1:
             msg = f"model proposed {len(calls)} tool actions, expected exactly one"
@@ -386,7 +386,7 @@ class OllamaModel:
             arguments=arguments,
         )
 
-    def _cost(self, response: _ChatResponse) -> float:
+    def _cost(self, response: ChatResponse) -> float:
         return (
             response.prompt_eval_count * self._capabilities.input_cost_usd_per_million
             + response.eval_count * self._capabilities.output_cost_usd_per_million

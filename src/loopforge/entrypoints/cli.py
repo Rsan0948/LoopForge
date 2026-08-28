@@ -6,6 +6,7 @@ import tempfile
 from pathlib import Path
 
 from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
+from loopforge.adapters.deepseek_model import DeepSeekModel
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
@@ -14,7 +15,7 @@ from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context_lifecycle import ContextTokenBudget
-from loopforge.domain.events import ArtifactRecorded
+from loopforge.domain.events import ArtifactRecorded, RunStopped
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -40,6 +41,7 @@ from loopforge.workloads.fixtures import adder_repair_task
 from loopforge.workloads.repair import RepairTask, repair_tool_specs
 
 _OLLAMA_API_KEY_ENV = "LOOPFORGE_OLLAMA_API_KEY"
+_DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
 
 
 def _metadata(
@@ -195,19 +197,34 @@ def build_ollama_model(
     )
 
 
+def build_deepseek_model(task: RepairTask, *, model_name: str) -> DeepSeekModel:
+    """Wire DeepSeek using the environment as the only credential source."""
+    api_key = (os.environ.get(_DEEPSEEK_API_KEY_ENV) or "").strip()
+    if not api_key:
+        msg = f"{_DEEPSEEK_API_KEY_ENV} is required for --model deepseek"
+        raise ValueError(msg)
+    return DeepSeekModel(
+        api_key=api_key,
+        model=model_name,
+        tools=repair_tool_specs(task),
+        template=default_controller_template(),
+    )
+
+
 def _close_model_quietly(model: ModelPort | None) -> None:
     close = getattr(model, "close", None)
     if callable(close):
         close()
 
 
-def _repair_demo(
+def _repair_demo(  # noqa: PLR0912, PLR0913 - CLI wiring keeps provider options explicit
     container_image: str | None,
     *,
     model_kind: str = "scripted",
     ollama_model: str = "devstral-small-2:latest",
     ollama_url: str = "http://localhost:11434",
     ollama_context_window: int = 131_072,
+    deepseek_model: str = "deepseek-v4-pro",
 ) -> int:
     """Repair a fixture repository through the full runtime, deterministically.
 
@@ -235,6 +252,8 @@ def _repair_demo(
                 base_url=ollama_url,
                 context_window_tokens=ollama_context_window,
             )
+        elif model_kind == "deepseek":
+            model = build_deepseek_model(task, model_name=deepseek_model)
         with tempfile.TemporaryDirectory(prefix="loopforge-repair-") as directory:
             store = InMemoryEventStore()
             telemetry = InMemoryTelemetry()
@@ -244,7 +263,13 @@ def _repair_demo(
                 sleeper=SystemSleeper(),
                 telemetry=telemetry,
                 model=model,
-                model_tier=(ModelTier.STANDARD if model_kind == "ollama" else ModelTier.ECONOMY),
+                model_tier=(
+                    ModelTier.ADVANCED
+                    if model_kind == "deepseek"
+                    else ModelTier.STANDARD
+                    if model_kind == "ollama"
+                    else ModelTier.ECONOMY
+                ),
             )
             if container_image is not None:
                 bundle = build_container_repair_runtime(
@@ -275,10 +300,15 @@ def _repair_demo(
             _close_model_quietly(model)
     events = store.events_for(state.run_id)
     artifacts = [event for event in events if isinstance(event, ArtifactRecorded)]
+    stop_event = next((event for event in reversed(events) if isinstance(event, RunStopped)), None)
     print(
         f"run={state.run_id} status={state.status.value} "
         f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
     )
+    if state.stop_reason is not None:
+        print(f"stop_reason={state.stop_reason.value}")
+    if stop_event is not None:
+        print(f"stop_summary={stop_event.summary}")
     print(f"final verification: {state.last_verification}")
     print(
         f"workspace={bundle.workspace.workspace_id} base_revision={bundle.workspace.base_revision}"
@@ -306,9 +336,15 @@ def main() -> int:
     )
     parser.add_argument(
         "--model",
-        choices=["scripted", "ollama"],
+        choices=["scripted", "ollama", "deepseek"],
         default="scripted",
         help="model backend for repair-demo (default: deterministic scripted model)",
+    )
+    parser.add_argument(
+        "--deepseek-model",
+        metavar="NAME",
+        default="deepseek-v4-pro",
+        help="DeepSeek model used with --model deepseek",
     )
     parser.add_argument(
         "--ollama-model",
@@ -340,6 +376,7 @@ def main() -> int:
             ollama_model=args.ollama_model,
             ollama_url=args.ollama_url,
             ollama_context_window=args.ollama_context_window,
+            deepseek_model=args.deepseek_model,
         )
     return 2
 

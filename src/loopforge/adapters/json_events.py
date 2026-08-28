@@ -32,7 +32,11 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+    WorkerMerged,
+    WorkerSpawned,
+    WorkerStopped,
 )
+from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
@@ -52,6 +56,8 @@ from loopforge.domain.types import (
     RunId,
     StopReason,
     UsageDelta,
+    WorkerId,
+    WorkspaceId,
 )
 
 SCHEMA_VERSION: Final[int] = 1
@@ -78,6 +84,9 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         ApprovalRequested,
         ApprovalGranted,
         RunStopped,
+        WorkerSpawned,
+        WorkerStopped,
+        WorkerMerged,
     )
 }
 
@@ -360,6 +369,36 @@ def _construct_run_stopped(base: dict[str, Any], data: dict[str, Any]) -> Event:
     )
 
 
+def _construct_worker_spawned(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return WorkerSpawned(
+        **base,
+        worker_id=WorkerId(_required_str(data, "worker_id")),
+        worker_run_id=RunId(_required_str(data, "worker_run_id")),
+        workspace_id=WorkspaceId(_required_str(data, "workspace_id")),
+        objective=_required_str(data, "objective"),
+        budget_share_cost_usd=_required_number(data, "budget_share_cost_usd"),
+    )
+
+
+def _construct_worker_stopped(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return WorkerStopped(
+        **base,
+        worker_id=WorkerId(_required_str(data, "worker_id")),
+        outcome=WorkerOutcome(_required_str(data, "outcome")),
+        summary=_required_str(data, "summary"),
+    )
+
+
+def _construct_worker_merged(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return WorkerMerged(
+        **base,
+        worker_id=WorkerId(_required_str(data, "worker_id")),
+        outcome=MergeOutcome(_required_str(data, "outcome")),
+        revision=_optional_str(data, "revision"),
+        detail=_required_str(data, "detail"),
+    )
+
+
 _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]]] = {
     "RunStarted": _construct_run_started,
     "PlanCreated": _construct_plan_created,
@@ -380,6 +419,9 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "ApprovalRequested": _construct_approval_requested,
     "ApprovalGranted": _construct_approval_granted,
     "RunStopped": _construct_run_stopped,
+    "WorkerSpawned": _construct_worker_spawned,
+    "WorkerStopped": _construct_worker_stopped,
+    "WorkerMerged": _construct_worker_merged,
 }
 
 

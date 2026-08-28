@@ -36,7 +36,11 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+    WorkerMerged,
+    WorkerSpawned,
+    WorkerStopped,
 )
+from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
@@ -56,6 +60,8 @@ from loopforge.domain.types import (
     RunId,
     StopReason,
     UsageDelta,
+    WorkerId,
+    WorkspaceId,
 )
 
 NOW = datetime(2026, 8, 22, tzinfo=UTC)
@@ -81,6 +87,9 @@ ALL_EVENT_CLASSES: tuple[type[DomainEvent], ...] = (
     ApprovalGranted,
     RunStopped,
     ContextAssembled,
+    WorkerSpawned,
+    WorkerStopped,
+    WorkerMerged,
 )
 
 
@@ -292,6 +301,36 @@ def _all_events() -> tuple[Event, ...]:
             occurred_at=NOW,
             sequence=17,
             context_items=(_context_snapshot(),),
+        ),
+        WorkerSpawned(
+            event_id=EventId("e19"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=19,
+            worker_id=WorkerId("worker-adder"),
+            worker_run_id=RunId("worker-run-1"),
+            workspace_id=WorkspaceId("ws-adder"),
+            objective="repair adder.py",
+            budget_share_cost_usd=0.5,
+        ),
+        WorkerStopped(
+            event_id=EventId("e20"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=20,
+            worker_id=WorkerId("worker-adder"),
+            outcome=WorkerOutcome.SUCCEEDED,
+            summary="worker finished",
+        ),
+        WorkerMerged(
+            event_id=EventId("e21"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=21,
+            worker_id=WorkerId("worker-adder"),
+            outcome=MergeOutcome.MERGED,
+            revision="a" * 40,
+            detail="merged worker branch",
         ),
     )
 

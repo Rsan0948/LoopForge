@@ -41,7 +41,11 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+    WorkerMerged,
+    WorkerSpawned,
+    WorkerStopped,
 )
+from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
@@ -61,6 +65,8 @@ from loopforge.domain.types import (
     RunId,
     StopReason,
     UsageDelta,
+    WorkerId,
+    WorkspaceId,
 )
 
 CODEC = JsonEventCodec()
@@ -313,6 +319,36 @@ EXAMPLES: tuple[Event, ...] = (
             ),
         ),
     ),
+    WorkerSpawned(
+        event_id=EventId("e23"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=23,
+        worker_id=WorkerId("worker-adder"),
+        worker_run_id=RunId("worker-run-1"),
+        workspace_id=WorkspaceId("ws-adder"),
+        objective="repair adder.py",
+        budget_share_cost_usd=0.5,
+    ),
+    WorkerStopped(
+        event_id=EventId("e24"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=24,
+        worker_id=WorkerId("worker-adder"),
+        outcome=WorkerOutcome.BUDGET_EXHAUSTED,
+        summary="share exhausted",
+    ),
+    WorkerMerged(
+        event_id=EventId("e25"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=25,
+        worker_id=WorkerId("worker-adder"),
+        outcome=MergeOutcome.CONFLICT,
+        revision=None,
+        detail="merge aborted: overlapping edits",
+    ),
 )
 
 (
@@ -338,6 +374,9 @@ EXAMPLES: tuple[Event, ...] = (
     CONTEXT_ASSEMBLED,
     ARTIFACT_RECORDED,
     CONTEXT_ASSEMBLED_SUPERSEDING,
+    WORKER_SPAWNED,
+    WORKER_STOPPED,
+    WORKER_MERGED,
 ) = EXAMPLES
 
 
@@ -379,7 +418,7 @@ def _legacy_tool_failed_payload(retryable: Any) -> str:
 
 def test_examples_cover_every_registered_event_type() -> None:
     assert {type(event).__name__ for event in EXAMPLES} == set(_EVENT_TYPES)
-    assert len(_EVENT_TYPES) == 19
+    assert len(_EVENT_TYPES) == 22
 
 
 @pytest.mark.parametrize(
