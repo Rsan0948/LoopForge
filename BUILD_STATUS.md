@@ -1,4 +1,81 @@
-# Build status — PACS-010 complete
+# Build status — PACS-011 complete
+
+PACS-011 integrates the first live model provider behind `ModelPort` without giving the
+provider ownership of the control loop, state, permissions, or stopping decisions. The new
+`OllamaModel` adapter (Ollama native `/api/chat`, `httpx` transport — the first HTTP
+dependency) receives only budgeted `ModelContext` plus the versioned prompt contract,
+renders the code-owned `PromptTemplate`, maintains per-run conversational turn state
+(structured `tool` result messages — see the cycle record for the flattened-observation
+failure mode this fixes), and validates provider responses by strict schema before they
+become `ActionProposal`s (exactly one tool call, string-valued arguments). A port-level
+failure taxonomy (`ModelFailureClass` + `ModelTurnError` reason codes) normalizes provider
+errors with no provider semantics in domain code; the runtime maps permanent failures and
+exhausted transient streaks to explicit `FAILURE` stops (existing `RunStopped`, schema v1,
+19 event types unchanged) and retries transient failures with bounded backoff that never
+burns `max_iterations`. Real provider token counts now debit `BudgetDebited` accounting;
+capability metadata (`ModelCapabilities`) and structural secret isolation (bearer token in
+request headers only, sourced from the environment, never in context/events/`repr`) are
+pinned by tests. Live-model tests are separated into `tests/live/` behind Ollama+Docker
+skipif probes, so deterministic CI runs with zero credentials. The repair task objective
+now names the workspace layout (code-owned bootstrap authority), and
+`repair-demo --model {scripted,ollama}` selects the backend with scripted still the
+default. See `docs/process/cycles/PACS-011-first-live-model-adapter.md`.
+No subsequent PACS cycle is active until manually initiated.
+
+Verified in this environment (2026-08-27/28, Ollama 0.32.15 with `devstral-small-2:latest`,
+Docker Desktop 29.2.1 live, `python:3.12-alpine` pulled; numbers below are post-hardening):
+
+- `uv run pytest -q --cov` — **1307 passing, 15 skipped** (skips are exactly the
+  pre-existing macOS `RLIMIT_AS` platform gates + 1 non-UTF-8-filesystem gate; the live
+  Ollama+Docker repair E2E **executed and passed**; zero credential-gated skips)
+- branch-aware coverage — **96.35% overall**; configured 90% gate satisfied
+- `ruff format --check .` / `ruff check .` — clean (131 files)
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- live CLI evidence — `repair-demo --container python:3.12-alpine --model ollama` →
+  `status=succeeded iterations=2`, verifier `command:run_tests: passed (exit_code=0);
+  patch_constraints: passed (files changed: adder.py)`, exact unified diff recorded
+  (`return left - right` → `return left + right`) with the live model driving
+
+Discoveries fixed and pinned this cycle: flattened text observations make live models
+re-issue the same read instead of acting on results (proven by A/B probe against the real
+server; the adapter now answers pending tool calls with structured `tool` messages built
+from observation-trust context deltas); the code-owned task objective must name the
+workspace layout or models guess wrong paths (`src/adder.py` stall loop); a `/api/tags`
+probe that typed model entries as `dict[str, str]` silently skipped the live suite
+(entries carry ints/nested dicts — probe models now ignore extra fields).
+
+Post-cycle adversarial hardening (three-agent review, 2026-08-28): ~20 findings triaged,
+every actionable defect fixed and pinned — most severely a REFLECTING-resume wedge that
+durably appended an illegal `ContextAssembled` and poisoned replay (the drive loop now
+re-plans from REFLECTING), plus `httpx.DecodingError`/HTTP-408 misclassification, NaN/inf
+cost-rate admission, dropped trust labels at the conversational boundary, rejected no-arg
+tool calls, constructor validation gaps, unbounded adapter text in durable `RunStopped`,
+failure-class type confusion, and CLI error-path leaks. Seven findings documented as
+designed. Full record in the cycle file's "Post-cycle hardening pass" section.
+
+## Implemented through PACS-011
+
+- `ports/model.py`: `ModelFailureClass`, `ModelTurnError` (machine reason codes:
+  `MODEL_UNAVAILABLE`/`MODEL_TIMEOUT`/`MODEL_AUTHENTICATION`/`MODEL_NOT_FOUND`/
+  `MODEL_REQUEST_INVALID`/`MODEL_INVALID_RESPONSE`/`MODEL_PROMPT_TEMPLATE_MISMATCH`),
+  `ModelToolSpec`, `ModelCapabilities`
+- `adapters/ollama_model.py`: strict-validated live adapter — per-run conversation state,
+  template-ref enforcement, failure normalization, honest `UsageDelta`, credential
+  isolation, `httpx.MockTransport` hermetic test seam
+- `application/runtime.py`: model-turn failure seam — explicit `FAILURE` stops for
+  permanent/exhausted failures, bounded in-loop transient retry off the iteration budget
+- `workloads/repair.py`: `repair_tool_specs` code-owned catalog describing the full bound
+  tool surface (rule 4: describes, never defines, runtime tool authority)
+- `entrypoints/repair.py` + `entrypoints/cli.py`: optional `model` dependency (scripted
+  default unchanged), `repair-demo --model {scripted,ollama} [--ollama-model NAME]
+  [--ollama-url URL]`, credentials from `LOOPFORGE_OLLAMA_API_KEY` only
+- test suites: `tests/unit/test_ollama_model.py` (32 hermetic tests),
+  `tests/integration/test_model_failure_runtime.py` (failure-class mapping),
+  `tests/live/test_ollama_repair_live.py` (probe-gated live acceptance E2E),
+  workload-spec and CLI coverage
+
+# Historical: PACS-010 complete
 
 PACS-010 establishes the software-repair reference workload and deterministic verifier stack
 while keeping the runtime workload-agnostic. New ports (`WorkspaceManagerPort`,

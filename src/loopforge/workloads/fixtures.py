@@ -80,7 +80,11 @@ def adder_repair_task(*, executable: str | None = None) -> RepairTask:
     resolved = executable or sys.executable
     return RepairTask(
         task_id="fixture-adder-regression",
-        objective="Repair the adder regression so the fixture test suite passes.",
+        objective=(
+            "Repair the adder regression so the fixture test suite passes. The buggy "
+            "implementation is in adder.py at the workspace root and the unittest suite "
+            "lives in tests/; only adder.py may be changed."
+        ),
         fixture=adder_fixture(),
         commands=(
             RepairCommand(

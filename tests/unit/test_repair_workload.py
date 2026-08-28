@@ -30,6 +30,7 @@ from loopforge.domain.workspace import (
     PatchConstraints,
 )
 from loopforge.ports.artifacts import RunArtifact
+from loopforge.ports.model import ModelToolSpec
 from loopforge.ports.workspace import WorkspaceError
 from loopforge.workloads.fixtures import adder_fixture, adder_repair_task
 from loopforge.workloads.repair import (
@@ -39,6 +40,7 @@ from loopforge.workloads.repair import (
     RepairContextBuilder,
     RepairTask,
     WorkspaceArtifactCollector,
+    repair_tool_specs,
     scripted_repair_actions,
 )
 
@@ -260,3 +262,46 @@ def test_fixture_without_solution_yields_read_only_script() -> None:
     )
     actions = scripted_repair_actions(task)
     assert [action.tool_name for action in actions] == ["read_file"]
+
+
+def test_repair_tool_specs_cover_the_bound_catalog() -> None:
+    task = adder_repair_task()
+    specs = repair_tool_specs(task)
+    names = [spec.name for spec in specs]
+    assert names == [
+        "read_file",
+        "search_files",
+        "write_file",
+        "edit_file",
+        "workspace_status",
+        "workspace_diff",
+        "revert_file",
+        "run_tests",
+        "build",
+    ]
+    assert len(set(names)) == len(names)
+    by_name = {spec.name: spec for spec in specs}
+    assert by_name["read_file"].parameters == {
+        "type": "object",
+        "properties": {"path": {"type": "string"}},
+        "required": ["path"],
+        "additionalProperties": False,
+    }
+    assert by_name["write_file"].parameters["required"] == ["path", "content"]
+    assert by_name["edit_file"].parameters["required"] == ["path", "old", "new"]
+    assert by_name["run_tests"].parameters == {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    }
+    for spec in specs:
+        assert spec.description.strip()
+        assert spec.parameters["type"] == "object"
+        assert spec.parameters["additionalProperties"] is False
+
+
+def test_model_tool_spec_validation() -> None:
+    with pytest.raises(ValueError, match="name cannot be empty"):
+        ModelToolSpec(name=" ", description="d", parameters={})
+    with pytest.raises(ValueError, match="description cannot be empty"):
+        ModelToolSpec(name="n", description="", parameters={})

@@ -46,6 +46,7 @@ from loopforge.domain.tooling import (
 )
 from loopforge.domain.types import BudgetLimit, Permission, RiskLevel
 from loopforge.ports.clock import ClockPort, SleeperPort
+from loopforge.ports.model import ModelPort
 from loopforge.ports.sandbox import SandboxPort
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.telemetry import TelemetryPort
@@ -113,6 +114,8 @@ class RepairRuntimeDeps:
     sleeper: SleeperPort
     telemetry: TelemetryPort | None = None
     budget: BudgetLimit | None = None
+    model: ModelPort | None = None
+    """Optional live model; defaults to the deterministic scripted model."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -131,6 +134,9 @@ class RepairRuntimeBundle:
         destroy = getattr(self.sandbox, "destroy", None)
         if callable(destroy):
             destroy()
+        close_model = getattr(self.runtime.model, "close", None)
+        if callable(close_model):
+            close_model()
 
 
 def build_trusted_repair_runtime(
@@ -216,7 +222,9 @@ def _repair_bundle(
         )
     )
     runtime = Runtime(
-        model=ScriptedModel(scripted_repair_actions(task)),
+        model=(
+            deps.model if deps.model is not None else ScriptedModel(scripted_repair_actions(task))
+        ),
         tools=tools,
         verifier=RepairVerifier(sandbox, workspace, task.acceptance),
         store=deps.store,

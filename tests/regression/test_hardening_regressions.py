@@ -16,6 +16,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
 
+import httpx
 import pytest
 
 from loopforge.adapters import _sandbox_exec
@@ -36,6 +37,7 @@ from loopforge.adapters.local_sandbox import (
     SandboxLimits,
 )
 from loopforge.adapters.memory import InMemoryEventStore
+from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.scripted import (
     FixedClock,
     ObservationContainsVerifier,
@@ -66,7 +68,13 @@ from loopforge.domain.context_lifecycle import (
     select_context,
     truncate_content,
 )
-from loopforge.domain.events import ArtifactRecorded, RetryScheduled, ToolFailed, VerificationFailed
+from loopforge.domain.events import (
+    ArtifactRecorded,
+    RetryScheduled,
+    RunStopped,
+    ToolFailed,
+    VerificationFailed,
+)
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import (
     PromptSection,
@@ -101,12 +109,19 @@ from loopforge.domain.types import (
 )
 from loopforge.domain.workspace import AcceptanceCriteria, FixtureFile, FixtureSpec
 from loopforge.ports.context import ContextContractError
+from loopforge.ports.model import (
+    ModelCapabilities,
+    ModelFailureClass,
+    ModelToolSpec,
+    ModelTurn,
+    ModelTurnError,
+)
 from loopforge.ports.sandbox import (
     SandboxError,
     SandboxPathError,
     SandboxPolicyError,
 )
-from loopforge.ports.tools import ToolExecutionRequest
+from loopforge.ports.tools import ToolExecutionRequest, ToolResult
 from loopforge.ports.workspace import WorkspaceError
 from loopforge.workloads.repair import RepairCommand, RepairCommandKind, RepairTask
 
@@ -983,3 +998,231 @@ def test_verification_failed_rejects_non_finite_score(bad: float) -> None:
             summary="s",
             score=bad,
         )
+
+
+# --- PACS-011 post-cycle hardening: live-model-adapter pins --------------------
+
+_P011_RUN = RunId("p011-regression")
+_P011_TEMPLATE = default_controller_template()
+_P011_TOOLS = (
+    ModelToolSpec(
+        name="run_tests",
+        description="Run the predefined test command.",
+        parameters={"type": "object", "properties": {}},
+    ),
+)
+
+
+def _p011_context() -> ModelContext:
+    item = ContextItem(
+        item_id=ContextItemId(f"{_P011_RUN}:objective"),
+        content="Repair the adder regression.",
+        trust=TrustClass.AUTHORIZED_HUMAN,
+        source=ContextSource(origin=TrustClass.AUTHORIZED_HUMAN, reference="ref:objective"),
+        sensitivity=DataSensitivity.INTERNAL,
+        created_at=NOW,
+    )
+    return ModelContext(
+        run_id=_P011_RUN,
+        items=(item,),
+        assembled_at=NOW,
+        prompt_template=_P011_TEMPLATE.reference(),
+    )
+
+
+def _p011_model(transport: httpx.BaseTransport) -> OllamaModel:
+    return OllamaModel(model="m", tools=_P011_TOOLS, template=_P011_TEMPLATE, transport=transport)
+
+
+# Defect: httpx reads response bodies eagerly and raises DecodingError (a
+# RequestError, NOT a TransportError) on a corrupt content-encoding — it
+# escaped the adapter's failure taxonomy and crashed the runtime uncaught.
+
+
+def test_corrupt_content_encoding_maps_to_invalid_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"Content-Encoding": "gzip"}, content=b"not-a-gzip-body")
+
+    model = _p011_model(httpx.MockTransport(handler))
+    with pytest.raises(ModelTurnError, match="could not be decoded") as excinfo:
+        model.propose_action(_p011_context())
+    assert excinfo.value.failure_class is ModelFailureClass.PERMANENT
+    assert excinfo.value.reason_code == "MODEL_INVALID_RESPONSE"
+
+
+# Defect: NaN/Infinity cost rates passed `rate < 0` validation, flowed into
+# UsageDelta, and crashed the runtime with an uncaught ValueError on the first
+# successful turn — the same non-finite class pinned for tool metadata above.
+
+
+@pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
+def test_model_capabilities_reject_non_finite_cost_rates(bad: float) -> None:
+    with pytest.raises(ValueError, match="cost rates must be finite"):
+        ModelCapabilities(
+            provider="ollama",
+            model="m",
+            supports_tool_calls=True,
+            context_window_tokens=8192,
+            input_cost_usd_per_million=bad,
+        )
+    with pytest.raises(ValueError, match="cost rates must be finite"):
+        ModelCapabilities(
+            provider="ollama",
+            model="m",
+            supports_tool_calls=True,
+            context_window_tokens=8192,
+            output_cost_usd_per_million=bad,
+        )
+
+
+def test_model_capabilities_reject_bool_context_window() -> None:
+    with pytest.raises(ValueError, match="must be an integer"):
+        ModelCapabilities(
+            provider="ollama",
+            model="m",
+            supports_tool_calls=True,
+            context_window_tokens=True,  # type: ignore[arg-type]
+        )
+
+
+# Defect: a legitimate zero-argument tool call (`run_tests`) from a real model
+# was hard-failed PERMANENT when the model omitted `arguments` or emitted null —
+# both shapes are routine provider output for zero-parameter tools.
+
+
+def _no_arg_payload(arguments: object) -> str:
+    function: dict[str, object] = {"name": "run_tests"}
+    if arguments != "omit":
+        function["arguments"] = arguments
+    return json.dumps(
+        {
+            "message": {"role": "assistant", "content": "", "tool_calls": [{"function": function}]},
+            "done": True,
+        }
+    )
+
+
+@pytest.mark.parametrize("arguments", ["omit", None])
+def test_zero_arg_tool_call_with_missing_arguments_is_accepted(arguments: object) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, text=_no_arg_payload(arguments))
+
+    turn = _p011_model(httpx.MockTransport(handler)).propose_action(_p011_context())
+    assert turn.action.tool_name == "run_tests"
+    assert turn.action.arguments == {}
+
+
+# Defect: HTTP 408 (request timeout — explicitly retryable) was classified
+# PERMANENT, killing runs for a transient provider condition.
+
+
+def test_http_408_maps_to_transient_timeout() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(408, text="{}")
+
+    model = _p011_model(httpx.MockTransport(handler))
+    with pytest.raises(ModelTurnError) as excinfo:
+        model.propose_action(_p011_context())
+    assert excinfo.value.failure_class is ModelFailureClass.TRANSIENT
+    assert excinfo.value.reason_code == "MODEL_TIMEOUT"
+
+
+# Defect: NaN timeouts/temperatures bypassed `<= 0` validation (NaN compares
+# False), and empty/scheme-less/credential-embedding base URLs reached the HTTP
+# layer as misclassified transient failures or bare httpx.InvalidURL escapes.
+
+
+@pytest.mark.parametrize("bad_timeout", [math.nan, math.inf, -math.inf, 0.0])
+def test_adapter_rejects_non_finite_or_non_positive_timeout(bad_timeout: float) -> None:
+    with pytest.raises(ValueError, match="positive and finite"):
+        OllamaModel(
+            model="m", tools=_P011_TOOLS, template=_P011_TEMPLATE, timeout_seconds=bad_timeout
+        )
+
+
+@pytest.mark.parametrize("bad_temperature", [math.nan, math.inf, -0.1])
+def test_adapter_rejects_invalid_temperature(bad_temperature: float) -> None:
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        OllamaModel(
+            model="m", tools=_P011_TOOLS, template=_P011_TEMPLATE, temperature=bad_temperature
+        )
+
+
+@pytest.mark.parametrize(
+    "bad_url",
+    ["", "   ", "localhost:11434", "ftp://x", "http://", "http://user:pass@host"],
+)
+def test_adapter_rejects_invalid_or_credential_embedding_base_url(bad_url: str) -> None:
+    with pytest.raises(ValueError, match="base URL"):
+        OllamaModel(model="m", tools=_P011_TOOLS, template=_P011_TEMPLATE, base_url=bad_url)
+
+
+# Defect: an adapter passing the plain string "permanent" (StrEnum lookalike)
+# bypassed the runtime's `is` identity check and was retried as transient.
+
+
+def test_model_turn_error_coerces_plain_string_failure_class() -> None:
+    error = ModelTurnError("permanent", "CODE", "summary")  # type: ignore[arg-type]
+    assert error.failure_class is ModelFailureClass.PERMANENT
+    with pytest.raises(ValueError, match="not a valid ModelFailureClass"):
+        ModelTurnError("sideways", "CODE", "summary")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="reason_code cannot be empty"):
+        ModelTurnError(ModelFailureClass.PERMANENT, " ", "summary")
+
+
+# Defect: adapter-supplied text was persisted verbatim into the durable
+# RunStopped event — unbounded and able to forge lines in downstream consumers.
+# The runtime now bounds and sanitizes at the boundary.
+
+
+class _ExplodingModel:
+    def __init__(self, error: ModelTurnError) -> None:
+        self._error = error
+
+    def propose_action(self, context: ModelContext) -> ModelTurn:  # noqa: ARG002
+        raise self._error
+
+
+def test_runtime_bounds_adapter_text_in_durable_stop_event() -> None:
+    store = InMemoryEventStore()
+    runtime = Runtime(
+        model=_ExplodingModel(
+            ModelTurnError(
+                ModelFailureClass.PERMANENT,
+                "MODEL_INVALID_RESPONSE",
+                "evil\x1b[31m\n" + "x" * 10_000,
+            )
+        ),
+        tools=ScriptedTools(
+            [ToolResult(ok=True, observation="ok")],
+            metadata=[
+                ToolMetadata(
+                    name="inspect",
+                    risk=RiskLevel.READ_ONLY,
+                    required_permission=Permission.READ,
+                    side_effect=SideEffectClass.READ_ONLY,
+                    retry=RetryClass.NEVER,
+                    idempotency=IdempotencyClass.NATURAL,
+                    approval=ApprovalClass.NONE,
+                    timeout_seconds=5.0,
+                )
+            ],
+        ),
+        verifier=ObservationContainsVerifier("all tests pass"),
+        store=store,
+        control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
+        permissions=PermissionPolicy(frozenset({Permission.READ})),
+        reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(FixedClock(NOW)),
+        clock=FixedClock(NOW),
+        sleeper=RecordingSleeper(),
+    )
+    state = runtime.run("objective")
+    assert state.status is RunStatus.FAILED
+    stopped = [e for e in store.events_for(state.run_id) if isinstance(e, RunStopped)]
+    assert len(stopped) == 1
+    summary = stopped[0].summary
+    assert len(summary) <= 500
+    assert "\x1b" not in summary
+    assert "\n" not in summary
+    assert summary.startswith("MODEL_INVALID_RESPONSE: ")

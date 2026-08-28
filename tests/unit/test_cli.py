@@ -9,7 +9,8 @@ import pytest
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
-from loopforge.entrypoints.cli import main
+from loopforge.entrypoints.cli import build_ollama_model, main
+from loopforge.workloads.fixtures import adder_repair_task
 
 
 def _rlimit_as_supported() -> bool:
@@ -255,3 +256,70 @@ def test_repair_demo_rejects_flag_like_container_image(
     captured = capsys.readouterr()
     assert "invalid repair-demo configuration" in captured.out
     assert "must not start with '-'" in captured.out
+
+
+def test_repair_demo_rejects_unknown_model_choice(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "repair-demo", "--model", "bogus")
+
+    with pytest.raises(SystemExit) as excinfo:
+        main()
+
+    assert excinfo.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
+
+
+def test_repair_demo_rejects_empty_ollama_model_name(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "repair-demo", "--model", "ollama", "--ollama-model", "")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "invalid repair-demo configuration" in captured.out
+
+
+def test_repair_demo_rejects_scheme_less_ollama_url(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "repair-demo", "--model", "ollama", "--ollama-url", "localhost:11434")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "invalid repair-demo configuration" in captured.out
+
+
+def test_ollama_factory_passes_env_credential_to_adapter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _RecordingModel:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("loopforge.entrypoints.cli.OllamaModel", _RecordingModel)
+    monkeypatch.setenv("LOOPFORGE_OLLAMA_API_KEY", "token-123")
+    build_ollama_model(
+        adder_repair_task(), model_name="devstral-small-2:latest", base_url="http://localhost:9"
+    )
+    assert captured["api_key"] == "token-123"
+    assert captured["model"] == "devstral-small-2:latest"
+
+
+def test_ollama_factory_ignores_blank_env_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class _RecordingModel:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("loopforge.entrypoints.cli.OllamaModel", _RecordingModel)
+    monkeypatch.setenv("LOOPFORGE_OLLAMA_API_KEY", "   ")
+    build_ollama_model(adder_repair_task(), model_name="m", base_url="http://localhost:11434")
+    assert captured["api_key"] is None

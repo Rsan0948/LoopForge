@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import tempfile
 from pathlib import Path
 
 from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
 from loopforge.adapters.memory import InMemoryEventStore
+from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.adapters.telemetry import InMemoryTelemetry
@@ -31,8 +33,12 @@ from loopforge.entrypoints.repair import (
     build_container_repair_runtime,
     build_trusted_repair_runtime,
 )
+from loopforge.ports.model import ModelPort
 from loopforge.ports.tools import ToolResult
 from loopforge.workloads.fixtures import adder_repair_task
+from loopforge.workloads.repair import RepairTask, repair_tool_specs
+
+_OLLAMA_API_KEY_ENV = "LOOPFORGE_OLLAMA_API_KEY"
 
 
 def _metadata(
@@ -160,7 +166,30 @@ def _demo() -> int:
     return 0
 
 
-def _repair_demo(container_image: str | None) -> int:
+def build_ollama_model(task: RepairTask, *, model_name: str, base_url: str) -> OllamaModel:
+    """Wire the live Ollama adapter; credentials come from the environment only."""
+    return OllamaModel(
+        model=model_name,
+        tools=repair_tool_specs(task),
+        template=default_controller_template(),
+        base_url=base_url,
+        api_key=(os.environ.get(_OLLAMA_API_KEY_ENV) or "").strip() or None,
+    )
+
+
+def _close_model_quietly(model: ModelPort | None) -> None:
+    close = getattr(model, "close", None)
+    if callable(close):
+        close()
+
+
+def _repair_demo(
+    container_image: str | None,
+    *,
+    model_kind: str = "scripted",
+    ollama_model: str = "devstral-small-2:latest",
+    ollama_url: str = "http://localhost:11434",
+) -> int:
     """Repair a fixture repository through the full runtime, deterministically.
 
     Default is the trusted-development path: a code-defined fixture on the
@@ -177,13 +206,21 @@ def _repair_demo(container_image: str | None) -> int:
         task = adder_repair_task(executable="/usr/local/bin/python")
     else:
         task = adder_repair_task()
-    with tempfile.TemporaryDirectory(prefix="loopforge-repair-") as directory:
-        store = InMemoryEventStore()
-        telemetry = InMemoryTelemetry()
-        deps = RepairRuntimeDeps(
-            store=store, clock=SystemClock(), sleeper=SystemSleeper(), telemetry=telemetry
-        )
-        try:
+    model: ModelPort | None = None
+    bundle_owned = False
+    try:
+        if model_kind == "ollama":
+            model = build_ollama_model(task, model_name=ollama_model, base_url=ollama_url)
+        with tempfile.TemporaryDirectory(prefix="loopforge-repair-") as directory:
+            store = InMemoryEventStore()
+            telemetry = InMemoryTelemetry()
+            deps = RepairRuntimeDeps(
+                store=store,
+                clock=SystemClock(),
+                sleeper=SystemSleeper(),
+                telemetry=telemetry,
+                model=model,
+            )
             if container_image is not None:
                 bundle = build_container_repair_runtime(
                     task,
@@ -197,34 +234,40 @@ def _repair_demo(container_image: str | None) -> int:
                     workspaces_dir=Path(directory),
                     deps=deps,
                 )
-        except ValueError as exc:
-            print(f"error: invalid repair-demo configuration: {exc}")
-            return 2
-        try:
-            state = bundle.runtime.run(task.objective)
-        finally:
-            bundle.close()
-        events = store.events_for(state.run_id)
-        artifacts = [event for event in events if isinstance(event, ArtifactRecorded)]
+            # The bundle now owns the model lifecycle (bundle.close()).
+            bundle_owned = True
+            try:
+                state = bundle.runtime.run(task.objective)
+            finally:
+                bundle.close()
+    except ValueError as exc:
+        print(f"error: invalid repair-demo configuration: {exc}")
+        return 2
+    finally:
+        if not bundle_owned:
+            # Construction succeeded but bundle wiring never took ownership;
+            # never leak the adapter's HTTP client on any failure path.
+            _close_model_quietly(model)
+    events = store.events_for(state.run_id)
+    artifacts = [event for event in events if isinstance(event, ArtifactRecorded)]
+    print(
+        f"run={state.run_id} status={state.status.value} "
+        f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
+    )
+    print(f"final verification: {state.last_verification}")
+    print(
+        f"workspace={bundle.workspace.workspace_id} base_revision={bundle.workspace.base_revision}"
+    )
+    print(f"evidence artifacts recorded: {len(artifacts)}")
+    if artifacts:
+        latest = artifacts[-1]
         print(
-            f"run={state.run_id} status={state.status.value} "
-            f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
+            f"latest artifact: kind={latest.kind.value} label={latest.label} "
+            f"bytes={len(latest.content.encode('utf-8'))}"
         )
-        print(f"final verification: {state.last_verification}")
-        print(
-            f"workspace={bundle.workspace.workspace_id} "
-            f"base_revision={bundle.workspace.base_revision}"
-        )
-        print(f"evidence artifacts recorded: {len(artifacts)}")
-        if artifacts:
-            latest = artifacts[-1]
-            print(
-                f"latest artifact: kind={latest.kind.value} label={latest.label} "
-                f"bytes={len(latest.content.encode('utf-8'))}"
-            )
-            print("exact patch evidence:")
-            print(latest.content)
-        return 0 if state.status is RunStatus.SUCCEEDED else 1
+        print("exact patch evidence:")
+        print(latest.content)
+    return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
 def main() -> int:
@@ -236,11 +279,34 @@ def main() -> int:
         default=None,
         help="run repair-demo through the hardened container sandbox using IMAGE",
     )
+    parser.add_argument(
+        "--model",
+        choices=["scripted", "ollama"],
+        default="scripted",
+        help="model backend for repair-demo (default: deterministic scripted model)",
+    )
+    parser.add_argument(
+        "--ollama-model",
+        metavar="NAME",
+        default="devstral-small-2:latest",
+        help="Ollama model tag used with --model ollama",
+    )
+    parser.add_argument(
+        "--ollama-url",
+        metavar="URL",
+        default="http://localhost:11434",
+        help="Ollama server base URL used with --model ollama",
+    )
     args = parser.parse_args()
     if args.command == "demo":
         return _demo()
     if args.command == "repair-demo":
-        return _repair_demo(args.container)
+        return _repair_demo(
+            args.container,
+            model_kind=args.model,
+            ollama_model=args.ollama_model,
+            ollama_url=args.ollama_url,
+        )
     return 2
 
 

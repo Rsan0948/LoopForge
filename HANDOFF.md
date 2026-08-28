@@ -37,7 +37,36 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-010.
+Completed: PACS-001 through PACS-011.
+
+PACS-011 (first live model adapter, 2026-08-27) integrated a real provider behind
+`ModelPort` without ceding runtime authority: an `OllamaModel` adapter (Ollama native
+`/api/chat` over `httpx`, the first HTTP dependency) that consumes only budgeted
+`ModelContext` + the versioned prompt contract, validates responses by strict schema
+(exactly one tool call, `StrictStr` arguments), normalizes provider failures into a
+port-level `ModelFailureClass`/`ModelTurnError` taxonomy (no provider semantics in domain
+code), debits real token counts through the PACS-008 accounting surface, exposes
+`ModelCapabilities` metadata, and isolates the optional bearer credential to request
+headers (environment-sourced, never in context/events/`repr`). The runtime gained the
+model-turn failure seam: permanent failures and exhausted transient streaks stop
+`FAILURE` with durable reason codes (no new event types — schema v1, 19 events), while
+transient failures retry with bounded backoff outside the iteration budget. The key
+discovery: flattened text observations make live models re-read instead of act — the
+adapter maintains per-run conversational state and answers pending tool calls with
+structured `tool` messages built from observation-trust context deltas (proven by A/B
+probe). Live-model tests are separated into `tests/live/` behind Ollama+Docker skipif
+probes; deterministic CI runs with zero credentials. Live evidence: `repair-demo
+--container python:3.12-alpine --model ollama` with `devstral-small-2:latest` →
+`status=succeeded iterations=2`, verifier-granted, exact patch recorded. A post-cycle
+adversarial hardening pass (three-agent review, 2026-08-28) triaged ~20 findings; every
+actionable defect was fixed and pinned — most severely a REFLECTING-resume wedge that
+durably poisoned the event stream (drive loop now re-plans from REFLECTING), plus
+exception-classification gaps (`httpx.DecodingError`, HTTP 408), NaN/inf cost rates,
+dropped trust labels at the conversational boundary, rejected no-arg tool calls,
+constructor validation, unbounded durable stop text, failure-class coercion, and CLI
+error-path leaks; seven findings documented as designed. See
+`docs/process/cycles/PACS-011-first-live-model-adapter.md`. Checkpoint not yet committed
+(awaiting operator confirmation).
 
 PACS-010 (software-repair workload and deterministic verifier stack, 2026-08-27) made software
 repair the reference workload while keeping the runtime workload-agnostic: a
@@ -104,7 +133,22 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-010 + post-cycle hardening pass, 2026-08-27, Docker Desktop
+Current checked evidence (PACS-011 post-hardening, 2026-08-28, Ollama 0.32.15 with
+`devstral-small-2:latest`, Docker Desktop 29.2.1 live):
+- 1307 tests passing, 15 platform-gated skips (same macOS `RLIMIT_AS` + non-UTF-8 gates as
+  PACS-010; the live Ollama+Docker repair E2E executed and passed; zero credential-gated
+  skips — deterministic CI runs with zero provider credentials)
+- 96.35% branch-aware coverage
+- ruff format/check, pyright strict, and import-linter all executed and green
+- live CLI evidence: `repair-demo --container python:3.12-alpine --model ollama` →
+  `status=succeeded iterations=2` with the live model driving, verifier summary
+  `command:run_tests: passed (exit_code=0); patch_constraints: passed (files changed:
+  adder.py)`, and the exact `adder.py` patch recorded as durable evidence
+- cycle discoveries fixed and pinned: conversational tool-result messaging (the
+  flattened-observation re-read loop), code-owned objective naming the workspace layout,
+  and a too-strict `/api/tags` probe that silently skipped the live suite
+
+Historical evidence (PACS-010 + post-cycle hardening pass, 2026-08-27, Docker Desktop
 29.2.1 live):
 - 1237 tests passing, 15 platform-gated skips (9 pre-existing `RLIMIT_AS` + 4 trusted-local
   repair E2E + 1 repair-demo CLI smoke + 1 non-UTF-8-filesystem gate; **zero** docker-gated
@@ -177,14 +221,15 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-010-software-repair-workload.md`
+- `docs/process/cycles/PACS-011-first-live-model-adapter.md`
 
 ## Next authorized work
 
-None. PACS-011 through PACS-017 are PLANNED, not active.
+None. PACS-012 through PACS-017 are PLANNED, not active.
 
-The PACS-010 checkpoint is reconciled but **uncommitted**; the operator must confirm the commit
-and manually initiate PACS-011 (first live model adapter) or another explicitly named scope.
+The PACS-011 checkpoint is reconciled but **uncommitted**; the operator must confirm the
+commit and manually initiate PACS-012 (model capability registry and routing) or another
+explicitly named scope.
 
 ## Planned path to v1.0
 

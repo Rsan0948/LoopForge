@@ -47,7 +47,13 @@ from loopforge.domain.types import (
 from loopforge.ports.artifacts import ArtifactCollectorPort, ArtifactContractError, RunArtifact
 from loopforge.ports.clock import ClockPort, SleeperPort
 from loopforge.ports.context import ContextBuilderPort, ContextContractError
-from loopforge.ports.model import ModelContractError, ModelPort, ModelTurn
+from loopforge.ports.model import (
+    ModelContractError,
+    ModelFailureClass,
+    ModelPort,
+    ModelTurn,
+    ModelTurnError,
+)
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.telemetry import TelemetryPort
 from loopforge.ports.tools import (
@@ -145,6 +151,7 @@ class Runtime:
         return self._drive(run_id)
 
     def _drive(self, run_id: RunId) -> RunState:  # noqa: PLR0912, PLR0915 - the drive loop is intentionally one flat orchestration of the authorized cycle; span instrumentation pushes it over the thresholds
+        model_failure_streak = 0
         while True:
             current = self.state_for(run_id)
             if current.status.is_terminal:
@@ -152,6 +159,16 @@ class Runtime:
                 # recording after verification) may have already terminated
                 # the run; never stop it twice.
                 return current
+            if current.status is RunStatus.REFLECTING:
+                # Resume() can enter the drive loop straight from a failed
+                # verification replay; the reflection plan must move the run
+                # back to READY before any context assembly, exactly like the
+                # post-execution path below.
+                self._persist_plan(
+                    run_id,
+                    "Resume after failed verification; choose a new bounded action.",
+                )
+                current = self.state_for(run_id)
             cycle = current.iteration + 1
             self._telemetry.set_cycle(cycle)
             with self._telemetry.span(
@@ -217,25 +234,64 @@ class Runtime:
                     ),
                 )
 
-                with self._telemetry.span(run_id, name=SpanName.MODEL_TURN) as model_span:
-                    turn = self.model.propose_action(model_context)
-                    # Boundary validation is intentional: adapters may violate port return types.
-                    if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
-                        msg_7 = f"model adapter returned {type(turn).__name__}, expected ModelTurn"
-                        raise ModelContractError(msg_7)
-                    if not isinstance(turn.action, ActionProposal) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                        turn.usage, UsageDelta
-                    ):
-                        msg_8 = "model turn contains invalid action or usage payload"
-                        raise ModelContractError(msg_8)
-                    model_span.attributes["loopforge.usage.cost_usd"] = turn.usage.cost_usd
-                    model_span.attributes["loopforge.usage.input_tokens"] = turn.usage.input_tokens
-                    model_span.attributes["loopforge.usage.output_tokens"] = (
-                        turn.usage.output_tokens
+                try:
+                    with self._telemetry.span(run_id, name=SpanName.MODEL_TURN) as model_span:
+                        turn = self.model.propose_action(model_context)
+                        # Boundary validation is intentional: adapters may violate port types.
+                        if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
+                            msg_7 = (
+                                f"model adapter returned {type(turn).__name__}, expected ModelTurn"
+                            )
+                            raise ModelContractError(msg_7)
+                        if not isinstance(turn.action, ActionProposal) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                            turn.usage, UsageDelta
+                        ):
+                            msg_8 = "model turn contains invalid action or usage payload"
+                            raise ModelContractError(msg_8)
+                        model_span.attributes["loopforge.usage.cost_usd"] = turn.usage.cost_usd
+                        model_span.attributes["loopforge.usage.input_tokens"] = (
+                            turn.usage.input_tokens
+                        )
+                        model_span.attributes["loopforge.usage.output_tokens"] = (
+                            turn.usage.output_tokens
+                        )
+                        model_span.attributes["loopforge.usage.cached_input_tokens"] = (
+                            turn.usage.cached_input_tokens
+                        )
+                except ModelTurnError as error:
+                    # Provider failures arrive normalized and classified by the
+                    # adapter; the runtime owns the stopping decision. Permanent
+                    # failures stop the run explicitly; transient failures retry
+                    # with bounded backoff inside the loop (a retry never
+                    # persists an action, so it cannot burn max_iterations, and
+                    # a crash mid-backoff resumes safely from READY). Adapter
+                    # text is bounded at this boundary before it can enter the
+                    # durable stream.
+                    stop_summary = _bounded_stop_text(error.reason_code, error.summary)
+                    if error.failure_class is ModelFailureClass.PERMANENT:
+                        self._stop(
+                            run_id,
+                            StopReason.FAILURE,
+                            error.reason_code,
+                            summary=stop_summary,
+                        )
+                        return self.state_for(run_id)
+                    model_failure_streak += 1
+                    if model_failure_streak >= self.reliability.retry.max_attempts:
+                        self._stop(
+                            run_id,
+                            StopReason.FAILURE,
+                            error.reason_code,
+                            summary=stop_summary,
+                        )
+                        return self.state_for(run_id)
+                    backoff = min(
+                        self.reliability.retry.base_delay_seconds * 2 ** (model_failure_streak - 1),
+                        self.reliability.retry.max_delay_seconds,
                     )
-                    model_span.attributes["loopforge.usage.cached_input_tokens"] = (
-                        turn.usage.cached_input_tokens
-                    )
+                    self.sleeper.sleep(backoff)
+                    continue
+                model_failure_streak = 0
                 self._persist(
                     run_id,
                     lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
@@ -699,3 +755,20 @@ class Runtime:
         # Telemetry is projected only after the authoritative event is durable;
         # it never feeds back into runtime state or decisions.
         self._telemetry.project_event(event)
+
+
+_STOP_TEXT_BUDGET = 500
+
+
+def _bounded_stop_text(reason_code: str, summary: str) -> str:
+    """Bound and sanitize adapter-supplied text before it enters a durable event.
+
+    ``ModelTurnError`` text crosses the port boundary from adapters the runtime
+    cannot fully trust to self-bound; control characters must never forge
+    lines in downstream consumers of the authoritative stream.
+    """
+    combined = f"{reason_code}: {summary}"
+    sanitized = "".join(char if char.isprintable() else f"\\x{ord(char):02x}" for char in combined)
+    if len(sanitized) <= _STOP_TEXT_BUDGET:
+        return sanitized
+    return sanitized[: _STOP_TEXT_BUDGET - 3] + "..."

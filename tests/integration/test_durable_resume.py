@@ -271,3 +271,92 @@ def test_budgeted_context_metadata_survives_sqlite_persistence_and_replay(
     replayed = fresh.state_for(state.run_id)
     assert replayed.status is RunStatus.SUCCEEDED
     assert replayed.last_context_items == assembled[0].context_items
+
+
+def test_resume_from_verifying_with_failing_verifier_does_not_wedge(tmp_path: Path) -> None:
+    """Pin the REFLECTING-entry wedge: resume must re-plan, not poison the stream.
+
+    A crash after ``ToolSucceeded`` (VERIFYING) followed by a *failing*
+    verification on resume lands the run in REFLECTING. Previously the drive
+    loop persisted ``ContextAssembled`` without first re-planning to READY,
+    durably appending an illegal event that wedged every future replay.
+    """
+    path = tmp_path / "reflecting-resume.db"
+    runtime = _runtime(path)
+    run_id = runtime.start("repair auth")
+    store = runtime.store
+    proposal = ActionProposal(ActionId("a1"), "inspect", {})
+
+    version = store.current_version(run_id)
+    store.append(
+        ActionProposed(
+            event_id=EventId("manual-proposed"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=version + 1,
+            proposal=proposal,
+        ),
+        expected_version=version,
+    )
+    version = store.current_version(run_id)
+    store.append(
+        ActionAuthorized(
+            event_id=EventId("manual-authorized"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=version + 1,
+            proposal=proposal,
+            tool_metadata=_metadata(),
+        ),
+        expected_version=version,
+    )
+    version = store.current_version(run_id)
+    store.append(
+        ToolExecutionStarted(
+            event_id=EventId("manual-started"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=version + 1,
+            action_id=proposal.action_id,
+            attempt=1,
+            idempotency_key=None,
+        ),
+        expected_version=version,
+    )
+    version = store.current_version(run_id)
+    store.append(
+        ToolSucceeded(
+            event_id=EventId("manual-succeeded"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=version + 1,
+            action_id=proposal.action_id,
+            observation="tests still failing",
+            attempt=1,
+        ),
+        expected_version=version,
+    )
+    assert runtime.state_for(run_id).status is RunStatus.VERIFYING
+
+    # A fresh runtime resumes: verification fails (observation lacks the
+    # expected text) → REFLECTING → the drive loop must re-plan to READY and
+    # continue, not append an illegal ContextAssembled.
+    resumed = Runtime(
+        model=ScriptedModel([ActionProposal(ActionId("a2"), "inspect", {})]),
+        tools=ScriptedTools(
+            [ToolResult(ok=True, observation="all tests pass")],
+            metadata=[_metadata()],
+        ),
+        verifier=ObservationContainsVerifier("all tests pass"),
+        store=SQLiteEventStore(path, codec=JsonEventCodec()),
+        control=ControlPolicy(BudgetLimit(5.0, 10)),
+        permissions=PermissionPolicy(frozenset({Permission.READ})),
+        reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(SystemClock()),
+        clock=SystemClock(),
+        sleeper=SystemSleeper(),
+    ).resume(run_id)
+
+    assert resumed.status is RunStatus.SUCCEEDED
+    # The stream stays replayable in a third process boundary.
+    assert _runtime(path, action_id="unused").state_for(run_id).status is RunStatus.SUCCEEDED

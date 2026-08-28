@@ -39,6 +39,7 @@ from loopforge.domain.verification import CheckOutcome, compose_check_outcomes
 from loopforge.domain.workspace import AcceptanceCriteria, FixtureSpec
 from loopforge.ports.artifacts import RunArtifact
 from loopforge.ports.context import ContextAccountingSource, ContextBuilderPort
+from loopforge.ports.model import ModelToolSpec
 from loopforge.ports.sandbox import SandboxError, SandboxPort
 from loopforge.ports.verifier import VerificationResult
 from loopforge.ports.workspace import WorkspaceError, WorkspacePort
@@ -319,6 +320,83 @@ class RepairContextBuilder:
                 ),
             )
         return item
+
+
+def repair_tool_specs(task: RepairTask) -> tuple[ModelToolSpec, ...]:
+    """Code-owned catalog describing the repair tools to a live model.
+
+    The catalog only *describes* the tools the runtime has already registered;
+    it cannot define or widen authority. Risk, permission, side-effect, retry,
+    idempotency, approval, timeout, and sensitivity metadata stay on the
+    runtime-owned ``ToolMetadata`` and are re-authorized for every proposal
+    (AGENTS.md rule 4). Every argument is string-valued, matching
+    ``ActionProposal.arguments``.
+    """
+    specs = [
+        ModelToolSpec(
+            name="read_file",
+            description="Read the contents of a file in the assigned workspace.",
+            parameters=_string_schema("path"),
+        ),
+        ModelToolSpec(
+            name="search_files",
+            description=("Search workspace files for a literal substring; returns matching lines."),
+            parameters=_string_schema("query"),
+        ),
+        ModelToolSpec(
+            name="write_file",
+            description="Write a file in the assigned workspace, replacing any existing content.",
+            parameters=_string_schema("path", "content"),
+        ),
+        ModelToolSpec(
+            name="edit_file",
+            description=(
+                "Replace an exact substring in a workspace file; the old text must occur "
+                "exactly once."
+            ),
+            parameters=_string_schema("path", "old", "new"),
+        ),
+        ModelToolSpec(
+            name="workspace_status",
+            description="List files changed relative to the workspace base revision.",
+            parameters=_empty_schema(),
+        ),
+        ModelToolSpec(
+            name="workspace_diff",
+            description="Show the unified diff of workspace changes against the base revision.",
+            parameters=_empty_schema(),
+        ),
+        ModelToolSpec(
+            name="revert_file",
+            description="Revert one workspace file to its base-revision content.",
+            parameters=_string_schema("path"),
+        ),
+    ]
+    specs.extend(
+        ModelToolSpec(
+            name=command.name,
+            description=(
+                f"Run the predefined {command.kind.value} command '{command.name}' inside "
+                "the sandbox and return its output."
+            ),
+            parameters=_empty_schema(),
+        )
+        for command in task.commands
+    )
+    return tuple(specs)
+
+
+def _string_schema(*required: str) -> dict[str, object]:
+    return {
+        "type": "object",
+        "properties": {name: {"type": "string"} for name in required},
+        "required": list(required),
+        "additionalProperties": False,
+    }
+
+
+def _empty_schema() -> dict[str, object]:
+    return {"type": "object", "properties": {}, "additionalProperties": False}
 
 
 def scripted_repair_actions(task: RepairTask) -> list[ActionProposal]:
