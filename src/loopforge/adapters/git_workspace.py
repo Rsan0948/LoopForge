@@ -143,6 +143,7 @@ class GitWorkspace:
     _workspace_id: WorkspaceId
     _base_revision: str
     _metadata_fingerprint: str
+    _include_ignored: bool = True
 
     @property
     def workspace_id(self) -> WorkspaceId:
@@ -157,16 +158,17 @@ class GitWorkspace:
         return self._base_revision
 
     def status(self) -> WorkspaceStatus:
-        output = self.run_git(
+        status_args = [
             "status",
             "--porcelain=v1",
             "-z",
             "--no-renames",
             "--untracked-files=all",
-            # Ignored files are worktree deviations too: a writable .gitignore
-            # must never hide changes from the verifier or the evidence trail.
-            "--ignored=matching",
-        )
+        ]
+        if self._include_ignored:
+            # Fixture verification treats ignored files as deviations too.
+            status_args.append("--ignored=matching")
+        output = self.run_git(*status_args)
         changed: list[str] = []
         untracked: list[str] = []
         for entry in output.split("\0"):
@@ -382,6 +384,7 @@ class GitWorkspaceManager:
             _workspace_id=assigned,
             _base_revision=base_revision,
             _metadata_fingerprint=_metadata_fingerprint(root),
+            _include_ignored=False,
         )
 
     def add_worker_worktree(self, integration: GitWorkspace, *, worker_id: str) -> GitWorkspace:
