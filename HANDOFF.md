@@ -71,6 +71,8 @@ first-selection reason codes, no-op budget pressure suppressing escalation, a
 latent routed-model client leak in bundle `close()`, Ollama capability/request
 identity divergence, and contract-validation normalization gaps. See
 `docs/process/cycles/PACS-012-model-capability-registry-and-routing.md`.
+Checkpoint committed as `48f2aac` (includes the operator-initiated post-cycle
+hardening pass).
 
 PACS-011 (first live model adapter, 2026-08-27) integrated a real provider behind
 `ModelPort` without ceding runtime authority: an `OllamaModel` adapter (Ollama native
@@ -261,11 +263,12 @@ Read the preceding cycle record before starting the next one:
 
 None. PACS-013 through PACS-017 are PLANNED, not active.
 
-The operator may manually initiate PACS-013 (orchestrator/worker and worktree
-isolation) or another explicitly named scope. Per standing practice, an
-operator-initiated adversarial hardening pass may precede the checkpoint commit
-(fix + pin actionable findings in `tests/regression/test_hardening_regressions.py`
-and add a "Post-cycle hardening pass" section to the PACS-012 cycle record).
+The PACS-012 checkpoint is committed as `48f2aac` (`feat: add model capability
+registry and routing (PACS-012)`). The operator may manually initiate PACS-013
+(orchestrator/worker and worktree isolation) or another explicitly named scope.
+Note: PACS-013's planned worker ownership/lifecycle events are new event types
+— they require explicit operator sign-off before the schema-v1 (19-event)
+catalog changes.
 
 ## Planned path to v1.0
 

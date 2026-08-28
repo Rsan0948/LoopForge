@@ -320,7 +320,8 @@ permissions, verification truth, or stopping, and it fails closed — never sile
 when no compatible model exists. The operator-initiated post-cycle hardening pass
 (above) fixed and pinned every actionable finding. No new ADR was required: the
 cycle realizes the PACS-012 scope of `remaining-pacs-plan.md` on the ADR-0005
-port/adapter pattern.
+port/adapter pattern. Checkpoint committed as `48f2aac` (includes the
+operator-initiated post-cycle hardening pass).
 
 ## Follow-on implications
 
