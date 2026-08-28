@@ -58,8 +58,8 @@ every host Git invocation) — plus verifier/evidence blind spots (ignored files
 `status()`), fail-open verifier edges, a permanent VERIFYING wedge on artifact-collector
 failure, crash/resume evidence duplication, NaN scores encoding into undecodable streams, and
 docker-argv flag injection via leading-dash image names. See
-`docs/process/cycles/PACS-010-software-repair-workload.md`. Checkpoint **not yet committed**
-(awaiting operator confirmation).
+`docs/process/cycles/PACS-010-software-repair-workload.md`. Checkpoint commit: `c65e051`
+(includes the operator-initiated post-cycle hardening pass).
 
 PACS-009 (hardened container sandbox, 2026-08-27) added `ContainerSandbox`: a Docker-CLI-driven
 `SandboxPort` adapter that executes untrusted repository/build workloads in hardened containers
