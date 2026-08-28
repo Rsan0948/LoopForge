@@ -24,6 +24,7 @@ from loopforge.domain.context import ModelContext
 from loopforge.domain.events import RunStopped
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy, RetrySettings
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.tooling import (
     ApprovalClass,
     IdempotencyClass,
@@ -66,6 +67,15 @@ class FlakyModel:
     def __init__(self, script: list[ModelTurnError | ActionProposal]) -> None:
         self._script = deque(script)
         self.calls = 0
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return ModelCapabilities(
+            provider="stub",
+            model="flaky",
+            supports_tool_calls=True,
+            context_window_tokens=4096,
+        )
 
     def propose_action(self, context: ModelContext) -> ModelTurn:
         del context

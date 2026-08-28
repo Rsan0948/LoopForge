@@ -125,6 +125,7 @@ def test_span_name_vocabulary_covers_every_required_boundary() -> None:
         "loopforge.policy.decision",
         "loopforge.context.build",
         "loopforge.model.turn",
+        "loopforge.model.route",
         "loopforge.tool.execute",
         "loopforge.retry",
         "loopforge.verify",

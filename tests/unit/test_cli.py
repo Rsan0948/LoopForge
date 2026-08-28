@@ -323,3 +323,31 @@ def test_ollama_factory_ignores_blank_env_credential(
     monkeypatch.setenv("LOOPFORGE_OLLAMA_API_KEY", "   ")
     build_ollama_model(adder_repair_task(), model_name="m", base_url="http://localhost:11434")
     assert captured["api_key"] is None
+
+
+def test_ollama_factory_registers_wiring_supplied_capability_metadata() -> None:
+    model = build_ollama_model(
+        adder_repair_task(),
+        model_name="devstral-small-2:latest",
+        base_url="http://localhost:11434",
+        context_window_tokens=64_000,
+    )
+    try:
+        capabilities = model.capabilities
+        assert capabilities.provider == "ollama"
+        assert capabilities.model == "devstral-small-2:latest"
+        assert capabilities.supports_tool_calls is True
+        assert capabilities.context_window_tokens == 64_000
+    finally:
+        model.close()
+
+
+def test_repair_demo_rejects_invalid_ollama_context_window(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "repair-demo", "--model", "ollama", "--ollama-context-window", "0")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "invalid repair-demo configuration" in captured.out

@@ -32,6 +32,7 @@ from loopforge.domain.reliability import (
     ReliabilityPolicy,
     idempotency_key_for,
 )
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.state import RunState, replay
 from loopforge.domain.telemetry import SpanName, SpanStatusCode
 from loopforge.domain.tooling import IdempotencyClass, SideEffectClass, ToolMetadata
@@ -54,6 +55,7 @@ from loopforge.ports.model import (
     ModelTurn,
     ModelTurnError,
 )
+from loopforge.ports.routing import RoutingDecision, RoutingPolicyPort, RoutingSignals
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.telemetry import TelemetryPort
 from loopforge.ports.tools import (
@@ -90,6 +92,11 @@ class Runtime:
     sleeper: SleeperPort
     telemetry: TelemetryPort | None = None
     artifacts: ArtifactCollectorPort | None = None
+    # When a router is wired it owns per-turn model selection: after the
+    # first routed turn, post-construction mutation of ``model`` has no
+    # effect on which adapter serves turns (``model`` remains the initial
+    # and router-less fallback adapter). Pass models through the registry.
+    router: RoutingPolicyPort | None = None
     _telemetry: RuntimeTelemetry = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -152,6 +159,11 @@ class Runtime:
 
     def _drive(self, run_id: RunId) -> RunState:  # noqa: PLR0912, PLR0915 - the drive loop is intentionally one flat orchestration of the authorized cycle; span instrumentation pushes it over the thresholds
         model_failure_streak = 0
+        # Under routing, ``active_model`` starts unset: the first selection is
+        # the router's (ROUTE_INITIAL_SELECTION), not an assumption. Without a
+        # router the wired model serves every turn, exactly as before.
+        active_model: ModelPort | None = None
+        fallback_requested = False
         while True:
             current = self.state_for(run_id)
             if current.status.is_terminal:
@@ -183,6 +195,25 @@ class Runtime:
                 if decision.stop_reason is not None:
                     self._stop(run_id, decision.stop_reason, decision.reason_code)
                     return self.state_for(run_id)
+
+                if self.router is not None:
+                    # Routing selects which registered model serves this turn
+                    # (vertical tier escalation, horizontal provider fallback)
+                    # from authoritative state signals. It holds no authority:
+                    # budgets, permissions, and stopping stay with the control
+                    # policy above (AGENTS.md rule 12). A model-less decision
+                    # fails closed through the existing RunStopped path.
+                    route = self._route(
+                        run_id,
+                        current,
+                        active_model=active_model,
+                        model_failure_streak=model_failure_streak,
+                        fallback_requested=fallback_requested,
+                    )
+                    if route is None:
+                        return self.state_for(run_id)
+                    active_model = route
+                    fallback_requested = False
 
                 with self._telemetry.span(run_id, name=SpanName.CONTEXT_BUILD) as context_span:
                     model_context = self.context.build_context(current)
@@ -234,9 +265,10 @@ class Runtime:
                     ),
                 )
 
+                turn_model = active_model if active_model is not None else self.model
                 try:
                     with self._telemetry.span(run_id, name=SpanName.MODEL_TURN) as model_span:
-                        turn = self.model.propose_action(model_context)
+                        turn = turn_model.propose_action(model_context)
                         # Boundary validation is intentional: adapters may violate port types.
                         if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
                             msg_7 = (
@@ -285,6 +317,11 @@ class Runtime:
                             summary=stop_summary,
                         )
                         return self.state_for(run_id)
+                    # Ask the router for a horizontal fallback on the next
+                    # iteration; with no compatible alternative it retains the
+                    # current model (FALLBACK_UNAVAILABLE) and the bounded
+                    # retry proceeds unchanged.
+                    fallback_requested = True
                     backoff = min(
                         self.reliability.retry.base_delay_seconds * 2 ** (model_failure_streak - 1),
                         self.reliability.retry.max_delay_seconds,
@@ -368,6 +405,92 @@ class Runtime:
                         run_id,
                         "Previous verification failed; choose a new bounded action.",
                     )
+
+    def _route(
+        self,
+        run_id: RunId,
+        state: RunState,
+        *,
+        active_model: ModelPort | None,
+        model_failure_streak: int,
+        fallback_requested: bool,
+    ) -> ModelPort | None:
+        """Select the model for this turn through the routing policy.
+
+        Returns the selected adapter, or ``None`` when the registry holds no
+        compatible model — the run is then stopped ``FAILURE`` with the
+        machine-readable ``ROUTE_NO_COMPATIBLE_MODEL`` reason code durable in
+        the existing ``RunStopped`` event (no new event types). A swapped-in
+        adapter starts a fresh conversation from the durable context, exactly
+        like the PACS-011 crash/resume path.
+        """
+        assert self.router is not None
+        current_capabilities: ModelCapabilities | None = None
+        if active_model is not None:
+            current_capabilities = active_model.capabilities
+            # Boundary validation is intentional: adapters may violate port types.
+            if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                current_capabilities, ModelCapabilities
+            ):
+                msg_16 = (
+                    f"model adapter capabilities returned {type(current_capabilities).__name__}, "
+                    "expected ModelCapabilities"
+                )
+                raise ModelContractError(msg_16)
+        signals = RoutingSignals(
+            current_model=current_capabilities,
+            model_failure_streak=model_failure_streak,
+            request_fallback=fallback_requested,
+            budget_remaining_fraction=self._budget_remaining_fraction(state),
+        )
+        with self._telemetry.span(run_id, name=SpanName.MODEL_ROUTE) as route_span:
+            decision = self.router.route(state, signals=signals)
+            # Boundary validation is intentional: adapters may violate port types.
+            if not isinstance(decision, RoutingDecision):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg_17 = (
+                    f"routing policy returned {type(decision).__name__}, expected RoutingDecision"
+                )
+                raise ModelContractError(msg_17)
+            route_span.attributes["loopforge.route.reason_code"] = decision.reason_code.value
+            if decision.model is not None:
+                # The routed object must be model-shaped: a capabilities
+                # property of the right type and a callable propose_action.
+                # ModelPort is a non-runtime-checkable Protocol, so shape
+                # checks are the boundary tool (getattr normalizes a missing
+                # property into the same contract error).
+                routed_capabilities = getattr(decision.model, "capabilities", None)
+                if not isinstance(routed_capabilities, ModelCapabilities):
+                    msg_18 = (
+                        "routed model capabilities returned "
+                        f"{type(routed_capabilities).__name__}, expected ModelCapabilities"
+                    )
+                    raise ModelContractError(msg_18)
+                if not callable(getattr(decision.model, "propose_action", None)):
+                    msg_19 = "routed model does not implement propose_action"
+                    raise ModelContractError(msg_19)
+                route_span.attributes["loopforge.route.provider"] = routed_capabilities.provider
+                route_span.attributes["loopforge.route.model"] = routed_capabilities.model
+                assert decision.tier is not None
+                route_span.attributes["loopforge.route.tier"] = decision.tier.value
+        if decision.model is None:
+            self._stop(
+                run_id,
+                StopReason.FAILURE,
+                decision.reason_code.value,
+                summary=(
+                    f"{decision.reason_code.value}: no registered model satisfies the "
+                    "code-owned capability requirements"
+                ),
+            )
+            return None
+        return decision.model
+
+    def _budget_remaining_fraction(self, state: RunState) -> float | None:
+        """Read-only budget context for routing; enforcement stays with ControlPolicy."""
+        limit = self.control.budget.max_cost_usd
+        if limit <= 0:
+            return None
+        return max(0.0, (limit - state.cost_usd) / limit)
 
     def _resume_acting(self, run_id: RunId) -> None:
         state = self.state_for(run_id)

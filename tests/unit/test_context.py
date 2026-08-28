@@ -40,6 +40,7 @@ from loopforge.domain.events import ContextAssembled
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import RunState
 from loopforge.domain.tooling import (
@@ -405,6 +406,15 @@ class _BrokenContextBuilder:
 class _RecordingModel:
     def __init__(self) -> None:
         self.received: list[ModelContext] = []
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return ModelCapabilities(
+            provider="stub",
+            model="recording",
+            supports_tool_calls=True,
+            context_window_tokens=4096,
+        )
 
     def propose_action(self, context: ModelContext) -> ModelTurn:
         self.received.append(context)

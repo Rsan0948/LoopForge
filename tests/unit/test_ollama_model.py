@@ -16,11 +16,11 @@ from loopforge.domain.context import (
     ModelRole,
 )
 from loopforge.domain.prompts import default_controller_template
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import DataSensitivity
 from loopforge.domain.types import ContextItemId, RunId
 from loopforge.ports.model import (
-    ModelCapabilities,
     ModelFailureClass,
     ModelToolSpec,
     ModelTurnError,
@@ -158,7 +158,8 @@ def test_action_id_increments_per_turn() -> None:
 def test_usage_cost_uses_capability_rates() -> None:
     capabilities = ModelCapabilities(
         provider="ollama",
-        model="priced-model",
+        # Identity must match the wired model (PACS-012 hardening).
+        model="devstral-small-2:latest",
         supports_tool_calls=True,
         context_window_tokens=8192,
         input_cost_usd_per_million=10.0,

@@ -18,6 +18,7 @@ from loopforge.domain.events import ArtifactRecorded
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
+from loopforge.domain.routing import ModelCapabilities, ModelTier
 from loopforge.domain.telemetry import LogRecord, MetricSample, Span, TelemetryRecord
 from loopforge.domain.tooling import (
     ApprovalClass,
@@ -166,14 +167,31 @@ def _demo() -> int:
     return 0
 
 
-def build_ollama_model(task: RepairTask, *, model_name: str, base_url: str) -> OllamaModel:
-    """Wire the live Ollama adapter; credentials come from the environment only."""
+def build_ollama_model(
+    task: RepairTask,
+    *,
+    model_name: str,
+    base_url: str,
+    context_window_tokens: int = 131_072,
+) -> OllamaModel:
+    """Wire the live Ollama adapter; credentials come from the environment only.
+
+    Honest per-model capability metadata is supplied here at wiring time (the
+    PACS-012 registry seam): the operator-owned context window for the
+    deployed model replaces the adapter's deliberately conservative default.
+    """
     return OllamaModel(
         model=model_name,
         tools=repair_tool_specs(task),
         template=default_controller_template(),
         base_url=base_url,
         api_key=(os.environ.get(_OLLAMA_API_KEY_ENV) or "").strip() or None,
+        capabilities=ModelCapabilities(
+            provider="ollama",
+            model=model_name,
+            supports_tool_calls=True,
+            context_window_tokens=context_window_tokens,
+        ),
     )
 
 
@@ -189,6 +207,7 @@ def _repair_demo(
     model_kind: str = "scripted",
     ollama_model: str = "devstral-small-2:latest",
     ollama_url: str = "http://localhost:11434",
+    ollama_context_window: int = 131_072,
 ) -> int:
     """Repair a fixture repository through the full runtime, deterministically.
 
@@ -210,7 +229,12 @@ def _repair_demo(
     bundle_owned = False
     try:
         if model_kind == "ollama":
-            model = build_ollama_model(task, model_name=ollama_model, base_url=ollama_url)
+            model = build_ollama_model(
+                task,
+                model_name=ollama_model,
+                base_url=ollama_url,
+                context_window_tokens=ollama_context_window,
+            )
         with tempfile.TemporaryDirectory(prefix="loopforge-repair-") as directory:
             store = InMemoryEventStore()
             telemetry = InMemoryTelemetry()
@@ -220,6 +244,7 @@ def _repair_demo(
                 sleeper=SystemSleeper(),
                 telemetry=telemetry,
                 model=model,
+                model_tier=(ModelTier.STANDARD if model_kind == "ollama" else ModelTier.ECONOMY),
             )
             if container_image is not None:
                 bundle = build_container_repair_runtime(
@@ -297,6 +322,14 @@ def main() -> int:
         default="http://localhost:11434",
         help="Ollama server base URL used with --model ollama",
     )
+    parser.add_argument(
+        "--ollama-context-window",
+        metavar="TOKENS",
+        type=int,
+        default=131_072,
+        help="honest context window of the deployed Ollama model, registered as "
+        "routing capability metadata (default: 131072)",
+    )
     args = parser.parse_args()
     if args.command == "demo":
         return _demo()
@@ -306,6 +339,7 @@ def main() -> int:
             model_kind=args.model,
             ollama_model=args.ollama_model,
             ollama_url=args.ollama_url,
+            ollama_context_window=args.ollama_context_window,
         )
     return 2
 

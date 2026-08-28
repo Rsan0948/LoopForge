@@ -37,6 +37,7 @@ from loopforge.entrypoints.repair import (
     build_container_repair_runtime,
     build_trusted_repair_runtime,
 )
+from loopforge.ports.model import ModelPort
 from loopforge.ports.state_store import StateStorePort
 from loopforge.workloads.fixtures import adder_repair_task
 from loopforge.workloads.repair import RepairTask
@@ -120,15 +121,20 @@ def _artifacts(events: tuple[Event, ...]) -> list[ArtifactRecorded]:
     return [event for event in events if isinstance(event, ArtifactRecorded)]
 
 
-def _deps(store: StateStorePort) -> RepairRuntimeDeps:
-    return RepairRuntimeDeps(store=store, clock=CLOCK, sleeper=RecordingSleeper())
+def _deps(store: StateStorePort, model: ModelPort | None = None) -> RepairRuntimeDeps:
+    return RepairRuntimeDeps(store=store, clock=CLOCK, sleeper=RecordingSleeper(), model=model)
 
 
-def _trusted_bundle(tmp_path: Path, task: RepairTask, store: InMemoryEventStore):
+def _trusted_bundle(
+    tmp_path: Path,
+    task: RepairTask,
+    store: InMemoryEventStore,
+    model: ModelPort | None = None,
+):
     return build_trusted_repair_runtime(
         task,
         workspaces_dir=tmp_path / "workspaces",
-        deps=_deps(store),
+        deps=_deps(store, model),
     )
 
 
@@ -196,19 +202,23 @@ def test_repair_run_is_durable_and_replayable_through_sqlite(tmp_path: Path) -> 
 def test_false_success_attempt_is_rejected(tmp_path: Path) -> None:
     task = adder_repair_task()
     store = InMemoryEventStore()
-    bundle = _trusted_bundle(tmp_path, task, store)
     # The scripted model applies a wrong fix while *claiming* success via the
     # expected-observation channel; verifier truth must ignore the claim.
-    bundle.runtime.model = ScriptedModel(
-        [
-            ActionProposal(
-                ActionId(f"wrong-{index}"),
-                "write_file",
-                {"path": "adder.py", "content": _WRONG_FIX},
-                expected_observation="all tests pass",
-            )
-            for index in range(1, 5)
-        ]
+    bundle = _trusted_bundle(
+        tmp_path,
+        task,
+        store,
+        ScriptedModel(
+            [
+                ActionProposal(
+                    ActionId(f"wrong-{index}"),
+                    "write_file",
+                    {"path": "adder.py", "content": _WRONG_FIX},
+                    expected_observation="all tests pass",
+                )
+                for index in range(1, 5)
+            ]
+        ),
     )
 
     state = bundle.runtime.run(task.objective)
@@ -229,17 +239,21 @@ def test_false_success_attempt_is_rejected(tmp_path: Path) -> None:
 def test_unrepaired_fixture_cannot_pass_verification(tmp_path: Path) -> None:
     task = adder_repair_task()
     store = InMemoryEventStore()
-    bundle = _trusted_bundle(tmp_path, task, store)
-    bundle.runtime.model = ScriptedModel(
-        [
-            ActionProposal(
-                ActionId(f"read-{index}"),
-                "read_file",
-                {"path": "adder.py"},
-                expected_observation="all tests pass",
-            )
-            for index in range(1, 5)
-        ]
+    bundle = _trusted_bundle(
+        tmp_path,
+        task,
+        store,
+        ScriptedModel(
+            [
+                ActionProposal(
+                    ActionId(f"read-{index}"),
+                    "read_file",
+                    {"path": "adder.py"},
+                    expected_observation="all tests pass",
+                )
+                for index in range(1, 5)
+            ]
+        ),
     )
 
     state = bundle.runtime.run(task.objective)
@@ -253,41 +267,45 @@ def test_unrepaired_fixture_cannot_pass_verification(tmp_path: Path) -> None:
 def test_workspace_changes_stay_confined_to_assigned_workspace(tmp_path: Path) -> None:
     task = adder_repair_task()
     store = InMemoryEventStore()
-    bundle = _trusted_bundle(tmp_path, task, store)
     sentinel = tmp_path / "escape.py"
-    bundle.runtime.model = ScriptedModel(
-        [
-            ActionProposal(
-                ActionId("escape"),
-                "write_file",
-                {"path": "../escape.py", "content": "x = 1\n"},
-            ),
-            ActionProposal(
-                ActionId("escape-absolute"),
-                "write_file",
-                {"path": "/tmp/loopforge-escape.py", "content": "x = 1\n"},
-            ),
-            ActionProposal(
-                ActionId("read"),
-                "read_file",
-                {"path": "adder.py"},
-            ),
-            ActionProposal(
-                ActionId("fix"),
-                "write_file",
-                {"path": "adder.py", "content": task.fixture.solution[0].content},
-            ),
-            # Trailing no-op turns let the run terminate through control policy
-            # even where the local launcher fails closed (RLIMIT_AS platforms).
-            *[
+    bundle = _trusted_bundle(
+        tmp_path,
+        task,
+        store,
+        ScriptedModel(
+            [
                 ActionProposal(
-                    ActionId(f"settle-{index}"),
-                    "workspace_status",
-                    {},
-                )
-                for index in range(1, 6)
-            ],
-        ]
+                    ActionId("escape"),
+                    "write_file",
+                    {"path": "../escape.py", "content": "x = 1\n"},
+                ),
+                ActionProposal(
+                    ActionId("escape-absolute"),
+                    "write_file",
+                    {"path": "/tmp/loopforge-escape.py", "content": "x = 1\n"},
+                ),
+                ActionProposal(
+                    ActionId("read"),
+                    "read_file",
+                    {"path": "adder.py"},
+                ),
+                ActionProposal(
+                    ActionId("fix"),
+                    "write_file",
+                    {"path": "adder.py", "content": task.fixture.solution[0].content},
+                ),
+                # Trailing no-op turns let the run terminate through control policy
+                # even where the local launcher fails closed (RLIMIT_AS platforms).
+                *[
+                    ActionProposal(
+                        ActionId(f"settle-{index}"),
+                        "workspace_status",
+                        {},
+                    )
+                    for index in range(1, 6)
+                ],
+            ]
+        ),
     )
 
     state = bundle.runtime.run(task.objective)

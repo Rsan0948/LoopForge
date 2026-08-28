@@ -32,6 +32,7 @@ from loopforge.domain.actions import ActionProposal
 from loopforge.domain.artifacts import ArtifactKind
 from loopforge.domain.context import ContextItem, ModelContext, ModelRole
 from loopforge.domain.context_lifecycle import ContextAccounting, ContextTokenBudget
+from loopforge.domain.routing import ModelRequirements
 from loopforge.domain.security import SandboxRequirements, TrustClass
 from loopforge.domain.state import RunState
 from loopforge.domain.types import ActionId, ContextItemId
@@ -49,6 +50,17 @@ UNTRUSTED_REPAIR_REQUIREMENTS: Final = SandboxRequirements(
     network_isolated=True,
 )
 """Sandbox contract for untrusted fixture/build execution (PACS-009 boundary)."""
+
+REPAIR_MODEL_REQUIREMENTS: Final = ModelRequirements(
+    supports_tool_calls=True,
+    min_context_window_tokens=4096,
+)
+"""Model contract for the repair workload (PACS-012 routing boundary).
+
+Code-owned like the sandbox contract above: repair turns drive the bound tool
+surface, so a model without tool-call support — or with a context window
+below the wired context budget — can never be routed to a repair run.
+"""
 
 _DETAIL_BUDGET: Final = 300
 _OBSERVATION_ITEM_KEY: Final = "observation"

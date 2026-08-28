@@ -86,6 +86,7 @@ from loopforge.domain.reliability import (
     ReliabilityPolicy,
     ToolFailureClass,
 )
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import RunState
 from loopforge.domain.tooling import (
@@ -110,7 +111,6 @@ from loopforge.domain.types import (
 from loopforge.domain.workspace import AcceptanceCriteria, FixtureFile, FixtureSpec
 from loopforge.ports.context import ContextContractError
 from loopforge.ports.model import (
-    ModelCapabilities,
     ModelFailureClass,
     ModelToolSpec,
     ModelTurn,
@@ -1179,6 +1179,15 @@ class _ExplodingModel:
     def __init__(self, error: ModelTurnError) -> None:
         self._error = error
 
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return ModelCapabilities(
+            provider="stub",
+            model="exploding",
+            supports_tool_calls=True,
+            context_window_tokens=4096,
+        )
+
     def propose_action(self, context: ModelContext) -> ModelTurn:  # noqa: ARG002
         raise self._error
 
@@ -1226,3 +1235,378 @@ def test_runtime_bounds_adapter_text_in_durable_stop_event() -> None:
     assert "\x1b" not in summary
     assert "\n" not in summary
     assert summary.startswith("MODEL_INVALID_RESPONSE: ")
+
+
+# --- PACS-012 post-cycle hardening: capability-registry and routing pins ------------
+
+from loopforge.adapters.model_registry import (  # noqa: E402
+    ModelRegistry,
+    ModelRegistryEntry,
+)
+from loopforge.adapters.routing import TieredRoutingPolicy  # noqa: E402
+from loopforge.domain.routing import (  # noqa: E402
+    ModelRequirements,
+    ModelTier,
+    RouteReason,
+    RoutingPolicyConfig,
+)
+from loopforge.entrypoints.repair import RepairRuntimeBundle  # noqa: E402
+from loopforge.ports.model import ModelContractError  # noqa: E402
+from loopforge.ports.routing import RoutingDecision, RoutingSignals  # noqa: E402
+
+
+def _caps(provider: str, name: str, *, tool_calls: bool = True) -> ModelCapabilities:
+    return ModelCapabilities(
+        provider=provider,
+        model=name,
+        supports_tool_calls=tool_calls,
+        context_window_tokens=8192,
+    )
+
+
+def _fake_model(provider: str, name: str, *, tool_calls: bool = True) -> ScriptedModel:
+    return ScriptedModel(
+        [ActionProposal(ActionId("a1"), "inspect", {})],
+        capabilities=_caps(provider, name, tool_calls=tool_calls),
+    )
+
+
+def _policy(
+    *entries: tuple[ScriptedModel, ModelTier],
+    default_tier: ModelTier = ModelTier.STANDARD,
+    stall_threshold: int = 2,
+    budget_fraction: float | None = None,
+) -> TieredRoutingPolicy:
+    registry = ModelRegistry(
+        tuple(ModelRegistryEntry(model=model, tier=tier) for model, tier in entries)
+    )
+    return TieredRoutingPolicy(
+        registry,
+        config=RoutingPolicyConfig(
+            requirements=ModelRequirements(supports_tool_calls=True),
+            default_tier=default_tier,
+            stall_escalation_threshold=stall_threshold,
+            budget_pressure_remaining_fraction=budget_fraction,
+        ),
+    )
+
+
+# Defect (three-agent review): horizontal fallback excluded only the current model
+# *instance* — a same-provider sibling could "fall back" onto the same dead
+# provider while telemetry claimed a provider fallback. Fallback now requires a
+# different provider.
+
+
+def test_pacs012_fallback_requires_a_different_provider() -> None:
+    failing = _fake_model("provider-a", "model-1")
+    sibling = _fake_model("provider-a", "model-2")
+    policy = _policy(
+        (failing, ModelTier.STANDARD),
+        (sibling, ModelTier.STANDARD),
+    )
+    decision = policy.route(
+        RunState(run_id=RunId("run_pin")),
+        signals=RoutingSignals(current_model=failing.capabilities, request_fallback=True),
+    )
+    assert decision.reason_code is RouteReason.FALLBACK_UNAVAILABLE
+    assert decision.model is failing
+
+
+def test_pacs012_fallback_prefers_cross_provider_over_cheaper_sibling() -> None:
+    failing = _fake_model("provider-a", "model-1")
+    cheap_sibling = _fake_model("provider-a", "model-2")
+    cross = _fake_model("provider-b", "model-1")
+    policy = _policy(
+        (failing, ModelTier.STANDARD),
+        (cheap_sibling, ModelTier.STANDARD),
+        (cross, ModelTier.STANDARD),
+    )
+    decision = policy.route(
+        RunState(run_id=RunId("run_pin")),
+        signals=RoutingSignals(current_model=failing.capabilities, request_fallback=True),
+    )
+    assert decision.reason_code is RouteReason.FALLBACK_TRANSIENT_FAILURE
+    assert decision.model is cross
+
+
+# Defect: a registry whose strongest compatible tier sat below default_tier made
+# _cheapest_at_or_above raise an uncaught RuntimeError — the run wedged
+# non-terminal and every resume re-raised. The default tier is a preference and
+# is now clamped to the strongest compatible tier available.
+
+
+def test_pacs012_default_tier_above_registry_clamps_instead_of_crashing() -> None:
+    economy = _fake_model("p", "economy")
+    policy = _policy((economy, ModelTier.ECONOMY), default_tier=ModelTier.ADVANCED)
+    decision = policy.route(RunState(run_id=RunId("run_pin")), signals=RoutingSignals())
+    assert decision.reason_code is RouteReason.ROUTE_INITIAL_SELECTION
+    assert decision.model is economy
+    assert decision.tier is ModelTier.ECONOMY
+
+
+def test_pacs012_below_default_tier_registry_never_wedges_the_run() -> None:
+    model = _fake_model("p", "economy")
+    policy = _policy((model, ModelTier.ECONOMY), default_tier=ModelTier.ADVANCED)
+    store = InMemoryEventStore()
+    runtime = Runtime(
+        model=model,
+        tools=ScriptedTools(
+            [ToolResult(ok=True, observation="all tests pass")],
+            metadata=[
+                ToolMetadata(
+                    name="inspect",
+                    risk=RiskLevel.READ_ONLY,
+                    required_permission=Permission.READ,
+                    side_effect=SideEffectClass.READ_ONLY,
+                    retry=RetryClass.NEVER,
+                    idempotency=IdempotencyClass.NATURAL,
+                    approval=ApprovalClass.NONE,
+                    timeout_seconds=5.0,
+                )
+            ],
+        ),
+        verifier=ObservationContainsVerifier("all tests pass"),
+        store=store,
+        control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
+        permissions=PermissionPolicy(frozenset({Permission.READ})),
+        reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(FixedClock(NOW)),
+        clock=FixedClock(NOW),
+        sleeper=RecordingSleeper(),
+        router=policy,
+    )
+    state = runtime.run("objective")
+    assert state.status is RunStatus.SUCCEEDED
+    assert model.capabilities.model == "economy"
+
+
+# Defect: a first selection (including post-resume re-selection, where
+# consecutive_no_progress may already exceed the stall threshold) was
+# reason-coded ESCALATED_STALL / DEESCALATED_BUDGET_PRESSURE although nothing
+# was escalated *from*. Initial selections are always ROUTE_INITIAL_SELECTION.
+
+
+def test_pacs012_initial_selection_is_never_mislabeled_escalation() -> None:
+    economy = _fake_model("p", "economy")
+    advanced = _fake_model("p", "advanced")
+    policy = _policy(
+        (economy, ModelTier.ECONOMY),
+        (advanced, ModelTier.ADVANCED),
+        default_tier=ModelTier.ECONOMY,
+        budget_fraction=0.5,
+    )
+    stalled = RunState(run_id=RunId("run_pin"), consecutive_no_progress=9)
+    stalled_decision = policy.route(stalled, signals=RoutingSignals())
+    assert stalled_decision.reason_code is RouteReason.ROUTE_INITIAL_SELECTION
+    assert stalled_decision.model is advanced  # signals still shape the tier
+    pressured_decision = policy.route(
+        RunState(run_id=RunId("run_pin")),
+        signals=RoutingSignals(budget_remaining_fraction=0.1),
+    )
+    assert pressured_decision.reason_code is RouteReason.ROUTE_INITIAL_SELECTION
+    assert pressured_decision.model is economy
+
+
+# Defect: budget pressure suppressed stall escalation even when de-escalation
+# was a no-op (already at the cheapest tier). No-op pressure no longer blocks.
+
+
+def test_pacs012_noop_budget_pressure_does_not_block_stall_escalation() -> None:
+    economy = _fake_model("p", "economy")
+    advanced = _fake_model("p", "advanced")
+    policy = _policy(
+        (economy, ModelTier.ECONOMY),
+        (advanced, ModelTier.ADVANCED),
+        budget_fraction=0.5,
+    )
+    decision = policy.route(
+        RunState(run_id=RunId("run_pin"), consecutive_no_progress=9),
+        signals=RoutingSignals(current_model=economy.capabilities, budget_remaining_fraction=0.1),
+    )
+    assert decision.reason_code is RouteReason.ESCALATED_STALL
+    assert decision.model is advanced
+
+
+# Boundary-equality pin: fraction exactly at the threshold triggers pressure.
+
+
+def test_pacs012_budget_pressure_fires_at_exact_threshold() -> None:
+    economy = _fake_model("p", "economy")
+    advanced = _fake_model("p", "advanced")
+    policy = _policy(
+        (economy, ModelTier.ECONOMY),
+        (advanced, ModelTier.ADVANCED),
+        budget_fraction=0.25,
+    )
+    decision = policy.route(
+        RunState(run_id=RunId("run_pin")),
+        signals=RoutingSignals(current_model=advanced.capabilities, budget_remaining_fraction=0.25),
+    )
+    assert decision.reason_code is RouteReason.DEESCALATED_BUDGET_PRESSURE
+    assert decision.model is economy
+
+
+# Defect: RoutingSignals accepted any object as current_model, surfacing a raw
+# AttributeError deep in the registry instead of a boundary error.
+
+
+def test_pacs012_routing_signals_reject_non_capability_current_model() -> None:
+    with pytest.raises(TypeError, match="must be ModelCapabilities"):
+        RoutingSignals(current_model="not-capabilities")  # pyright: ignore[reportArgumentType]
+
+
+# Defect: a registry entry whose model lacks the capabilities property raised a
+# raw AttributeError instead of the normalized construction error.
+
+
+def test_pacs012_registry_entry_normalizes_missing_capabilities() -> None:
+    class _BareModel:
+        def propose_action(self, context: ModelContext) -> ModelTurn:  # noqa: ARG002
+            raise AssertionError
+
+    with pytest.raises(TypeError, match="must be ModelCapabilities"):
+        ModelRegistryEntry(model=_BareModel(), tier=ModelTier.ECONOMY)  # pyright: ignore[reportArgumentType]
+
+
+# Defect: RoutingDecision accepted ROUTE_NO_COMPATIBLE_MODEL *with* a model — a
+# self-contradictory audit record.
+
+
+def test_pacs012_no_compatible_model_reason_cannot_carry_a_model() -> None:
+    with pytest.raises(ValueError, match="cannot carry a model"):
+        RoutingDecision(
+            reason_code=RouteReason.ROUTE_NO_COMPATIBLE_MODEL,
+            model=_fake_model("p", "m"),
+            tier=ModelTier.STANDARD,
+        )
+
+
+# Defect: a routed decision carrying an object that is not model-shaped crashed
+# with AttributeError mid-turn instead of failing at the routing boundary.
+
+
+def test_pacs012_runtime_rejects_model_less_routed_objects() -> None:
+    class _ShapedRouter:
+        def __init__(self, routed: object) -> None:
+            self._routed = routed
+
+        def route(self, state: RunState, *, signals: RoutingSignals) -> RoutingDecision:
+            del state, signals
+            return RoutingDecision(
+                reason_code=RouteReason.ROUTE_RETAINED_CURRENT,
+                model=self._routed,  # pyright: ignore[reportArgumentType]
+                tier=ModelTier.STANDARD,
+            )
+
+    class _NoCapabilities:
+        def propose_action(self, context: ModelContext) -> ModelTurn:  # noqa: ARG002
+            raise AssertionError
+
+    class _NoProposeAction:
+        @property
+        def capabilities(self) -> ModelCapabilities:
+            return _caps("p", "m")
+
+    for routed in (_NoCapabilities(), _NoProposeAction()):
+        model = _fake_model("p", "m")
+        runtime = Runtime(
+            model=model,
+            tools=ScriptedTools(
+                [ToolResult(ok=True, observation="ok")],
+                metadata=[
+                    ToolMetadata(
+                        name="inspect",
+                        risk=RiskLevel.READ_ONLY,
+                        required_permission=Permission.READ,
+                        side_effect=SideEffectClass.READ_ONLY,
+                        retry=RetryClass.NEVER,
+                        idempotency=IdempotencyClass.NATURAL,
+                        approval=ApprovalClass.NONE,
+                        timeout_seconds=5.0,
+                    )
+                ],
+            ),
+            verifier=ObservationContainsVerifier("ok"),
+            store=InMemoryEventStore(),
+            control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
+            permissions=PermissionPolicy(frozenset({Permission.READ})),
+            reliability=ReliabilityPolicy(),
+            context=BasicContextBuilder(FixedClock(NOW)),
+            clock=FixedClock(NOW),
+            sleeper=RecordingSleeper(),
+            router=_ShapedRouter(routed),  # pyright: ignore[reportArgumentType]
+        )
+        with pytest.raises(ModelContractError):
+            runtime.run("objective")
+
+
+# Defect: OllamaModel accepted capabilities whose provider/model diverged from
+# the wired model — the request payload sends capabilities.model, so a wiring
+# typo would silently query a different model. Identity is now enforced.
+
+
+def test_pacs012_ollama_capabilities_identity_must_match_wired_model() -> None:
+    with pytest.raises(ValueError, match="must match the wired provider and model"):
+        OllamaModel(
+            model="real-model",
+            tools=(ModelToolSpec(name="inspect", description="d", parameters={}),),
+            template=default_controller_template(),
+            capabilities=_caps("ollama", "DIFFERENT-model"),
+        )
+    with pytest.raises(ValueError, match="must match the wired provider and model"):
+        OllamaModel(
+            model="real-model",
+            tools=(ModelToolSpec(name="inspect", description="d", parameters={}),),
+            template=default_controller_template(),
+            capabilities=_caps("other-provider", "real-model"),
+        )
+
+
+# Defect (latent): RepairRuntimeBundle.close() closed only runtime.model; a
+# routed registry model different from runtime.model would leak its client.
+# close() now fans out over every registered model.
+
+
+def test_pacs012_bundle_close_fans_out_over_all_registered_models() -> None:
+    closed: list[str] = []
+
+    class _ClosableModel:
+        def __init__(self, name: str) -> None:
+            self._name = name
+
+        @property
+        def capabilities(self) -> ModelCapabilities:
+            return _caps("p", self._name)
+
+        def propose_action(self, context: ModelContext) -> ModelTurn:  # noqa: ARG002
+            raise AssertionError
+
+        def close(self) -> None:
+            closed.append(self._name)
+
+    class _DestroyableSandbox:
+        def destroy(self) -> None:
+            closed.append("sandbox")
+
+    wired = _ClosableModel("wired")
+    routed = _ClosableModel("routed")
+    runtime = Runtime(
+        model=wired,
+        tools=ScriptedTools([ToolResult(ok=True, observation="ok")], metadata=[]),
+        verifier=ObservationContainsVerifier("ok"),
+        store=InMemoryEventStore(),
+        control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
+        permissions=PermissionPolicy(frozenset({Permission.READ})),
+        reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(FixedClock(NOW)),
+        clock=FixedClock(NOW),
+        sleeper=RecordingSleeper(),
+    )
+    bundle = RepairRuntimeBundle(
+        runtime=runtime,
+        workspace=None,  # pyright: ignore[reportArgumentType] - close() never touches it
+        sandbox=_DestroyableSandbox(),  # pyright: ignore[reportArgumentType]
+        models=(routed, wired),  # wired appears twice across models+runtime
+    )
+    bundle.close()
+    assert closed == ["sandbox", "routed", "wired"]

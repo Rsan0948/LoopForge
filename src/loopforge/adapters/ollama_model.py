@@ -32,10 +32,10 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ContextItem, ModelContext
 from loopforge.domain.prompts import PromptTemplate, RenderedPrompt, render_prompt
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import TrustClass
 from loopforge.domain.types import ActionId, RunId, UsageDelta
 from loopforge.ports.model import (
-    ModelCapabilities,
     ModelFailureClass,
     ModelToolSpec,
     ModelTurn,
@@ -133,6 +133,17 @@ class OllamaModel:
             # parameter is the only sanctioned credential path.
             msg_8 = "ollama base URL must not embed credentials; use api_key"
             raise ValueError(msg_8)
+        # Capability identity is request identity: the payload sends
+        # capabilities.model, so a wiring typo that diverges the two must
+        # fail at construction, not silently query a different model.
+        if capabilities is not None and (
+            capabilities.provider != "ollama" or capabilities.model != model
+        ):
+            msg_9 = (
+                "ollama capabilities identity must match the wired provider "
+                f"and model (expected ollama/{model})"
+            )
+            raise ValueError(msg_9)
         self._capabilities = capabilities or ModelCapabilities(
             provider="ollama",
             model=model,

@@ -5,6 +5,7 @@ from datetime import datetime
 
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.state import RunState
 from loopforge.domain.tooling import ToolMetadata
 from loopforge.domain.types import UsageDelta
@@ -14,9 +15,28 @@ from loopforge.ports.verifier import VerificationResult
 
 
 class ScriptedModel:
-    def __init__(self, actions: list[ActionProposal], *, cost_per_turn: float = 0.01) -> None:
+    def __init__(
+        self,
+        actions: list[ActionProposal],
+        *,
+        cost_per_turn: float = 0.01,
+        capabilities: ModelCapabilities | None = None,
+    ) -> None:
         self._actions = deque(actions)
         self._cost_per_turn = cost_per_turn
+        self._capabilities = capabilities or ModelCapabilities(
+            provider="scripted",
+            model="scripted-deterministic",
+            supports_tool_calls=True,
+            # The scripted model is deterministic and never reads context;
+            # the declared window honestly matches the runtime's wired
+            # context budget rather than implying unbounded capacity.
+            context_window_tokens=4096,
+        )
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self._capabilities
 
     def propose_action(self, context: ModelContext) -> ModelTurn:
         del context

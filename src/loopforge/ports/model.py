@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Protocol
 
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.types import UsageDelta
 
 
@@ -78,45 +78,21 @@ class ModelToolSpec:
             raise ValueError(msg_2)
 
 
-@dataclass(frozen=True, slots=True, kw_only=True)
-class ModelCapabilities:
-    """Provider/model capability metadata advertised by a live adapter.
-
-    Honest, code-owned metadata about the backing model. Cost rates are per
-    one million tokens in USD; local providers report ``0.0``. The capability
-    registry and routing policy are a follow-on cycle (PACS-012).
-    """
-
-    provider: str
-    model: str
-    supports_tool_calls: bool
-    context_window_tokens: int
-    input_cost_usd_per_million: float = 0.0
-    output_cost_usd_per_million: float = 0.0
-
-    def __post_init__(self) -> None:
-        if not self.provider.strip():
-            msg = "model capabilities provider cannot be empty"
-            raise ValueError(msg)
-        if not self.model.strip():
-            msg_2 = "model capabilities model cannot be empty"
-            raise ValueError(msg_2)
-        if not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-            self.context_window_tokens, int
-        ) or isinstance(self.context_window_tokens, bool):
-            msg_5 = "model capabilities context window must be an integer"
-            raise ValueError(msg_5)  # noqa: TRY004
-        if self.context_window_tokens <= 0:
-            msg_3 = "model capabilities context window must be positive"
-            raise ValueError(msg_3)
-        rates = (self.input_cost_usd_per_million, self.output_cost_usd_per_million)
-        if not all(math.isfinite(rate) for rate in rates):
-            msg_6 = "model capabilities cost rates must be finite"
-            raise ValueError(msg_6)
-        if self.input_cost_usd_per_million < 0 or self.output_cost_usd_per_million < 0:
-            msg_4 = "model capabilities cost rates cannot be negative"
-            raise ValueError(msg_4)
+# ModelCapabilities lives in ``loopforge.domain.routing`` (code-owned domain
+# vocabulary, mirroring ``SandboxCapabilities``); it is imported here so the
+# port can declare it structurally.
 
 
 class ModelPort(Protocol):
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        """Honest capability metadata for the backing model.
+
+        Every adapter advertises capabilities — deterministic and scripted
+        adapters included — so the registry and routing policy can match
+        code-owned ``ModelRequirements`` fail-closed instead of trusting
+        provider names (mirrors ``SandboxPort.capabilities``).
+        """
+        ...
+
     def propose_action(self, context: ModelContext) -> ModelTurn: ...

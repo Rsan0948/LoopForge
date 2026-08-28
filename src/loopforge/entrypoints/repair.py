@@ -28,6 +28,8 @@ from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCoun
 from loopforge.adapters.file_tools import WorkspaceFileTools
 from loopforge.adapters.git_workspace import GitWorkspaceManager
 from loopforge.adapters.local_sandbox import CommandSpec, ConstrainedLocalSandbox
+from loopforge.adapters.model_registry import ModelRegistry, ModelRegistryEntry
+from loopforge.adapters.routing import TieredRoutingPolicy
 from loopforge.adapters.sandbox_tools import SandboxCommandTools, SandboxToolBinding
 from loopforge.adapters.scripted import ScriptedModel
 from loopforge.adapters.workspace_git_tools import WorkspaceGitTools
@@ -36,6 +38,7 @@ from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
+from loopforge.domain.routing import ModelTier, RoutingPolicyConfig
 from loopforge.domain.security import SandboxRequirements
 from loopforge.domain.tooling import (
     ApprovalClass,
@@ -52,6 +55,7 @@ from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.telemetry import TelemetryPort
 from loopforge.ports.workspace import WorkspacePort
 from loopforge.workloads.repair import (
+    REPAIR_MODEL_REQUIREMENTS,
     UNTRUSTED_REPAIR_REQUIREMENTS,
     RepairCommand,
     RepairContextBuilder,
@@ -116,6 +120,8 @@ class RepairRuntimeDeps:
     budget: BudgetLimit | None = None
     model: ModelPort | None = None
     """Optional live model; defaults to the deterministic scripted model."""
+    model_tier: ModelTier = ModelTier.ECONOMY
+    """Code-owned routing tier for the wired model (scripted default is ECONOMY)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -123,20 +129,31 @@ class RepairRuntimeBundle:
     runtime: Runtime
     workspace: WorkspacePort
     sandbox: SandboxPort
+    models: tuple[ModelPort, ...] = ()
+    """Every registry-registered model whose lifecycle the bundle owns."""
 
     def close(self) -> None:
-        """Release sandbox resources (in-flight containers) best-effort.
+        """Release sandbox and model resources best-effort.
 
-        The composition root owns the sandbox lifecycle: callers should pair
-        ``runtime.run(...)`` with ``close()`` in a ``finally`` block so an
-        exceptional run never leaks an in-flight workload container.
+        The composition root owns the sandbox lifecycle (an exceptional run
+        must never leak an in-flight workload container) and the lifecycle of
+        every registered model: routing may serve turns from any registry
+        entry, so close() fans out over all of them — closing only
+        ``runtime.model`` would leak a routed live adapter's HTTP client.
+        Callers should pair ``runtime.run(...)`` with ``close()`` in a
+        ``finally`` block.
         """
         destroy = getattr(self.sandbox, "destroy", None)
         if callable(destroy):
             destroy()
-        close_model = getattr(self.runtime.model, "close", None)
-        if callable(close_model):
-            close_model()
+        seen: set[int] = set()
+        for model in (*self.models, self.runtime.model):
+            if id(model) in seen:
+                continue
+            seen.add(id(model))
+            close_model = getattr(model, "close", None)
+            if callable(close_model):
+                close_model()
 
 
 def build_trusted_repair_runtime(
@@ -221,10 +238,23 @@ def _repair_bundle(
             ),
         )
     )
-    runtime = Runtime(
-        model=(
-            deps.model if deps.model is not None else ScriptedModel(scripted_repair_actions(task))
+    model = deps.model if deps.model is not None else ScriptedModel(scripted_repair_actions(task))
+    # The wired model is registered with its honest capabilities and routed
+    # through the tiered policy against the workload's code-owned model
+    # contract; with a single entry the policy deterministically retains it
+    # (or stops the run ROUTE_NO_COMPATIBLE_MODEL if it cannot satisfy the
+    # requirements — fail closed, never route to an incompatible model).
+    registry = ModelRegistry((ModelRegistryEntry(model=model, tier=deps.model_tier),))
+    router = TieredRoutingPolicy(
+        registry,
+        config=RoutingPolicyConfig(
+            requirements=REPAIR_MODEL_REQUIREMENTS,
+            default_tier=deps.model_tier,
         ),
+    )
+    runtime = Runtime(
+        model=model,
+        router=router,
         tools=tools,
         verifier=RepairVerifier(sandbox, workspace, task.acceptance),
         store=deps.store,
@@ -244,4 +274,9 @@ def _repair_bundle(
         telemetry=deps.telemetry,
         artifacts=WorkspaceArtifactCollector(workspace),
     )
-    return RepairRuntimeBundle(runtime=runtime, workspace=workspace, sandbox=sandbox)
+    return RepairRuntimeBundle(
+        runtime=runtime,
+        workspace=workspace,
+        sandbox=sandbox,
+        models=tuple(entry.model for entry in registry.entries),
+    )

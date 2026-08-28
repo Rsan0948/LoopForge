@@ -23,6 +23,7 @@ from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.domain.events import ArtifactRecorded, BudgetDebited
 from loopforge.domain.prompts import default_controller_template
+from loopforge.domain.routing import ModelTier
 from loopforge.domain.types import RunStatus
 from loopforge.entrypoints.repair import RepairRuntimeDeps, build_container_repair_runtime
 from loopforge.workloads.fixtures import adder_repair_task
@@ -117,6 +118,8 @@ def test_live_ollama_model_repairs_fixture_through_full_runtime(tmp_path: Path) 
         sleeper=SystemSleeper(),
         telemetry=InMemoryTelemetry(),
         model=model,
+        # Live models register at STANDARD, matching the CLI wiring.
+        model_tier=ModelTier.STANDARD,
     )
     bundle = build_container_repair_runtime(
         task,

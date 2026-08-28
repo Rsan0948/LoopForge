@@ -54,6 +54,7 @@ class SpanName(StrEnum):
     POLICY_DECISION = "loopforge.policy.decision"
     CONTEXT_BUILD = "loopforge.context.build"
     MODEL_TURN = "loopforge.model.turn"
+    MODEL_ROUTE = "loopforge.model.route"
     TOOL_EXECUTE = "loopforge.tool.execute"
     RETRY = "loopforge.retry"
     VERIFY = "loopforge.verify"

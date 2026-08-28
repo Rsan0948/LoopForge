@@ -37,7 +37,40 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-011.
+Completed: PACS-001 through PACS-012.
+
+PACS-012 (model capability registry and routing, 2026-08-28) replaced hard-coded
+model selection with a code-owned registry and deterministic, reason-coded routing
+— without ceding any authority. `ModelCapabilities` moved home to
+`domain/routing.py` (mirroring `SandboxCapabilities`) beside `ModelTier`
+strength/cost classes, fail-closed `ModelRequirements`, the closed `RouteReason`
+vocabulary (7 codes), and an authority-free `RoutingPolicyConfig`; `ModelPort`
+now declares `capabilities` structurally and `ScriptedModel` advertises honest
+defaults. `ModelRegistry` fails at construction on duplicate provider/model
+registration and fails closed on capability mismatch; it is where honest
+per-model wiring-time metadata lands (the CLI now registers the Ollama model's
+real context window via `--ollama-context-window`). `TieredRoutingPolicy`
+selects cheapest-at-target-tier (climbing only when the tier is empty),
+escalates vertically on stalls, de-escalates on budget pressure using a
+read-only remaining-budget fraction (enforcement stays with `ControlPolicy`,
+rule 12), falls back horizontally across providers on transient failure, and
+retains honestly when no compatible move exists. The runtime's optional
+`router` seam selects the model per turn (mid-run swaps restart the adapter
+conversation from durable context — the PACS-011 resume safety argument); a
+model-less decision stops `FAILURE` with `ROUTE_NO_COMPATIBLE_MODEL` durable in
+the existing `RunStopped` event (schema v1, 19 events unchanged). Telemetry
+gained one closed-vocabulary span (`loopforge.model.route`); router-less runs
+are byte-identical to PACS-011. The policy is proven entirely with fake
+adapters; the live Ollama+Docker repair E2E passes through the routed runtime.
+A post-cycle adversarial hardening pass (three-agent review, 2026-08-28) triaged
+~15 findings; every actionable defect was fixed and pinned — most severely a
+same-provider "fallback" mislabeled as cross-provider, and a `default_tier`
+above all registered tiers wedging runs non-terminal (now clamped: the default
+tier is a preference, requirements the hard gate) — plus mislabeled
+first-selection reason codes, no-op budget pressure suppressing escalation, a
+latent routed-model client leak in bundle `close()`, Ollama capability/request
+identity divergence, and contract-validation normalization gaps. See
+`docs/process/cycles/PACS-012-model-capability-registry-and-routing.md`.
 
 PACS-011 (first live model adapter, 2026-08-27) integrated a real provider behind
 `ModelPort` without ceding runtime authority: an `OllamaModel` adapter (Ollama native
@@ -133,12 +166,13 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-011 post-hardening, 2026-08-28, Ollama 0.32.15 with
+Current checked evidence (PACS-012 post-hardening, 2026-08-28, Ollama 0.32.15 with
 `devstral-small-2:latest`, Docker Desktop 29.2.1 live):
-- 1307 tests passing, 15 platform-gated skips (same macOS `RLIMIT_AS` + non-UTF-8 gates as
-  PACS-010; the live Ollama+Docker repair E2E executed and passed; zero credential-gated
-  skips — deterministic CI runs with zero provider credentials)
-- 96.35% branch-aware coverage
+- 1370 tests passing, 15 platform-gated skips (same macOS `RLIMIT_AS` + non-UTF-8 gates as
+  PACS-010/011; the live Ollama+Docker repair E2E executed and passed through the routed
+  runtime; zero credential-gated skips — deterministic CI runs with zero provider
+  credentials, 1369 passing with `--ignore=tests/live`)
+- 96.71% branch-aware coverage (all new routing modules at 97–100%)
 - ruff format/check, pyright strict, and import-linter all executed and green
 - live CLI evidence: `repair-demo --container python:3.12-alpine --model ollama` →
   `status=succeeded iterations=2` with the live model driving, verifier summary
@@ -221,15 +255,17 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-011-first-live-model-adapter.md`
+- `docs/process/cycles/PACS-012-model-capability-registry-and-routing.md`
 
 ## Next authorized work
 
-None. PACS-012 through PACS-017 are PLANNED, not active.
+None. PACS-013 through PACS-017 are PLANNED, not active.
 
-The PACS-011 checkpoint is committed as `975cf12` (`feat: add first live model adapter
-(PACS-011)`). The operator may manually initiate PACS-012 (model capability registry and
-routing) or another explicitly named scope.
+The operator may manually initiate PACS-013 (orchestrator/worker and worktree
+isolation) or another explicitly named scope. Per standing practice, an
+operator-initiated adversarial hardening pass may precede the checkpoint commit
+(fix + pin actionable findings in `tests/regression/test_hardening_regressions.py`
+and add a "Post-cycle hardening pass" section to the PACS-012 cycle record).
 
 ## Planned path to v1.0
 

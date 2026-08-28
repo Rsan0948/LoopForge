@@ -1,4 +1,92 @@
-# Build status — PACS-011 complete
+# Build status — PACS-012 complete
+
+PACS-012 replaces hard-coded model selection with a capability registry and
+reason-coded routing while keeping every ounce of authority outside the policy.
+`ModelCapabilities` moved home to `domain/routing.py` (mirroring
+`SandboxCapabilities`) alongside `ModelTier` strength/cost classes, fail-closed
+`ModelRequirements` (tool-call support, minimum context window, cost ceilings),
+the closed `RouteReason` machine-code vocabulary, and an authority-free
+`RoutingPolicyConfig`. `ModelPort` now declares `capabilities` structurally
+(mirroring `SandboxPort.capabilities`); `ScriptedModel` advertises honest
+defaults. `ModelRegistry` (construction-validated: duplicate provider/model
+fails at wiring time, capability matching fails closed) is where honest
+per-model metadata supplied at wiring time lands — the CLI now registers the
+Ollama adapter's real context window (`--ollama-context-window`), replacing the
+deliberately conservative adapter default. `TieredRoutingPolicy` routes every
+turn deterministically: cheapest-at-target-tier selection (climbing only when
+the tier is empty), vertical escalation on stalls, budget-pressure
+de-escalation (read-only budget context; enforcement stays with
+`ControlPolicy`, rule 12), horizontal provider fallback on transient failure,
+and honest retention (`ROUTE_RETAINED_CURRENT`/`FALLBACK_UNAVAILABLE`) when no
+compatible move exists. The runtime's optional `router` seam selects the model
+per turn; mid-run swaps start a fresh adapter conversation from durable context
+(same safety argument as PACS-011 resume); a model-less decision stops the run
+`FAILURE` with `ROUTE_NO_COMPATIBLE_MODEL` durable in the existing `RunStopped`
+event — schema v1, 19 event types unchanged. Routing telemetry is one
+closed-vocabulary span extension (`loopforge.model.route` with
+reason/provider/model/tier attributes); router-less runs emit nothing and all
+pre-existing span pins are unchanged. The repair workload declares
+`REPAIR_MODEL_REQUIREMENTS` beside its sandbox contract; entrypoints register
+the wired model (scripted ECONOMY, live STANDARD) and route every turn. See
+`docs/process/cycles/PACS-012-model-capability-registry-and-routing.md`.
+No subsequent PACS cycle is active until manually initiated.
+
+Verified in this environment (2026-08-28, Ollama 0.32.15 with
+`devstral-small-2:latest`, Docker Desktop live, `python:3.12-alpine` pulled;
+numbers below are post-hardening):
+
+- `uv run pytest -q --cov` — **1370 passing, 15 skipped** (skips are exactly the
+  pre-existing macOS `RLIMIT_AS` platform gates + 1 non-UTF-8-filesystem gate;
+  the live Ollama+Docker repair E2E **executed and passed** through the routed
+  runtime; zero credential-gated skips)
+- branch-aware coverage — **96.71% overall**; configured 90% gate satisfied;
+  all new routing modules at 97–100%
+- `ruff format --check .` / `ruff check .` — clean (139 files)
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- live CLI evidence — `repair-demo --container python:3.12-alpine` (scripted
+  model through the routed stack) → `status=succeeded iterations=2 cost=$0.02`,
+  verifier summary and exact patch evidence unchanged
+- deterministic CI preserved — `--ignore=tests/live`: 1369 passing / 15 skipped
+  with zero provider credentials
+
+Post-cycle adversarial hardening (three-agent review, 2026-08-28): ~15 findings
+triaged, every actionable defect fixed and pinned — most severely a same-provider
+"fallback" that telemetry mislabeled as cross-provider, and a `default_tier`
+above all registered tiers wedging runs non-terminal via an uncaught
+`RuntimeError` (now clamped — the default tier is a preference, requirements the
+hard gate). Also fixed: mislabeled first-selection reason codes on resume-shaped
+state, no-op budget pressure suppressing stall escalation, a latent routed-model
+client leak in bundle `close()` (now fans out over all registered models),
+Ollama capability/request identity divergence (now constructor-enforced),
+contract-validation normalization at the signals/registry/runtime boundaries,
+and a self-contradictory `ROUTE_NO_COMPATIBLE_MODEL`-with-model decision. Eight
+findings documented as designed. Full record in the cycle file's "Post-cycle
+hardening pass" section; pins in `tests/regression/test_hardening_regressions.py`
+(PACS-012 section).
+
+## Implemented through PACS-012
+
+- `domain/routing.py`: `ModelCapabilities` (re-homed from `ports/model.py`),
+  `ModelTier` + `TIER_RANK`, `ModelRequirements.missing_for` fail-closed
+  matching, `RouteReason` (7 codes), `RoutingPolicyConfig`
+- `ports/model.py`: `ModelPort.capabilities` (protocol widening);
+  `ports/routing.py`: `RoutingSignals`, `RoutingDecision` (invariant-validated,
+  enum-coerced), `RoutingPolicyPort`
+- `adapters/model_registry.py`: `ModelRegistry`/`ModelRegistryEntry`/
+  `ModelLookupError`; `adapters/routing.py`: `TieredRoutingPolicy`
+- `application/runtime.py`: optional `router` seam — per-turn selection,
+  mid-run swap, fallback flag on transient failure, read-only budget fraction,
+  fail-closed `ROUTE_NO_COMPATIBLE_MODEL` stop, `loopforge.model.route` spans
+- `workloads/repair.py`: `REPAIR_MODEL_REQUIREMENTS`; `entrypoints/repair.py` +
+  `entrypoints/cli.py`: registry/policy wiring, `RepairRuntimeDeps.model_tier`,
+  wiring-time Ollama capabilities (`--ollama-context-window`)
+- test suites: `tests/unit/test_model_registry.py`,
+  `tests/unit/test_routing_policy.py` (fake-adapter acceptance gate),
+  `tests/integration/test_routing_runtime.py` (per-turn routing, mid-run swap,
+  fail-closed stops, span reason sequences), CLI capability pins
+
+# Historical: PACS-011 complete
 
 PACS-011 integrates the first live model provider behind `ModelPort` without giving the
 provider ownership of the control loop, state, permissions, or stopping decisions. The new
