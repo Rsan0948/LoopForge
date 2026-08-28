@@ -27,7 +27,7 @@ from loopforge.adapters.container_sandbox import ContainerSandbox, ContainerSand
 from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
 from loopforge.adapters.file_tools import WorkspaceFileTools
 from loopforge.adapters.git_workspace import GitWorkspaceManager
-from loopforge.adapters.local_sandbox import CommandSpec, ConstrainedLocalSandbox
+from loopforge.adapters.local_sandbox import CommandSpec, ConstrainedLocalSandbox, SandboxLimits
 from loopforge.adapters.model_registry import ModelRegistry, ModelRegistryEntry
 from loopforge.adapters.routing import TieredRoutingPolicy
 from loopforge.adapters.sandbox_tools import SandboxCommandTools, SandboxToolBinding
@@ -207,6 +207,7 @@ def build_adopted_repair_runtime(
                 image=container_image,
                 commands=tuple(repair_command_specs(task.commands)),
                 environment={"CIVICML_ENV": "test"},
+                limits=SandboxLimits(max_memory_bytes=2 * 1024 * 1024 * 1024),
             ),
         )
     else:
