@@ -337,11 +337,11 @@ def _repair_demo(  # noqa: PLR0912, PLR0913 - CLI wiring keeps provider options 
     return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
-def _civicml_loop(repository: str, *, deepseek_model: str) -> int:
+def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str) -> int:
     """Run DeepSeek repair iterations against an adopted CivicML checkout."""
     root = Path(repository).resolve()
     python = root / ".venv/bin/python"
-    if not python.is_file():
+    if not container_image and not python.is_file():
         print(f"error: expected CivicML virtualenv interpreter at {python}")
         return 2
     task = RepairTask(
@@ -359,14 +359,17 @@ def _civicml_loop(repository: str, *, deepseek_model: str) -> int:
             RepairCommand(
                 kind=RepairCommandKind.TEST,
                 name="civicml_tests",
-                argv=(str(python), "-m", "pytest", "-q"),
+                argv=(
+                    "/usr/local/bin/python" if container_image else str(python),
+                    "-m", "pytest", "-q",
+                ),
                 timeout_seconds=300,
                 cpu_seconds=240,
             ),
             RepairCommand(
                 kind=RepairCommandKind.LINT,
                 name="civicml_ruff",
-                argv=(str(python), "-m", "ruff", "check", "."),
+                argv=("/usr/local/bin/ruff" if container_image else str(python), "check", "."),
                 timeout_seconds=120,
                 cpu_seconds=120,
             ),
@@ -393,7 +396,9 @@ def _civicml_loop(repository: str, *, deepseek_model: str) -> int:
         model_tier=ModelTier.ADVANCED,
         budget=BudgetLimit(max_cost_usd=5.0, max_iterations=30),
     )
-    bundle = build_adopted_repair_runtime(task, repository=root, deps=deps)
+    bundle = build_adopted_repair_runtime(
+        task, repository=root, deps=deps, container_image=container_image or None
+    )
     try:
         state = bundle.runtime.run(task.objective)
     finally:
@@ -412,6 +417,7 @@ def main() -> int:
     )
     parser.add_argument("command", choices=["demo", "repair-demo", "civicml-loop"])
     parser.add_argument("--repository", default="/Users/rubensanchez/Developer/civicml-loopforge")
+    parser.add_argument("--container-image", default="civicml-loopforge:integration")
     parser.add_argument(
         "--container",
         metavar="IMAGE",
@@ -463,7 +469,11 @@ def main() -> int:
             deepseek_model=args.deepseek_model,
         )
     if args.command == "civicml-loop":
-        return _civicml_loop(args.repository, deepseek_model=args.deepseek_model)
+        return _civicml_loop(
+            args.repository,
+            deepseek_model=args.deepseek_model,
+            container_image=args.container_image,
+        )
     return 2
 
 

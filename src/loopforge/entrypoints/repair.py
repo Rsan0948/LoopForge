@@ -188,6 +188,7 @@ def build_adopted_repair_runtime(
     *,
     repository: str | Path,
     deps: RepairRuntimeDeps,
+    container_image: str | None = None,
 ) -> RepairRuntimeBundle:
     """Run a repair task against an existing checkout, without copying it.
 
@@ -199,11 +200,21 @@ def build_adopted_repair_runtime(
     workspace = GitWorkspaceManager(Path(repository).parent).adopt_existing(
         repository, workspace_id=WorkspaceId(task.task_id)
     )
-    sandbox: SandboxPort = ConstrainedLocalSandbox(
-        workspace.root,
-        commands=repair_command_specs(task.commands),
-        environment={"CIVICML_ENV": "test"},
-    )
+    if container_image:
+        sandbox = ContainerSandbox(
+            workspace.root,
+            config=ContainerSandboxConfig(
+                image=container_image,
+                commands=tuple(repair_command_specs(task.commands)),
+                environment={"CIVICML_ENV": "test"},
+            ),
+        )
+    else:
+        sandbox = ConstrainedLocalSandbox(
+            workspace.root,
+            commands=repair_command_specs(task.commands),
+            environment={"CIVICML_ENV": "test"},
+        )
     return _repair_bundle(
         task,
         workspace=workspace,
