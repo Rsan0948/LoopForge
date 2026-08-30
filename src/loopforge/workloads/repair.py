@@ -32,10 +32,11 @@ from loopforge.domain.actions import ActionProposal
 from loopforge.domain.artifacts import ArtifactKind
 from loopforge.domain.context import ContextItem, ModelContext, ModelRole
 from loopforge.domain.context_lifecycle import ContextAccounting, ContextTokenBudget
+from loopforge.domain.orchestration import validate_worker_id
 from loopforge.domain.routing import ModelRequirements
 from loopforge.domain.security import SandboxRequirements, TrustClass
 from loopforge.domain.state import RunState
-from loopforge.domain.types import ActionId, ContextItemId
+from loopforge.domain.types import ActionId, ContextItemId, WorkerId, WorkspaceId
 from loopforge.domain.verification import CheckOutcome, compose_check_outcomes
 from loopforge.domain.workspace import AcceptanceCriteria, FixtureSpec
 from loopforge.ports.artifacts import RunArtifact
@@ -144,6 +145,77 @@ class RepairCheck(Protocol):
     """
 
     def __call__(self, sandbox: SandboxPort, workspace: WorkspacePort) -> CheckOutcome: ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerRepairAssignment:
+    """One worker's code-owned slice of a decomposed repair task (PACS-013).
+
+    The worker's ``task`` carries its own objective, commands, and acceptance
+    contract (patch constraints disjoint from its siblings), plus a
+    worker-scoped fixture view whose ``solution`` drives the deterministic
+    scripted model. Decomposition is code-owned: model output never decides
+    who repairs what.
+    """
+
+    worker_id: WorkerId
+    workspace_id: WorkspaceId
+    task: RepairTask
+
+    def __post_init__(self) -> None:
+        validate_worker_id(str(self.worker_id))
+        validate_worker_id(str(self.workspace_id))
+        if not isinstance(self.task, RepairTask):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "worker assignment task must be a RepairTask"
+            raise TypeError(msg)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OrchestratedRepairTask:
+    """A repair task decomposed across bounded workers (PACS-013).
+
+    The orchestrator owns the global ``objective``/``plan`` and the
+    integration ``fixture``/``commands``/``acceptance`` verified against the
+    merged workspace; workers own their assigned slices. This is the
+    benchmarkable multi-agent path — never an always-on default.
+    """
+
+    task_id: str
+    objective: str
+    plan: str
+    fixture: FixtureSpec
+    assignments: tuple[WorkerRepairAssignment, ...]
+    commands: tuple[RepairCommand, ...]
+    acceptance: AcceptanceCriteria
+
+    def __post_init__(self) -> None:
+        if not self.task_id.strip():
+            msg = "orchestrated task_id cannot be empty"
+            raise ValueError(msg)
+        if not self.objective.strip():
+            msg_2 = "orchestrated task objective cannot be empty"
+            raise ValueError(msg_2)
+        if not self.plan.strip():
+            msg_3 = "orchestrated task plan cannot be empty"
+            raise ValueError(msg_3)
+        if not self.assignments:
+            msg_4 = "orchestrated task requires at least one worker assignment"
+            raise ValueError(msg_4)
+        ids = [str(assignment.worker_id) for assignment in self.assignments]
+        if len(set(ids)) != len(ids):
+            msg_5 = "worker assignment ids must be unique"
+            raise ValueError(msg_5)
+        if not self.acceptance.required_commands:
+            msg_6 = "acceptance criteria must require at least one command"
+            raise ValueError(msg_6)
+        names = [command.name for command in self.commands]
+        if len(set(names)) != len(names):
+            msg_7 = "repair command names must be unique"
+            raise ValueError(msg_7)
+        unknown = [name for name in self.acceptance.required_commands if name not in names]
+        if unknown:
+            msg_8 = f"acceptance criteria reference undefined commands: {', '.join(unknown)}"
+            raise ValueError(msg_8)
 
 
 class RepairVerifier:

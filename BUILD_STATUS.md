@@ -1,4 +1,103 @@
-# Build status — PACS-012 complete
+# Build status — PACS-013 complete
+
+PACS-013 adds bounded multi-agent execution as an opt-in, benchmarkable path:
+an orchestrator owns the global plan and a shared authoritative event store,
+workers own assigned Git-worktree workspaces and per-worker run streams, and a
+deterministic spawn-order merge/reconciliation policy combines worker results
+— budgets, permissions, verification truth, and stopping stay exactly where
+PACS-001–012 put them. The schema-v1 event catalog grew 19→22
+(operator-signed-off): `WorkerSpawned`/`WorkerStopped`/`WorkerMerged` through
+all four touchpoints, with a replayable `RunState.workers` roster projection
+(the orchestrated run enters `VERIFYING` only when every worker is stopped
+and every succeeded worker has a merge outcome). The durable, workload-agnostic
+`Orchestrator` (`application/orchestrator.py`) spawns bounded workers with
+durable ownership records, drives their runtimes round-robin one cycle at a
+time through the runtime's new `step()` seam (per-run `_DriveState`; blocking
+`run()`/`resume()` semantics pinned unchanged), records terminal outcomes,
+cancels siblings explicitly if the defense-in-depth aggregate budget check
+trips, merges succeeded workers in spawn order (`git merge --no-ff`; conflict
+→ abort → `WorkerMerged(CONFLICT)` → explicit `WORKER_MERGE_CONFLICT`
+`FAILURE` stop), verifies the merged workspace, and records merged evidence
+through the existing `ArtifactRecorded` path. Workers execute in isolated
+linked worktrees (`git worktree add -b worker/<id>`) with the
+metadata-fingerprint defense extended to the `.git` pointer layout; budgets
+are static shares of the global `BudgetLimit` (`partition_budget`, validated
+to never sum above the global limit) enforced per worker by `ControlPolicy` —
+shares, never new authority. The two-module calculator fixture decomposes
+repair across two workers with disjoint patch constraints; the
+`orchestrated-repair-demo` CLI wires the path while the single-runtime
+`repair-demo` stays byte-identical. A mid-cycle, operator-visible scope
+addition (DeepSeek adapter + `civicml-loop` dogfooding) is recorded as a
+deviation in the cycle record. See
+`docs/process/cycles/PACS-013-orchestrator-worker-and-worktree-isolation.md`.
+No subsequent PACS cycle is active until manually initiated.
+
+Verified in this environment (2026-08-30, Ollama 0.32.15 with
+`devstral-small-2:latest`, Docker Desktop live, `python:3.12-alpine` pulled):
+
+- `uv run pytest -q --cov` — **1449 passing, 18 skipped** (skips are the
+  pre-existing macOS `RLIMIT_AS` platform gates + 1 non-UTF-8-filesystem gate
+  + 3 new trusted-local orchestrated E2E/CLI gates on the same platform
+  restriction; the live Ollama+Docker repair E2E and the live container
+  orchestrated two-worker E2E both **executed and passed**; zero
+  credential-gated skips)
+- branch-aware coverage — **94.34% overall**; configured 90% gate satisfied;
+  new orchestration modules at 92–98%
+- `ruff format --check .` / `ruff check .` — clean (148 files)
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- live CLI evidence — `orchestrated-repair-demo --container
+  python:3.12-alpine` → `status=succeeded stop_reason=success_verified`, both
+  workers `outcome=succeeded merge=merged`, integration verifier
+  `command:run_tests: passed (exit_code=0)`, merged evidence artifact
+  recorded
+- deterministic CI preserved — `--ignore=tests/live`: 1448 passing / 18
+  skipped with zero provider credentials
+
+Discoveries fixed and pinned this cycle: the integration acceptance's
+`require_change` was incompatible with committed merges (worker patches land
+as merge commits, so status-based change detection sees a clean tree and
+falsely reported "no workspace changes") — integration acceptance now gates on
+the full merged suite with per-worker `require_change` enforced pre-merge;
+container runs must wire the in-container interpreter
+(`/usr/local/bin/python`), never the host `sys.executable`.
+
+## Implemented through PACS-013
+
+- `domain/orchestration.py`: `WorkerOutcome`/`MergeOutcome` closed
+  vocabularies, worker id/text/budget-share validators, `WorkerSpec`,
+  `WorkerProjection`, `partition_budget` (fail-closed static shares)
+- event catalog 19→22 (schema v1): `WorkerSpawned` (worker id, worker run id,
+  workspace id, objective, budget share), `WorkerStopped` (closed outcome),
+  `WorkerMerged` (MERGED with revision / CONFLICT without) — `Event` union,
+  reducer arms + `_ALLOWED_STATUS` + `RunState.workers` roster, JSON codec,
+  metadata-only telemetry arms threading `CorrelationIds.worker_id`, closed
+  `MetricName` additions
+- `application/runtime.py`: per-run `_DriveState`, extracted `_drive_cycle`,
+  public `step(run_id)`, optional `worker_id` telemetry correlation
+- `application/orchestrator.py`: durable event-sourced orchestrator — bounded
+  spawn, deterministic round-robin interleave, explicit sibling cancellation,
+  spawn-order reconciliation, integration verification, fail-closed artifact
+  evidence, reason-coded stops (`WORKER_INCOMPLETE`, `WORKER_MERGE_CONFLICT`,
+  `WORKER_MERGE_ERROR`, `MERGED_VERIFICATION_FAILED`,
+  `ORCHESTRATOR_BUDGET_EXHAUSTED`, `ARTIFACT_COLLECTION_FAILED`,
+  `ORCHESTRATOR_CONTROL_INCONSISTENT`)
+- `adapters/git_workspace.py`: `adopt_existing`, `add_worker_worktree`,
+  `commit_worker`, `merge_worker` (conflict → abort → `None`),
+  linked-worktree fingerprint pinning
+- `workloads/repair.py`: `WorkerRepairAssignment`/`OrchestratedRepairTask`
+  (code-owned decomposition); `workloads/fixtures.py`: two-module calculator
+  fixture with disjoint per-worker patch constraints
+- `entrypoints/orchestrated.py` composition root + `orchestrated-repair-demo`
+  CLI (per-worker sandbox/verifier/context/routing/budget share, `close()`
+  fan-out)
+- test suites: `tests/unit/test_orchestration.py` (38), reducer-arm roster
+  pins in `test_state.py` (12), rewritten `test_orchestrator.py` (15),
+  worktree isolation/merge/conflict pins, event-catalog pins 19→22,
+  integration `test_orchestrated_repair_runtime.py` (trusted-local E2E, live
+  container E2E, constructed conflict E2E), CLI pins
+
+# Historical: PACS-012 complete
 
 PACS-012 replaces hard-coded model selection with a capability registry and
 reason-coded routing while keeping every ounce of authority outside the policy.
@@ -29,7 +128,6 @@ pre-existing span pins are unchanged. The repair workload declares
 `REPAIR_MODEL_REQUIREMENTS` beside its sandbox contract; entrypoints register
 the wired model (scripted ECONOMY, live STANDARD) and route every turn. See
 `docs/process/cycles/PACS-012-model-capability-registry-and-routing.md`.
-No subsequent PACS cycle is active until manually initiated.
 
 Verified in this environment (2026-08-28, Ollama 0.32.15 with
 `devstral-small-2:latest`, Docker Desktop live, `python:3.12-alpine` pulled;

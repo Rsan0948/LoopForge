@@ -37,7 +37,42 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-012.
+Completed: PACS-001 through PACS-013.
+
+PACS-013 (orchestrator/worker and worktree isolation, 2026-08-30) added bounded
+multi-agent execution as an opt-in, benchmarkable path without ceding any
+runtime authority. The schema-v1 event catalog grew 19→22 (operator-signed-off):
+`WorkerSpawned`/`WorkerStopped`/`WorkerMerged` through all four touchpoints,
+with a replayable `RunState.workers` roster projection that transitions the
+orchestrated run to `VERIFYING` only when every worker is stopped and every
+succeeded worker has a merge outcome. A durable, workload-agnostic
+`Orchestrator` owns the global plan on its own authoritative stream, spawns
+bounded workers with durable ownership records (worker id, worker run id,
+workspace id, objective, static budget share), drives worker runtimes
+round-robin one cycle at a time through the runtime's new `step()` seam
+(drive-loop locals became per-run `_DriveState`; blocking `run()`/`resume()`
+semantics pinned unchanged), records terminal outcomes, reconciles succeeded
+workers in spawn order via real Git merges (`--no-ff`; conflict → abort →
+`WorkerMerged(CONFLICT)` → explicit `WORKER_MERGE_CONFLICT` `FAILURE` stop),
+verifies the merged workspace, and records merged evidence through the
+existing artifact path. Workers execute in isolated linked Git worktrees
+(`git worktree add -b worker/<id>`) with the metadata-fingerprint defense
+extended to the `.git` pointer layout; budgets are static shares of the
+global `BudgetLimit` (`partition_budget`, shares validated to never sum above
+the global limit) enforced by each worker's own `ControlPolicy` — shares,
+never new authority (rule 12). The two-module calculator fixture decomposes
+repair across two workers with disjoint patch constraints; the
+`orchestrated-repair-demo` CLI wires the path (scripted default,
+`--container` variant) while the single-runtime `repair-demo` stays
+byte-identical — multi-agent is never a default. Live container E2E: two
+workers succeed, merge in spawn order, and the integration verifier grants
+success on the full merged suite. A mid-cycle, operator-visible scope
+addition (DeepSeek adapter + `civicml-loop` dogfooding, commits `d12d71a`..
+`3a26f27`) is recorded as a deviation in the cycle record. The post-cycle
+adversarial hardening pass has not run and is available on operator request.
+See
+`docs/process/cycles/PACS-013-orchestrator-worker-and-worktree-isolation.md`.
+Checkpoint commit: pending operator-confirmed commit on top of `3a26f27`.
 
 PACS-012 (model capability registry and routing, 2026-08-28) replaced hard-coded
 model selection with a code-owned registry and deterministic, reason-coded routing
@@ -168,7 +203,29 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-012 post-hardening, 2026-08-28, Ollama 0.32.15 with
+Current checked evidence (PACS-013, 2026-08-30, Ollama 0.32.15 with
+`devstral-small-2:latest`, Docker Desktop live):
+- 1449 tests passing, 18 platform-gated skips (the pre-existing macOS `RLIMIT_AS` +
+  non-UTF-8 gates plus 3 new trusted-local orchestrated E2E/CLI gates on the same
+  platform restriction; the live Ollama+Docker repair E2E and the live container
+  orchestrated two-worker E2E both executed and passed; zero credential-gated
+  skips — deterministic CI runs with zero provider credentials, 1448 passing with
+  `--ignore=tests/live`)
+- 94.34% branch-aware coverage (new orchestration modules at 92–98%)
+- ruff format/check, pyright strict, and import-linter all executed and green
+- live CLI evidence: `orchestrated-repair-demo --container python:3.12-alpine` →
+  `status=succeeded stop_reason=success_verified`, both workers
+  `outcome=succeeded merge=merged`, integration verifier `command:run_tests:
+  passed (exit_code=0)`, merged evidence artifact recorded, orchestrator stream
+  replaying to the exact terminal state
+- cycle discoveries fixed and pinned: integration `require_change` was
+  incompatible with committed merges (worker patches land as merge commits, so
+  status-based change detection sees a clean tree) — integration acceptance now
+  gates on the full merged suite while per-worker acceptance enforces
+  `require_change` pre-merge; container runs must wire the in-container
+  interpreter (`/usr/local/bin/python`)
+
+Historical evidence (PACS-012 post-hardening, 2026-08-28, Ollama 0.32.15 with
 `devstral-small-2:latest`, Docker Desktop 29.2.1 live):
 - 1370 tests passing, 15 platform-gated skips (same macOS `RLIMIT_AS` + non-UTF-8 gates as
   PACS-010/011; the live Ollama+Docker repair E2E executed and passed through the routed
@@ -257,18 +314,17 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-012-model-capability-registry-and-routing.md`
+- `docs/process/cycles/PACS-013-orchestrator-worker-and-worktree-isolation.md`
 
 ## Next authorized work
 
-None. PACS-013 through PACS-017 are PLANNED, not active.
+None. PACS-014 through PACS-017 are PLANNED, not active.
 
-The PACS-012 checkpoint is committed as `48f2aac` (`feat: add model capability
-registry and routing (PACS-012)`). The operator may manually initiate PACS-013
-(orchestrator/worker and worktree isolation) or another explicitly named scope.
-Note: PACS-013's planned worker ownership/lifecycle events are new event types
-— they require explicit operator sign-off before the schema-v1 (19-event)
-catalog changes.
+The PACS-013 checkpoint commit is pending operator confirmation on top of
+`3a26f27` (the schema-v1 catalog extension 19→22 was explicitly signed off as
+operator decision 1 of the cycle). The operator may manually initiate the
+PACS-013 post-cycle adversarial hardening pass, PACS-014 (evaluator +
+evidence-grounded Reflexion + async HITL), or another explicitly named scope.
 
 ## Planned path to v1.0
 

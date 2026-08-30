@@ -1,6 +1,6 @@
 # PACS-013 — Orchestrator/worker and worktree isolation
 
-Status: MINIMUM FUNCTIONAL CHECKPOINT
+Status: SUCCESS
 
 ## Objective
 
@@ -182,26 +182,157 @@ itself.
 
 ## Act
 
-- Added replayable worker lifecycle vocabulary and projections, per-run runtime stepping,
-  worker-attributed telemetry, deterministic round-robin orchestration, and budget partitioning.
-- Added isolated linked Git worktrees, worker commits, spawn-order merges, and conflict aborts.
-- Added a DeepSeek live adapter and CLI backend so the functional path can be dogfooded now.
-- Deferred the full orchestrated-repair CLI fixture and broader adversarial hardening described
-  above; this checkpoint intentionally targets usable functionality rather than PACS closure.
+- **Domain vocabulary** (`domain/orchestration.py`): closed `WorkerOutcome` /
+  `MergeOutcome` vocabularies; `validate_worker_id` / `validate_worker_text` /
+  `validate_budget_share` fail-closed validators; `WorkerSpec` spawn-time
+  assignment; `WorkerProjection` roster element; `partition_budget` static
+  shares (cost/tokens additive, validated to never sum above the global limit
+  — float rounding nudged downward; iterations/elapsed inherited per worker).
+- **Event catalog 19→22, schema v1** (operator-signed-off): `WorkerSpawned`,
+  `WorkerStopped`, `WorkerMerged` through all four touchpoints — `Event`
+  union, reducer arms + `_ALLOWED_STATUS`, JSON codec registry/constructors
+  (schema stays 1), metadata-only telemetry projector arms threading
+  `worker_id` into the reserved `CorrelationIds.worker_id` slot, plus closed
+  `MetricName` worker-lifecycle additions. `RunState.workers` projects the
+  roster; the `WorkerMerged` arm transitions the orchestrated run to
+  `VERIFYING` exactly when every spawned worker is stopped and every
+  succeeded worker has a merge outcome; duplicate spawns, double terminal
+  outcomes, merges by non-succeeded workers, and unknown workers are rejected
+  by the reducer.
+- **Runtime step seam** (`application/runtime.py`): drive-loop locals became
+  per-run `_DriveState` (failure streak, active model, fallback flag) so the
+  extracted `_drive_cycle` advances exactly one cycle via public
+  `step(run_id)`; blocking `run()`/`resume()` semantics unchanged (pinned by
+  the pre-existing suite, including the transient-failure fallback tests).
+  `Runtime` gained optional `worker_id` for telemetry correlation.
+- **Worktree isolation** (`adapters/git_workspace.py`): one code-owned
+  integration repository per orchestrated run; `add_worker_worktree`
+  (`git worktree add -b worker/<id>` from the integration base revision),
+  `commit_worker`, `merge_worker` (spawn-order `--no-ff --no-edit`; conflict
+  → `merge --abort` → `None`, never a silent resolution); the
+  metadata-fingerprint defense extended to the linked-worktree `.git` pointer
+  file so a tampered pointer fails closed before any host-Git invocation.
+- **Durable orchestrator** (`application/orchestrator.py`, workload-agnostic):
+  owns the global plan on its own authoritative stream; spawns bounded
+  workers (`max_workers`, unique ids, shares ≤ global validated at
+  construction) with durable `WorkerSpawned` ownership records (worker id,
+  worker run id, workspace id, objective, budget share); drives worker
+  runtimes round-robin one cycle at a time (deterministic interleaving —
+  logical concurrency, zero wall-clock races, trivial replay); records
+  `WorkerStopped` outcomes; cancels remaining workers explicitly if the
+  defense-in-depth aggregate cost check trips; reconciles succeeded workers
+  in spawn order with durable `WorkerMerged` (MERGED with revision, CONFLICT
+  without); verifies the merged workspace through a verifier bound to the
+  integration workspace; records merged evidence via the existing
+  `ArtifactRecorded` path (fail-closed on collector failure); stops through
+  the existing `RunStopped` with reason codes `WORKER_INCOMPLETE`,
+  `WORKER_MERGE_CONFLICT`, `WORKER_MERGE_ERROR`,
+  `MERGED_VERIFICATION_FAILED`, `ORCHESTRATOR_BUDGET_EXHAUSTED`,
+  `ARTIFACT_COLLECTION_FAILED` — and `ORCHESTRATOR_CONTROL_INCONSISTENT` if a
+  passed verification ever produced no control stop.
+- **Workload + entrypoints**: `WorkerRepairAssignment` /
+  `OrchestratedRepairTask` (code-owned decomposition; model output never
+  decides who repairs what); the two-module `calculator` fixture (independent
+  buggy `adder.py`/`greeter.py`, disjoint per-worker patch constraints,
+  per-worker scoped test commands); `entrypoints/orchestrated.py` composition
+  root (per-worker worktree/sandbox/verifier/context/routing/budget share,
+  `close()` fan-out mirroring the PACS-012 contract); the
+  `orchestrated-repair-demo` CLI command. The single-runtime `repair-demo`
+  path is untouched — multi-agent is opt-in, never a default.
+- **Tests**: 38 domain-vocabulary unit tests; 12 reducer-arm roster tests; 15
+  durable-orchestrator unit tests (interleave order, durable spawn ownership,
+  merge order, conflict/error stops, merged-verification failure, aggregate
+  budget defense canceling siblings, artifact evidence + fail-closed
+  collection, worker-attributed telemetry, construction guards); worktree
+  adapter isolation/merge/conflict tests; event-catalog pins 19→22 across
+  `test_events`/`test_json_events`/`test_telemetry_projection`; integration
+  E2E (`test_orchestrated_repair_runtime.py`): two-worker trusted-local run
+  (RLIMIT_AS-gated), two-worker live container run, and a constructed
+  same-file conflict run proving explicit rejection (RLIMIT_AS-gated); CLI
+  pins (trusted-local success gated, empty/flag-like `--container`
+  rejection); help-text updated for the new command.
+- **Discoveries fixed and pinned**: the integration acceptance's
+  `require_change` was incompatible with committed merges — worker patches
+  land as merge *commits*, so status-based change detection sees a clean
+  tree (`MERGED_VERIFICATION_FAILED: no workspace changes` on a fully
+  repaired fixture). Integration acceptance now gates on the full merged
+  suite with `require_change=False` (per-worker acceptance enforces
+  `require_change` pre-merge; prefix/file-count constraints still reject
+  stray uncommitted edits). Container runs must wire the in-container
+  interpreter (`/usr/local/bin/python`) — the host `sys.executable` default
+  is only valid for the trusted-local path.
+- **Mid-cycle scope additions** (operator-visible commits `d12d71a`..
+  `3a26f27`, outside the planned scope's "no new live provider adapters"
+  boundary, recorded here as a deviation): a DeepSeek live adapter, existing
+  repository adoption (`adopt_existing`), and the `civicml-loop` dogfooding
+  command. They do not affect the orchestrator architecture and are pinned by
+  their own suites.
 
 ## Check
 
-- Credential-free suite: 1,367 passing, 29 platform-gated skips; 93.82% branch coverage.
-- Ruff format/check, Pyright strict, and import-linter green.
-- Live DeepSeek Pro + Docker repair: succeeded in 3 iterations, approximately $0.01; independent
-  verifier passed tests and patch constraints, with exact `adder.py` evidence recorded.
+Verified in this environment (2026-08-30, Ollama 0.32.15 with
+`devstral-small-2:latest`, Docker Desktop live, `python:3.12-alpine` pulled):
+
+- `uv run pytest -q --cov` — **1449 passing, 18 skipped** (skips are the
+  pre-existing macOS `RLIMIT_AS` platform gates + 1 non-UTF-8-filesystem gate
+  + 3 new trusted-local orchestrated E2E/CLI gates on the same platform
+  restriction; the live Ollama+Docker repair E2E and the live container
+  orchestrated E2E both **executed and passed**; zero credential-gated skips)
+- deterministic CI — `--ignore=tests/live`: **1448 passing, 18 skipped** with
+  zero provider credentials
+- branch-aware coverage — **94.34% overall**; configured 90% gate satisfied;
+  new modules: `domain/orchestration.py` 98%, `application/orchestrator.py`
+  92%, `entrypoints/orchestrated.py` 93%
+- `ruff format --check .` / `ruff check .` — clean (148 files)
+- `pyright` (strict) — 0 errors, 0 warnings
+- `lint-imports` — 2 contracts kept, 0 broken
+- live CLI evidence — `orchestrated-repair-demo --container
+  python:3.12-alpine` → `status=succeeded stop_reason=success_verified`,
+  `worker=adder outcome=succeeded merge=merged`, `worker=greeter
+  outcome=succeeded merge=merged`, integration verifier
+  `command:run_tests: passed (exit_code=0)`, merged evidence artifact
+  recorded; orchestrator stream `RunStarted, PlanCreated, WorkerSpawned ×2,
+  WorkerStopped ×2, WorkerMerged ×2, VerificationPassed, ArtifactRecorded,
+  RunStopped` replays to the exact terminal state
+- acceptance gate (remaining-pacs-plan.md): (1) two workers execute without
+  sharing a mutable filesystem workspace — linked worktrees, pinned by
+  adapter isolation tests and both E2E runs; (2) conflicting state updates
+  rejected explicitly — `WorkerMerged(CONFLICT)` + `WORKER_MERGE_CONFLICT`
+  `FAILURE` stop, pinned at unit level (executed) and E2E level
+  (platform-gated); (3) global budgets enforceable across workers —
+  `partition_budget` shares ≤ global (construction- and unit-pinned),
+  per-worker `ControlPolicy` enforcement, orchestrator aggregate defense
+  check (unit-pinned, cancels siblings explicitly); (4) orchestrator owns the
+  global plan, workers own assigned workspaces — durable `WorkerSpawned`
+  ownership records pin the binding; (5) multi-agent is a benchmarkable path,
+  not the default — `repair-demo` byte behavior pinned unchanged by the
+  pre-existing replay/CLI suites; `orchestrated-repair-demo` is a separate
+  opt-in command.
 
 ## Stop
 
-Minimum functional checkpoint reached. PACS-013 remains intentionally short of its complete
-hardening scope, but the bounded worker/worktree primitives and live DeepSeek repair path are
-usable for initial dogfooding.
+Classification: **SUCCESS**. All five acceptance criteria are met with
+executed evidence (two platform-gated trusted-local E2E pins execute on
+RLIMIT_AS-capable platforms, matching the posture of every prior cycle).
+The post-cycle adversarial hardening pass is available on operator request,
+following the PACS-010/011/012 pattern.
 
 ## Follow-on implications
 
-(recorded at cycle end)
+- PACS-016 (locked benchmark) now has a real multi-agent path to compare
+  against the single-runtime baseline: `calculator_repair_task` +
+  `orchestrated-repair-demo` are deterministic and replayable.
+- Recovery policy is deliberately absent: a failed worker or a merge
+  conflict stops the orchestrated run explicitly. Re-dispatching failed
+  workers or iterative merge repair is future work (needs an operator
+  decision on recovery authority).
+- The runtime `step()` seam is the canonical way to drive a runtime from
+  outside; PACS-014's async HITL should consume the same seam rather than
+  adding a second drive path.
+- Trusted-local orchestrated E2E (success + conflict) is RLIMIT_AS-gated and
+  skips on macOS; Linux CI executes it. The container E2E covers the
+  untrusted boundary on any Docker host.
+- The post-cycle adversarial hardening pass (three-agent review) has not
+  run; on operator initiation, findings get fixed, pinned in
+  `tests/regression/test_hardening_regressions.py` (PACS-013 section), and
+  recorded here.

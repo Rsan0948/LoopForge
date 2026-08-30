@@ -36,6 +36,7 @@ from loopforge.domain.workspace import (
     FixtureSpec,
     PatchConstraints,
 )
+from loopforge.entrypoints.orchestrated import build_orchestrated_repair_runtime
 from loopforge.entrypoints.repair import (
     RepairRuntimeDeps,
     build_adopted_repair_runtime,
@@ -44,7 +45,7 @@ from loopforge.entrypoints.repair import (
 )
 from loopforge.ports.model import ModelPort
 from loopforge.ports.tools import ToolResult
-from loopforge.workloads.fixtures import adder_repair_task
+from loopforge.workloads.fixtures import adder_repair_task, calculator_repair_task
 from loopforge.workloads.repair import (
     RepairCommand,
     RepairCommandKind,
@@ -337,6 +338,66 @@ def _repair_demo(  # noqa: PLR0912, PLR0913 - CLI wiring keeps provider options 
     return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
+def _orchestrated_repair_demo(container_image: str | None) -> int:
+    """Repair the two-module calculator fixture with two isolated workers.
+
+    The benchmarkable multi-agent path (PACS-013): one worker repairs
+    ``adder.py``, another repairs ``greeter.py``, each in its own linked
+    worktree with a static budget share; the orchestrator merges their
+    verified patches in spawn order and the integration verifier grants
+    success only when the full merged suite passes. The single-runtime
+    ``repair-demo`` remains the untouched default reference behavior.
+    """
+    if container_image is not None and not container_image.strip():
+        print("error: --container requires a non-empty image reference")
+        return 2
+    executable = "/usr/local/bin/python" if container_image is not None else None
+    task = calculator_repair_task(executable=executable)
+    try:
+        with tempfile.TemporaryDirectory(prefix="loopforge-orchestrated-") as directory:
+            store = InMemoryEventStore()
+            deps = RepairRuntimeDeps(
+                store=store,
+                clock=SystemClock(),
+                sleeper=SystemSleeper(),
+                telemetry=InMemoryTelemetry(),
+            )
+            bundle = build_orchestrated_repair_runtime(
+                task,
+                workspaces_dir=Path(directory),
+                deps=deps,
+                container_image=container_image,
+            )
+            try:
+                state = bundle.orchestrator.run(task.objective, task.plan)
+            finally:
+                bundle.close()
+    except ValueError as exc:
+        print(f"error: invalid orchestrated-repair-demo configuration: {exc}")
+        return 2
+    events = store.events_for(state.run_id)
+    artifacts = [event for event in events if isinstance(event, ArtifactRecorded)]
+    stop_event = next((event for event in reversed(events) if isinstance(event, RunStopped)), None)
+    print(
+        f"run={state.run_id} status={state.status.value} "
+        f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
+    )
+    if state.stop_reason is not None:
+        print(f"stop_reason={state.stop_reason.value}")
+    if stop_event is not None:
+        print(f"stop_summary={stop_event.summary}")
+    for worker in state.workers:
+        outcome = worker.outcome.value if worker.outcome is not None else "-"
+        merge = worker.merge_outcome.value if worker.merge_outcome is not None else "-"
+        print(
+            f"worker={worker.worker_id} run={worker.worker_run_id} outcome={outcome} "
+            f"merge={merge} budget_share=${worker.budget_share_cost_usd:.2f}"
+        )
+    print(f"final verification: {state.last_verification}")
+    print(f"evidence artifacts recorded: {len(artifacts)}")
+    return 0 if state.status is RunStatus.SUCCEEDED else 1
+
+
 def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str) -> int:
     """Run DeepSeek repair iterations against an adopted CivicML checkout."""
     root = Path(repository).resolve()
@@ -364,7 +425,10 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
                 name="civicml_tests",
                 argv=(
                     "/usr/local/bin/python" if container_image else str(python),
-                    "-m", "pytest", "-q", "--ignore=tests/research",
+                    "-m",
+                    "pytest",
+                    "-q",
+                    "--ignore=tests/research",
                 ),
                 timeout_seconds=300,
                 cpu_seconds=240,
@@ -374,7 +438,10 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
                 name="civicml_ruff",
                 argv=(
                     "/usr/local/bin/ruff" if container_image else str(python),
-                    "check", "apps", "packages", "tests",
+                    "check",
+                    "apps",
+                    "packages",
+                    "tests",
                 ),
                 timeout_seconds=120,
                 cpu_seconds=120,
@@ -385,7 +452,11 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
             patch=PatchConstraints(
                 require_change=True,
                 allowed_prefixes=(
-                    "apps", "packages", "tests", "pyproject.toml", "requirements.txt"
+                    "apps",
+                    "packages",
+                    "tests",
+                    "pyproject.toml",
+                    "requirements.txt",
                 ),
                 max_changed_files=30,
             ),
@@ -418,10 +489,10 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(
-        prog="loopforge", epilog="legacy commands: {demo,repair-demo}"
+    parser = argparse.ArgumentParser(prog="loopforge", epilog="legacy commands: {demo,repair-demo}")
+    parser.add_argument(
+        "command", choices=["demo", "repair-demo", "orchestrated-repair-demo", "civicml-loop"]
     )
-    parser.add_argument("command", choices=["demo", "repair-demo", "civicml-loop"])
     parser.add_argument("--repository", default="/Users/rubensanchez/Developer/civicml-loopforge")
     parser.add_argument("--container-image", default="civicml-loopforge:integration")
     parser.add_argument(
@@ -474,6 +545,8 @@ def main() -> int:
             ollama_context_window=args.ollama_context_window,
             deepseek_model=args.deepseek_model,
         )
+    if args.command == "orchestrated-repair-demo":
+        return _orchestrated_repair_demo(args.container)
     if args.command == "civicml-loop":
         return _civicml_loop(
             args.repository,

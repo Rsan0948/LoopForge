@@ -188,7 +188,8 @@ def test_help_exits_zero_and_documents_demo_command(
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out.startswith("usage: loopforge")
-    assert "{demo,repair-demo}" in captured.out
+    for command in ("demo", "repair-demo", "orchestrated-repair-demo", "civicml-loop"):
+        assert command in captured.out
 
 
 @example(command="DEMO")
@@ -229,6 +230,54 @@ def test_module_main_guard_runs_demo_and_exits_zero(
     assert exc_info.value.code == 0
     captured = capsys.readouterr()
     assert DEMO_LINE.fullmatch(captured.out.splitlines()[0]) is not None
+
+
+# --- PACS-013: orchestrated-repair-demo pins ---
+
+
+@_REQUIRES_RLIMIT_AS
+def test_orchestrated_repair_demo_repairs_calculator_fixture_with_two_workers(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "orchestrated-repair-demo")
+
+    assert main() == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    lines = captured.out.splitlines()
+    assert lines[0].startswith("run=run_")
+    assert "status=succeeded" in lines[0]
+    assert "stop_reason=success_verified" in captured.out
+    assert "worker=adder" in captured.out
+    assert "worker=greeter" in captured.out
+    assert captured.out.count("outcome=succeeded merge=merged") == 2
+    assert "command:run_tests: passed (exit_code=0)" in captured.out
+    assert "evidence artifacts recorded: 1" in captured.out
+
+
+def test_orchestrated_repair_demo_rejects_empty_container_image(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "orchestrated-repair-demo", "--container", "")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "non-empty image reference" in captured.out
+
+
+def test_orchestrated_repair_demo_rejects_flag_like_container_image(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The equals form forces argparse to accept the flag-like token as the value.
+    _argv(monkeypatch, "orchestrated-repair-demo", "--container=--privileged")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "invalid orchestrated-repair-demo configuration" in captured.out
+    assert "must not start with '-'" in captured.out
 
 
 # --- PACS-010 hardening: CLI input-validation pins ---

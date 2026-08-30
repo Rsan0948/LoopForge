@@ -31,7 +31,11 @@ from loopforge.domain.events import (
     ToolSucceeded,
     VerificationFailed,
     VerificationPassed,
+    WorkerMerged,
+    WorkerSpawned,
+    WorkerStopped,
 )
+from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import (
@@ -61,6 +65,8 @@ from loopforge.domain.types import (
     RunStatus,
     StopReason,
     UsageDelta,
+    WorkerId,
+    WorkspaceId,
 )
 
 NOW = datetime(2026, 8, 22, tzinfo=UTC)
@@ -1183,3 +1189,166 @@ def test_artifact_recorded_projects_a_content_fingerprint_for_dedup() -> None:
     assert fingerprint.kind == "workspace_snapshot"
     assert fingerprint.label == "workspace:fixture"
     assert fingerprint.content.startswith("workspace_id=fixture")
+
+
+# --- PACS-013: worker lifecycle roster projection (orchestrator streams) ---
+
+
+def _worker_spawned(
+    sequence: int, worker_id: str = "adder", *, worker_run_id: str = "run_worker"
+) -> WorkerSpawned:
+    return WorkerSpawned(
+        event_id=_event_id(sequence),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=sequence,
+        worker_id=WorkerId(worker_id),
+        worker_run_id=RunId(worker_run_id),
+        workspace_id=WorkspaceId(f"calculator-{worker_id}"),
+        objective=f"repair {worker_id}.py",
+        budget_share_cost_usd=1.0,
+    )
+
+
+def _worker_stopped(
+    sequence: int,
+    worker_id: str = "adder",
+    outcome: WorkerOutcome = WorkerOutcome.SUCCEEDED,
+) -> WorkerStopped:
+    return WorkerStopped(
+        event_id=_event_id(sequence),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=sequence,
+        worker_id=WorkerId(worker_id),
+        outcome=outcome,
+        summary=f"worker {worker_id} finished",
+    )
+
+
+def _worker_merged(
+    sequence: int,
+    worker_id: str = "adder",
+    outcome: MergeOutcome = MergeOutcome.MERGED,
+) -> WorkerMerged:
+    return WorkerMerged(
+        event_id=_event_id(sequence),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=sequence,
+        worker_id=WorkerId(worker_id),
+        outcome=outcome,
+        revision="abc123" if outcome is MergeOutcome.MERGED else None,
+        detail="merged" if outcome is MergeOutcome.MERGED else "conflicted and aborted",
+    )
+
+
+def _orchestrator_state_at_acting() -> RunState:
+    return replay(RUN, (_started(1), _planned(2), _worker_spawned(3)))
+
+
+def test_worker_spawned_projects_roster_entry_and_enters_acting() -> None:
+    state = _orchestrator_state_at_acting()
+
+    assert state.status is RunStatus.ACTING
+    assert len(state.workers) == 1
+    projection = state.workers[0]
+    assert projection.worker_id == WorkerId("adder")
+    assert projection.worker_run_id == RunId("run_worker")
+    assert projection.workspace_id == WorkspaceId("calculator-adder")
+    assert projection.budget_share_cost_usd == 1.0
+    assert projection.outcome is None
+    assert projection.merge_outcome is None
+
+
+def test_worker_spawned_is_rejected_before_the_plan_exists() -> None:
+    with pytest.raises(InvalidTransitionError, match="invalid while run is planning"):
+        replay(RUN, (_started(1), _worker_spawned(2)))
+
+
+def test_worker_spawned_rejects_a_duplicate_worker_id() -> None:
+    with pytest.raises(InvalidTransitionError, match="already on the roster"):
+        replay(RUN, (_started(1), _planned(2), _worker_spawned(3), _worker_spawned(4)))
+
+
+def test_worker_stopped_records_the_terminal_outcome() -> None:
+    state = reduce_event(_orchestrator_state_at_acting(), _worker_stopped(4))
+
+    assert state.workers[0].outcome is WorkerOutcome.SUCCEEDED
+    assert state.status is RunStatus.ACTING
+
+
+def test_worker_stopped_rejects_a_second_terminal_outcome() -> None:
+    state = reduce_event(_orchestrator_state_at_acting(), _worker_stopped(4))
+    with pytest.raises(InvalidTransitionError, match="already has a terminal outcome"):
+        reduce_event(state, _worker_stopped(5, outcome=WorkerOutcome.FAILED))
+
+
+def test_worker_stopped_rejects_an_unknown_worker() -> None:
+    with pytest.raises(InvalidTransitionError, match="unknown worker"):
+        reduce_event(_orchestrator_state_at_acting(), _worker_stopped(4, worker_id="ghost"))
+
+
+def test_worker_merged_requires_a_succeeded_worker() -> None:
+    with pytest.raises(InvalidTransitionError, match="only a succeeded worker may merge"):
+        reduce_event(_orchestrator_state_at_acting(), _worker_merged(4))
+
+
+def test_worker_merged_rejects_a_failed_worker_merge() -> None:
+    state = reduce_event(
+        _orchestrator_state_at_acting(),
+        _worker_stopped(4, outcome=WorkerOutcome.FAILED),
+    )
+    with pytest.raises(InvalidTransitionError, match="only a succeeded worker may merge"):
+        reduce_event(state, _worker_merged(5))
+
+
+def test_worker_merged_enters_verifying_once_every_worker_is_resolved() -> None:
+    state = reduce_event(_orchestrator_state_at_acting(), _worker_stopped(4))
+    state = reduce_event(state, _worker_merged(5))
+
+    assert state.workers[0].merge_outcome is MergeOutcome.MERGED
+    assert state.status is RunStatus.VERIFYING
+
+
+def test_worker_merged_rejects_a_second_merge_outcome() -> None:
+    # Two workers keep the run ACTING after the first merge, isolating the
+    # duplicate-merge guard from the resolved-roster VERIFYING transition.
+    events: tuple[Event, ...] = (
+        _started(1),
+        _planned(2),
+        _worker_spawned(3, "adder", worker_run_id="run_adder"),
+        _worker_spawned(4, "greeter", worker_run_id="run_greeter"),
+        _worker_stopped(5, "adder"),
+        _worker_merged(6, "adder"),
+    )
+    state = replay(RUN, events)
+    with pytest.raises(InvalidTransitionError, match="already has a merge outcome"):
+        reduce_event(state, _worker_merged(7, "adder", MergeOutcome.CONFLICT))
+
+
+def test_roster_stays_acting_until_the_last_worker_merges() -> None:
+    events: tuple[Event, ...] = (
+        _started(1),
+        _planned(2),
+        _worker_spawned(3, "adder", worker_run_id="run_adder"),
+        _worker_spawned(4, "greeter", worker_run_id="run_greeter"),
+        _worker_stopped(5, "adder"),
+        _worker_merged(6, "adder"),
+        _worker_stopped(7, "greeter"),
+    )
+    state = replay(RUN, events)
+    assert state.status is RunStatus.ACTING  # WorkerStopped never transitions alone.
+
+    state = reduce_event(state, _worker_merged(8, "greeter"))
+    assert state.status is RunStatus.VERIFYING
+
+
+def test_worker_merged_conflict_still_resolves_the_worker() -> None:
+    # A conflicted merge is aborted and recorded explicitly; the worker counts
+    # as resolved (the orchestrator then stops the run FAILURE).
+    state = reduce_event(_orchestrator_state_at_acting(), _worker_stopped(4))
+    state = reduce_event(state, _worker_merged(5, outcome=MergeOutcome.CONFLICT))
+
+    assert state.workers[0].merge_outcome is MergeOutcome.CONFLICT
+    assert state.status is RunStatus.VERIFYING
