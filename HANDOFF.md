@@ -68,9 +68,12 @@ byte-identical — multi-agent is never a default. Live container E2E: two
 workers succeed, merge in spawn order, and the integration verifier grants
 success on the full merged suite. A mid-cycle, operator-visible scope
 addition (DeepSeek adapter + `civicml-loop` dogfooding, commits `d12d71a`..
-`3a26f27`) is recorded as a deviation in the cycle record. The post-cycle
-adversarial hardening pass has not run and is available on operator request.
-See
+`3a26f27`) is recorded as a deviation in the cycle record. Adversarial
+hardening ran as a continuous two-agent review (Kimi + Codex) interleaved with
+construction — every finding fixed and pinned, most severely the non-durable
+first orchestrator (rewritten event-sourced), a transient-failure fallback
+regression from the `step()` seam refactor, and a verifier blind spot where
+committed merges made integration `require_change` unsatisfiable. See
 `docs/process/cycles/PACS-013-orchestrator-worker-and-worktree-isolation.md`.
 Checkpoint committed as `5bb4f05`.
 
@@ -323,9 +326,9 @@ None. PACS-014 through PACS-017 are PLANNED, not active.
 The PACS-013 checkpoint is committed as `5bb4f05` (`feat: add
 orchestrator/worker execution with worktree isolation (PACS-013)`); the
 schema-v1 catalog extension 19→22 was explicitly signed off as operator
-decision 1 of the cycle. The operator may manually initiate the
-PACS-013 post-cycle adversarial hardening pass, PACS-014 (evaluator +
-evidence-grounded Reflexion + async HITL), or another explicitly named scope.
+decision 1 of the cycle. The operator may manually initiate PACS-014
+(evaluator + evidence-grounded Reflexion + async HITL) or another explicitly
+named scope.
 
 ## Planned path to v1.0
 

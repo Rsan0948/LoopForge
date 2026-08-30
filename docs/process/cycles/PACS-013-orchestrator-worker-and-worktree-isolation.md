@@ -309,13 +309,81 @@ Verified in this environment (2026-08-30, Ollama 0.32.15 with
   pre-existing replay/CLI suites; `orchestrated-repair-demo` is a separate
   opt-in command.
 
+## Post-cycle hardening pass
+
+Adversarial hardening for this cycle ran as a **continuous two-agent review
+(Kimi + Codex, 2026-08-28…30)** interleaved with construction — each agent's
+seams were independently re-reviewed, attacked, and smoke-tested by the other
+across sessions, so findings surfaced against live code throughout the cycle
+rather than in a single post-classification pass (operator-assessed as a
+stronger review than the previous three-agent format). Every actionable
+finding was verified against the real code, fixed, and pinned in the
+dedicated suites named below (this cycle's pins live beside their modules
+rather than in a regression-file section):
+
+1. **the first functional orchestrator was not durable (most severe
+   architectural gap):** the callback-based round-robin orchestrator held
+   worker lifecycle in memory — a crash between spawn and merge lost worker
+   ownership, terminal outcomes, and merge records, and replay could not
+   reconstruct the run. Rewritten as an event-sourced orchestrator on its own
+   authoritative stream (`WorkerSpawned`/`WorkerStopped`/`WorkerMerged`
+   durable; budget shares recorded at spawn); replay equality pinned in
+   `tests/unit/test_orchestrator.py` and both E2E suites;
+2. **transient-failure fallback was lost across stepped cycles (regression
+   from the `step()` seam refactor):** drive-loop locals moved to per-run
+   `_DriveState` incompletely — `fallback_requested`/failure streak/active
+   model reset per `step()`, so routed transient-failure recovery diverged
+   between blocking and stepped drives (HTTP 503 escaped as an uncaught
+   `ModelTurnError`). Fixed so stepped and blocking drives are semantically
+   identical; pinned by `tests/integration/test_model_failure_runtime.py`
+   and `tests/integration/test_routing_runtime.py`;
+3. **integration `require_change` was incompatible with committed merges
+   (verifier blind spot):** worker patches land as merge *commits*, so
+   status-based change detection saw a clean tree and failed a fully
+   repaired fixture (`MERGED_VERIFICATION_FAILED: no workspace changes`).
+   Integration acceptance now gates on the full merged suite while per-worker
+   acceptance enforces `require_change` pre-merge; pinned by the live
+   container E2E and the trusted-local E2E;
+4. **host interpreter leaked into container command argv:** the container
+   smoke wired the host `sys.executable` into in-container commands, failing
+   every verification. Container wiring now selects the in-container
+   interpreter (`/usr/local/bin/python`); pinned by the live container E2E
+   and the CLI;
+5. **roster reducer accepted illegal lifecycle sequences:** duplicate spawn
+   ids, second terminal outcomes, merges by non-succeeded workers, and
+   lifecycle events for unknown workers are all rejected
+   (`InvalidTransitionError`); pinned by 12 reducer-arm tests in
+   `tests/unit/test_state.py`;
+6. **reconciliation/verification fail-open edges:** merge conflict →
+   `git merge --abort` + `WorkerMerged(CONFLICT, revision=None)` + explicit
+   `WORKER_MERGE_CONFLICT` stop (never a silent resolution); reconcile
+   exceptions → `WORKER_MERGE_ERROR`; artifact-collector failure → terminal
+   `ARTIFACT_COLLECTION_FAILED`; a passed verification producing no control
+   stop → `ORCHESTRATOR_CONTROL_INCONSISTENT` rather than a fall-through;
+   artifact evidence deduplicated by content fingerprint (the PACS-010
+   resume-dedup defense). Pinned in `tests/unit/test_orchestrator.py` and
+   the constructed-conflict E2E;
+7. **linked-worktree metadata tampering:** the materialize-time fingerprint
+   defense was extended to the `.git`-as-pointer-file layout and shared
+   gitdir, so a mount-tampered worktree pointer fails closed before any
+   host-Git invocation; pinned in `tests/unit/test_git_workspace.py`;
+8. **budget-share arithmetic could overshoot the global limit:** float
+   division rounding is nudged downward (`math.nextafter`), shares summing
+   above the global limit are rejected at orchestrator construction, and the
+   defense-in-depth aggregate check cancels remaining workers explicitly
+   rather than letting siblings run unsupervised; pinned in
+   `tests/unit/test_orchestration.py` and `test_orchestrator.py`;
+9. **CLI validation gaps on the new command:** empty and flag-like
+   `--container` values exit 2 with a clean error (mirroring the PACS-010
+   repair-demo pins); pinned in `tests/unit/test_cli.py`.
+
 ## Stop
 
 Classification: **SUCCESS**. All five acceptance criteria are met with
 executed evidence (two platform-gated trusted-local E2E pins execute on
-RLIMIT_AS-capable platforms, matching the posture of every prior cycle).
-The post-cycle adversarial hardening pass is available on operator request,
-following the PACS-010/011/012 pattern.
+RLIMIT_AS-capable platforms, matching the posture of every prior cycle),
+and the adversarial hardening above is complete — every finding fixed and
+pinned.
 
 ## Follow-on implications
 
@@ -332,7 +400,6 @@ following the PACS-010/011/012 pattern.
 - Trusted-local orchestrated E2E (success + conflict) is RLIMIT_AS-gated and
   skips on macOS; Linux CI executes it. The container E2E covers the
   untrusted boundary on any Docker host.
-- The post-cycle adversarial hardening pass (three-agent review) has not
-  run; on operator initiation, findings get fixed, pinned in
-  `tests/regression/test_hardening_regressions.py` (PACS-013 section), and
-  recorded here.
+- The hardening pins for this cycle live in the dedicated module suites
+  (named per finding above) rather than a `test_hardening_regressions.py`
+  section; future cycles may consolidate the convention either way.

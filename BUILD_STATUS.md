@@ -54,13 +54,26 @@ Verified in this environment (2026-08-30, Ollama 0.32.15 with
 - deterministic CI preserved — `--ignore=tests/live`: 1448 passing / 18
   skipped with zero provider credentials
 
-Discoveries fixed and pinned this cycle: the integration acceptance's
+Adversarial hardening ran as a continuous two-agent review (Kimi + Codex)
+interleaved with construction — every finding verified against live code,
+fixed, and pinned in the dedicated module suites (full record in the cycle
+file's "Post-cycle hardening pass" section): the first functional orchestrator
+held worker lifecycle in memory and could not replay (rewritten event-sourced
+with durable `WorkerSpawned`/`WorkerStopped`/`WorkerMerged`); the `step()`
+seam refactor lost transient-failure fallback across cycles (stepped and
+blocking drives now semantically identical); the integration acceptance's
 `require_change` was incompatible with committed merges (worker patches land
-as merge commits, so status-based change detection sees a clean tree and
+as merge commits, so status-based change detection saw a clean tree and
 falsely reported "no workspace changes") — integration acceptance now gates on
 the full merged suite with per-worker `require_change` enforced pre-merge;
 container runs must wire the in-container interpreter
-(`/usr/local/bin/python`), never the host `sys.executable`.
+(`/usr/local/bin/python`), never the host `sys.executable`; the roster
+reducer rejects duplicate spawns, double outcomes, non-succeeded merges, and
+unknown workers; reconciliation fails closed on conflict (abort + explicit
+stop), reconcile errors, artifact-collection failure, and control
+inconsistency; the metadata-fingerprint defense covers the linked-worktree
+`.git` pointer layout; budget-share arithmetic can never overshoot the global
+limit; and the new CLI command rejects empty/flag-like `--container` values.
 
 ## Implemented through PACS-013
 
