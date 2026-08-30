@@ -72,7 +72,7 @@ addition (DeepSeek adapter + `civicml-loop` dogfooding, commits `d12d71a`..
 adversarial hardening pass has not run and is available on operator request.
 See
 `docs/process/cycles/PACS-013-orchestrator-worker-and-worktree-isolation.md`.
-Checkpoint commit: pending operator-confirmed commit on top of `3a26f27`.
+Checkpoint committed as `5bb4f05`.
 
 PACS-012 (model capability registry and routing, 2026-08-28) replaced hard-coded
 model selection with a code-owned registry and deterministic, reason-coded routing
@@ -320,9 +320,10 @@ Read the preceding cycle record before starting the next one:
 
 None. PACS-014 through PACS-017 are PLANNED, not active.
 
-The PACS-013 checkpoint commit is pending operator confirmation on top of
-`3a26f27` (the schema-v1 catalog extension 19→22 was explicitly signed off as
-operator decision 1 of the cycle). The operator may manually initiate the
+The PACS-013 checkpoint is committed as `5bb4f05` (`feat: add
+orchestrator/worker execution with worktree isolation (PACS-013)`); the
+schema-v1 catalog extension 19→22 was explicitly signed off as operator
+decision 1 of the cycle. The operator may manually initiate the
 PACS-013 post-cycle adversarial hardening pass, PACS-014 (evaluator +
 evidence-grounded Reflexion + async HITL), or another explicitly named scope.
 
