@@ -19,6 +19,7 @@ signatures stay small and explicit.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -183,38 +184,44 @@ def build_trusted_repair_runtime(
     )
 
 
-def build_adopted_repair_runtime(
+def build_adopted_repair_runtime(  # noqa: PLR0913 - composition roots keep authority explicit
     task: RepairTask,
     *,
     repository: str | Path,
     deps: RepairRuntimeDeps,
     container_image: str | None = None,
+    environment: Mapping[str, str] | None = None,
+    limits: SandboxLimits | None = None,
 ) -> RepairRuntimeBundle:
     """Run a repair task against an existing checkout, without copying it.
 
     This is the dogfood path: the checkout is adopted at its current HEAD and
     all model edits remain visible in that checkout.  Callers must provide a
     code-owned command allowlist and acceptance contract; repository content
-    cannot widen either one.
+    cannot widen either one. The sandbox environment and container resource
+    limits are likewise caller-owned (operator authority): they default to an
+    empty environment and a 2 GiB container memory ceiling, and can only ever
+    be set explicitly by the wiring caller, never by repository content.
     """
     workspace = GitWorkspaceManager(Path(repository).parent).adopt_existing(
         repository, workspace_id=WorkspaceId(task.task_id)
     )
+    sandbox_environment = dict(environment) if environment is not None else {}
     if container_image:
         sandbox = ContainerSandbox(
             workspace.root,
             config=ContainerSandboxConfig(
                 image=container_image,
                 commands=tuple(repair_command_specs(task.commands)),
-                environment={"CIVICML_ENV": "test"},
-                limits=SandboxLimits(max_memory_bytes=2 * 1024 * 1024 * 1024),
+                environment=sandbox_environment,
+                limits=limits or SandboxLimits(max_memory_bytes=2 * 1024 * 1024 * 1024),
             ),
         )
     else:
         sandbox = ConstrainedLocalSandbox(
             workspace.root,
             commands=repair_command_specs(task.commands),
-            environment={"CIVICML_ENV": "test"},
+            environment=sandbox_environment,
         )
     return _repair_bundle(
         task,

@@ -4,6 +4,7 @@ import re
 import runpy
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from hypothesis import HealthCheck, example, given, settings
@@ -188,7 +189,7 @@ def test_help_exits_zero_and_documents_demo_command(
     captured = capsys.readouterr()
     assert captured.err == ""
     assert captured.out.startswith("usage: loopforge")
-    for command in ("demo", "repair-demo", "orchestrated-repair-demo", "civicml-loop"):
+    for command in ("demo", "repair-demo", "orchestrated-repair-demo", "civicml-loop", "loop"):
         assert command in captured.out
 
 
@@ -400,3 +401,84 @@ def test_repair_demo_rejects_invalid_ollama_context_window(
 
     captured = capsys.readouterr()
     assert "invalid repair-demo configuration" in captured.out
+
+
+def _loop_profile_repo(root: Path) -> Path:
+    (root / ".git").mkdir(parents=True)
+    venv_bin = root / ".venv" / "bin"
+    venv_bin.mkdir(parents=True)
+    (venv_bin / "python").touch()
+    return root
+
+
+def _loop_profile(tmp_path: Path) -> str:
+    repo = _loop_profile_repo(tmp_path / "repo")
+    profile = tmp_path / "profile.toml"
+    profile.write_text(
+        f"""
+[task]
+id = "cli-loop"
+objective = "Fix the failing checks."
+repository = "{repo}"
+
+[[checks]]
+name = "unit_tests"
+kind = "TEST"
+argv = ["{{python}}", "-m", "pytest", "-q", "tests/unit"]
+timeout_seconds = 300
+
+[acceptance]
+required = ["unit_tests"]
+allowed_prefixes = ["src", "tests"]
+
+[model]
+provider = "scripted"
+tier = "economy"
+
+[budget]
+max_cost_usd = 5.0
+max_iterations = 30
+""",
+        encoding="utf-8",
+    )
+    return str(profile)
+
+
+def test_loop_command_requires_a_profile_path(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _argv(monkeypatch, "loop")
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "requires a profile" in captured.out
+
+
+def test_loop_command_rejects_invalid_profile(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "loop", str(tmp_path / "missing.toml"))
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "invalid loop profile" in captured.out
+
+
+def test_loop_dry_run_prints_resolved_profile_without_running(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "loop", _loop_profile(tmp_path), "--dry-run")
+
+    assert main() == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    out = captured.out
+    assert "profile task=cli-loop" in out
+    assert "mode=local" in out
+    assert "check unit_tests kind=test" in out
+    assert "acceptance required=['unit_tests']" in out
+    assert "model provider=scripted" in out
+    assert "budget max_cost=$5.00 max_iterations=30" in out

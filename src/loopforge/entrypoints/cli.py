@@ -37,6 +37,7 @@ from loopforge.domain.workspace import (
     PatchConstraints,
 )
 from loopforge.entrypoints.orchestrated import build_orchestrated_repair_runtime
+from loopforge.entrypoints.profile import LoopProfile, ProfileError, load_profile
 from loopforge.entrypoints.repair import (
     RepairRuntimeDeps,
     build_adopted_repair_runtime,
@@ -474,7 +475,11 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
         budget=BudgetLimit(max_cost_usd=5.0, max_iterations=30),
     )
     bundle = build_adopted_repair_runtime(
-        task, repository=root, deps=deps, container_image=container_image or None
+        task,
+        repository=root,
+        deps=deps,
+        container_image=container_image or None,
+        environment={"CIVICML_ENV": "test"},
     )
     try:
         state = bundle.runtime.run(task.objective)
@@ -488,10 +493,126 @@ def _civicml_loop(repository: str, *, deepseek_model: str, container_image: str)
     return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
-def main() -> int:
+def _print_profile_summary(profile: LoopProfile) -> None:
+    """Render the resolved profile for --dry-run review (no model, no sandbox)."""
+    task = profile.task
+    mode = f"container image={profile.container_image}" if profile.container_image else "local"
+    print(f"profile task={task.task_id} repository={profile.repository} mode={mode}")
+    print(f"objective={task.objective}")
+    for command in task.commands:
+        print(
+            f"check {command.name} kind={command.kind.value} "
+            f"timeout={command.timeout_seconds:g}s cpu={command.cpu_seconds}s "
+            f"argv={' '.join(command.argv)}"
+        )
+    patch = task.acceptance.patch
+    print(
+        f"acceptance required={list(task.acceptance.required_commands)} "
+        f"require_change={patch.require_change} "
+        f"allowed_prefixes={list(patch.allowed_prefixes)} "
+        f"max_changed_files={patch.max_changed_files}"
+    )
+    print(f"environment keys={sorted(profile.environment)}")
+    print(
+        f"model provider={profile.model_provider} name={profile.model_name} "
+        f"tier={profile.model_tier.value}"
+    )
+    budget = profile.budget
+    print(
+        f"budget max_cost=${budget.max_cost_usd:.2f} "
+        f"max_iterations={budget.max_iterations} "
+        f"max_total_tokens={budget.max_total_tokens or '-'} "
+        f"max_elapsed_seconds={budget.max_elapsed_seconds or '-'}"
+    )
+
+
+def _profile_loop(
+    profile_path: str,
+    *,
+    dry_run: bool,
+    ollama_url: str,
+    ollama_context_window: int,
+) -> int:
+    """Run repair iterations against any local checkout described by a profile.
+
+    The profile (operator-owned, loaded from outside the target repository)
+    supplies the task, checks, acceptance contract, sandbox environment,
+    model selection, and budget that ``civicml-loop`` hardcodes.
+    """
+    try:
+        profile = load_profile(profile_path)
+    except ProfileError as exc:
+        print(f"error: invalid loop profile: {exc}")
+        return 2
+    if dry_run:
+        _print_profile_summary(profile)
+        return 0
+    task = profile.task
+    model: ModelPort | None = None
+    bundle_owned = False
+    try:
+        if profile.model_provider == "deepseek":
+            model = build_deepseek_model(task, model_name=profile.model_name)
+        elif profile.model_provider == "ollama":
+            model = build_ollama_model(
+                task,
+                model_name=profile.model_name,
+                base_url=ollama_url,
+                context_window_tokens=ollama_context_window,
+            )
+        store = InMemoryEventStore()
+        deps = RepairRuntimeDeps(
+            store=store,
+            clock=SystemClock(),
+            sleeper=SystemSleeper(),
+            telemetry=InMemoryTelemetry(),
+            model=model,
+            model_tier=profile.model_tier,
+            budget=profile.budget,
+        )
+        bundle = build_adopted_repair_runtime(
+            task,
+            repository=profile.repository,
+            deps=deps,
+            container_image=profile.container_image,
+            environment=profile.environment,
+            limits=profile.limits,
+        )
+        bundle_owned = True
+        try:
+            state = bundle.runtime.run(task.objective)
+        finally:
+            bundle.close()
+    except ValueError as exc:
+        print(f"error: invalid loop configuration: {exc}")
+        return 2
+    finally:
+        if not bundle_owned:
+            _close_model_quietly(model)
+    print(
+        f"run={state.run_id} status={state.status.value} "
+        f"iterations={state.iteration} cost=${state.cost_usd:.2f}"
+    )
+    print(f"verification={state.last_verification}")
+    return 0 if state.status is RunStatus.SUCCEEDED else 1
+
+
+def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
     parser = argparse.ArgumentParser(prog="loopforge", epilog="legacy commands: {demo,repair-demo}")
     parser.add_argument(
-        "command", choices=["demo", "repair-demo", "orchestrated-repair-demo", "civicml-loop"]
+        "command",
+        choices=["demo", "repair-demo", "orchestrated-repair-demo", "civicml-loop", "loop"],
+    )
+    parser.add_argument(
+        "profile",
+        nargs="?",
+        default=None,
+        help="path to an operator-owned loop profile TOML (required by the loop command)",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="loop only: print the resolved profile without running the model or sandbox",
     )
     parser.add_argument("--repository", default="/Users/rubensanchez/Developer/civicml-loopforge")
     parser.add_argument("--container-image", default="civicml-loopforge:integration")
@@ -534,6 +655,8 @@ def main() -> int:
         "routing capability metadata (default: 131072)",
     )
     args = parser.parse_args()
+    if args.profile is not None and args.command != "loop":
+        parser.error(f"unrecognized arguments: {args.profile}")
     if args.command == "demo":
         return _demo()
     if args.command == "repair-demo":
@@ -552,6 +675,16 @@ def main() -> int:
             args.repository,
             deepseek_model=args.deepseek_model,
             container_image=args.container_image,
+        )
+    if args.command == "loop":
+        if not args.profile:
+            print("error: the loop command requires a profile TOML path")
+            return 2
+        return _profile_loop(
+            args.profile,
+            dry_run=args.dry_run,
+            ollama_url=args.ollama_url,
+            ollama_context_window=args.ollama_context_window,
         )
     return 2
 

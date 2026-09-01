@@ -330,6 +330,46 @@ decision 1 of the cycle. The operator may manually initiate PACS-014
 (evaluator + evidence-grounded Reflexion + async HITL) or another explicitly
 named scope.
 
+### Operator-authorized addition (2026-09-01): profile-driven `loop` command
+
+Mid-cycle, operator-visible scope addition (same class as the PACS-013
+DeepSeek/`civicml-loop` deviation): a generic `loopforge loop <profile.toml>`
+command that runs the bounded adopted-checkout repair loop against ANY local
+repository — including LoopForge itself — driven by operator-owned TOML
+profiles instead of the hardcoded `civicml-loop` wiring.
+
+- `src/loopforge/entrypoints/profile.py` (new): `load_profile()` /
+  `LoopProfile` / `ProfileError`. Validates every field at load time and
+  fails closed: absolute existing git-worktree repository, 1..N uniquely
+  named checks with `TEST|LINT|TYPECHECK|BUILD` kinds, absolute (or
+  `{python}`-token, local mode only) argv executables, `required ⊆ checks`,
+  relative no-`..` patch prefixes, env-key allowlist pattern, container image
+  reference rules mirroring `ContainerSandboxConfig`, provider/tier enums,
+  positive finite budgets. Profiles are operator authority (AGENTS.md rule
+  14): they live OUTSIDE the target repository — the repo-local
+  `.loopforge/` directory is gitignored for exactly this purpose — and
+  target-repo content can never supply or widen one.
+- `entrypoints/repair.py`: `build_adopted_repair_runtime` gained
+  caller-owned `environment` and `limits` parameters (the hardcoded
+  `{"CIVICML_ENV": "test"}` injection and 2 GiB ceiling moved out to the
+  wiring callers; defaults unchanged for existing callers).
+- `entrypoints/cli.py`: new `loop` command with `--dry-run` (resolves and
+  prints the profile without model or sandbox); `civicml-loop` retained and
+  now passes its environment explicitly; stray positionals on non-`loop`
+  commands still exit with a usage error.
+- Local-only profiles (gitignored, not part of the repository content):
+  `.loopforge/civicml.toml` (reproduces the hardcoded dogfood wiring),
+  `.loopforge/loopforge-self.toml` (self-targeting, local mode, checks
+  scoped to `tests/unit` + ruff + pyright + lint-imports),
+  `.loopforge/README.md` (schema + authority rules + in-place-edit warning).
+- Evidence: 1478 tests passing (18 platform-gated skips), 93.78% branch
+  coverage, ruff format/check + pyright strict + import-linter all green;
+  `--dry-run` verified against both profiles; allow/deny validation pinned
+  by 26 new profile tests per rule 10; no network in unit tests (rule 9).
+- Known limitation (documented in the profile README): the DeepSeek
+  adapter's cost accounting uses pro-tier rates, so `deepseek-v4-flash`
+  runs overestimate reported spend.
+
 ## Planned path to v1.0
 
 - PACS-006 Context authority model
