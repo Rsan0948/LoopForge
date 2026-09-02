@@ -35,6 +35,7 @@ from loopforge.domain.events import (
     ApprovalRejected,
     ApprovalRequested,
     OperatorInstruction,
+    ToolExecutionStarted,
     ToolSucceeded,
 )
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
@@ -406,3 +407,51 @@ def test_operator_instruction_on_an_unknown_run_fails_closed() -> None:
 
     with pytest.raises(LookupError, match="no persisted run"):
         runtime.add_operator_instruction(RunId("missing"), "nothing here")
+
+
+def test_spent_grant_is_not_re_executed_after_failed_verification() -> None:
+    """Regression pin for the PACS-014 live round-trip defect.
+
+    An approved action that executes successfully but fails verification
+    re-plans back to READY with the stale proposal still projected. The grant
+    must be spent by the successful execution — otherwise the next cycle
+    re-executes the same approved action at attempt 1, persisting an event
+    the reducer rejects and durably poisoning the stream.
+    """
+    store = InMemoryEventStore()
+    runtime = _runtime(
+        _model("turn-1", "turn-2"),
+        store=store,
+        tools=ScriptedTools(
+            [
+                ToolResult(ok=True, observation="still failing"),
+                ToolResult(ok=True, observation="all tests pass"),
+            ],
+            metadata=[_metadata("deploy", ApprovalClass.REQUIRED)],
+        ),
+    )
+    run_id = runtime.start("approved edit, failed verification")
+    assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
+    runtime.grant_approval(run_id, ActionId("turn-1"))
+
+    ready = runtime.step(run_id)  # executes turn-1; verification fails; re-plans
+
+    assert ready.status is RunStatus.READY
+    # The grant is spent by the successful execution.
+    assert ready.approved_action_ids == ()
+    succeeded = [e for e in store.events_for(run_id) if isinstance(e, ToolSucceeded)]
+    assert [(e.action_id, e.attempt) for e in succeeded] == [(ActionId("turn-1"), 1)]
+
+    # The next cycle proposes a FRESH action instead of re-executing the stale
+    # approved one — and the fresh gated action re-quiesces the run.
+    waiting = runtime.step(run_id)
+
+    assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
+    assert waiting.current_action_id == "turn-2"
+    events = store.events_for(run_id)
+    started = [e for e in events if isinstance(e, ToolExecutionStarted)]
+    assert [(e.action_id, e.attempt) for e in started] == [(ActionId("turn-1"), 1)]
+    assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 2
+    # The stream stays fully replayable from a fresh runtime (poison guard).
+    fresh = _runtime(_model(), store=store)
+    assert fresh.state_for(run_id).status is RunStatus.WAITING_FOR_APPROVAL

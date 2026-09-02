@@ -335,6 +335,16 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 tool_failure_streaks=_update_streak(
                     base.tool_failure_streaks, tool_name, success=True
                 ),
+                # A grant is spent by the successful execution of its action.
+                # Without this, a re-planned cycle would see READY + stale
+                # proposal + lingering grant and re-execute the same approved
+                # action — durably poisoning the stream with an attempt-1
+                # duplicate (found by the PACS-014 live round-trip).
+                approved_action_ids=tuple(
+                    action_id
+                    for action_id in base.approved_action_ids
+                    if action_id != base.current_action_id
+                ),
                 status=RunStatus.VERIFYING,
             )
         case ToolFailed(error_message=message, failure_class=failure_class, attempt=attempt):
