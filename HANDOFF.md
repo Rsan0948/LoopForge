@@ -354,9 +354,20 @@ Read the preceding cycle record before starting the next one:
 
 ## Next authorized work
 
-None. PACS-015 through PACS-017 are PLANNED, not active; the evaluator +
+PACS-014b (operator usability) closed 2026-09-02 — see
+`docs/process/cycles/PACS-014b-operator-usability.md`: no_progress_limit is
+now a profile/inline knob (default 3), the inline form supports container
+mode (the macOS-viable path), terminal runs offer a manual report-seeded
+follow-up, and a live container run drove the blackjack demo to
+STOP_SUCCESS_VERIFIED.
+
+PACS-015 through PACS-017 remain PLANNED, not active; the evaluator +
 evidence-grounded Reflexion remainder of the original PACS-014 scope is also
-available as an explicitly named follow-on.
+available as an explicitly named follow-on. PACS-014b follow-ons worth
+considering for PACS-015 planning: a dedicated PG test database (the suite's
+schema drop annihilates live sessions on the default DSN), a repository-claim
+force-release/expiry path for zombie runs, and a progress model that
+distinguishes exploration from no-progress.
 
 PACS-014 (operator command center) closed 2026-09-02 at 1592 tests passing
 (18 platform-gated skips), 95% branch coverage, all lint/type/import gates

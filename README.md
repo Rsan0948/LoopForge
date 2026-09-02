@@ -104,3 +104,23 @@ The server binds 127.0.0.1 only and has no authentication — it is a
 trusted-operator local tool. `--sqlite PATH` swaps the store for a local
 SQLite file with identical semantics. See `ui/README.md` and
 `docs/process/cycles/PACS-014-operator-command-center.md`.
+
+## Operator usability (PACS-014b)
+
+- **macOS**: the local sandbox fails closed on macOS (the platform rejects
+  RLIMIT_AS), so inline sessions cannot execute checks there. Use container
+  mode: set `sandbox.container_image` in the inline form (or
+  `[sandbox] container_image` in a TOML profile) and write check argv with
+  in-container paths (`{python}` is not substituted in container mode).
+- **Stall threshold**: runs stop after 3 consecutive verifications without
+  score progress (`STOP_STALLED_NO_PROGRESS`). Small local models that read
+  files for several turns before their first edit need headroom — set
+  `[budget] no_progress_limit` in a profile or `budget.no_progress_limit`
+  in the inline form (default stays 3).
+- **Follow-up**: on a terminal (finished) run, "follow up →" creates a
+  quiescent successor session on the same repository whose objective opens
+  with the original task and closes with a bounded, deterministic report
+  consolidated from the finished run's durable events. The operator reviews
+  the seeded objective and presses start — nothing auto-chains.
+
+See `docs/process/cycles/PACS-014b-operator-usability.md`.
