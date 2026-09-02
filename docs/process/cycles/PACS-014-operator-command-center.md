@@ -210,11 +210,93 @@ milestone, plus live smoke at each step). Findings, all fixed and pinned:
   machine (RLIMIT_AS rejected → fail closed); container mode is the live
   path, matching the existing platform-gated test skips.
 
+## Adversarial hardening pass (2026-09-02, three-agent review)
+
+Three parallel adversarial reviews (core runtime/domain/adapters, serving
+plane, console UI) plus operator-seeded hypotheses. Every hypothesis was
+verified against code before triage; reproductions were executed for all
+critical/major findings. Fixed and pinned (allow+deny pairs per rule 10):
+
+- **Permanent-failure grant poison (critical)**: the `38d1f7c` spent-grant
+  fix covered only `ToolSucceeded`; a granted action failing PERMANENTLY (or
+  exhausting retries) kept its grant, and the re-planned READY state
+  re-executed the stale approved proposal at attempt 1 — the identical
+  durable-stream poison. Fix: `ToolFailed` consumes the grant too (retries
+  never consult the grant, so bounded retries are not starved — pinned by an
+  explicit allow test). Defense in depth: `_approved_pending_action` also
+  requires `current_attempt == 0`, so an already-attempted proposal can never
+  be resurfaced.
+- **Stale-grant authority bypass (major)**: the `ActionRejected` arm left the
+  grant behind; action ids are adapter-minted (`{run_id}:model-turn-N`) and
+  the counter resets on adapter rebuild, so a post-restart proposal reusing
+  the id would skip the approval gate entirely. Fix: the grant dies with its
+  action; pinned by a reused-id integration test asserting a FRESH
+  `ApprovalRequested` and no execution without a second grant.
+- **Runs-index objective divergence (major)**: an amending
+  `OperatorInstruction` never updated the folded index row; `list_runs()`
+  served the stale objective permanently. Fix in the shared fold + a
+  conformance pin against full replay.
+- **PG backfill race (major)**: the runs-index rebuild was last-writer-wins
+  against a concurrent appender (a terminal `RunStopped` could be reverted
+  out of the index permanently). Fix: the rebuild takes the same per-run
+  `pg_advisory_xact_lock` append holds; concurrent first-initialization is
+  serialized by a fixed init lock (plus idempotent trigger DDL). Live-PG
+  pins for both.
+- **Server lifecycle cleanup (major x2)**: `create_session` leaked the built
+  bundle when `runtime.start` failed and left a live-but-unmanaged run when
+  `registry.put` failed — now close-on-start-failure and
+cancel+close+evict-on-registration-failure. And two sessions could adopt
+  the same checkout (racing edits, cross-attributed diffs, mutually
+  destructive rollbacks) — one ACTIVE session per resolved repository path
+  is now enforced from the durable registry + runs index (restart-safe),
+  denied with 409.
+- **Error-map completeness**: `StreamVersionConflictError` → 409 (was 500),
+  `WorkspaceError` → 422 (rollback of empty/unrevertible paths was a bare
+  500), and a new `SessionRegistryError` → 500-with-detail replaces the
+  misleading 422/bare-500 split for registry corruption.
+- **WS consumer hardening**: history replay offloaded off the event loop;
+  a live frame arriving with a sequence GAP (cross-process publish
+  reordering) now resyncs from the durable store instead of dropping the
+  missed sequence for the life of the connection.
+- **Console defects**: SessionView remounts per run (state no longer leaks
+  across sessions); out-of-order `getSession` responses are discarded by a
+  monotonic `version` guard (stale detail could persist forever on terminal
+  runs); NaN/Infinity budget inputs are form errors instead of silently
+  serializing to `null` ("no limit"); DiffViewer parses paths with spaces
+  and decodes git C-quoted paths.
+- **Evidence-document grammar**: untracked-file renders now open with a
+  `diff --git` + `new file mode` header (previously headerless difflib
+  output merged into the previous tracked file in the viewer, hijacking its
+  path and counts) and the workspace diff uses `--no-renames` for parity
+  with `status()` (every changed path individually revertible).
+- **Misc**: inline TOML environment KEYS are quoted (a newline key could
+  inject an extra `[[checks]]` allowlist entry); failed inline profiles are
+  validated before their digest file appears in `profiles_dir`; blank
+  operator instructions fail closed (they could blank the objective);
+  `shutdown()` closes bundles under the per-run lock (never tears down a
+  container under an in-flight step); `_ensure_session` loser bundles close
+  outside the manager lock; `InMemoryEventStore.append` is one critical
+  section; SQLite backfill re-checks inside its write transaction; `serve`
+  warns loudly on off-loopback binds.
+
+Accepted limitations (documented, not fixed): `stop()`/`instruct()` park on
+the per-run lock behind a wedged in-flight step (state-safe; the bounded
+join only bounds the driver exit, by design); registry read-modify-write is
+single-process (two servers over one data dir can lose a wiring update);
+comma-containing filenames corrupt the snapshot header's display-only file
+list (rollback paths come from parsed diff entries, not the header).
+
 ## Stop
 
 Cycle closes at 1592 passed / 18 skipped / 95% branch coverage, all §7 gates
 green, §10 live round-trip evidence complete. Commits `1cfd1ca`..(M5 docs)
 on `main`; local-only workflow per operator instruction (no push).
+
+Post-hardening stop (2026-09-02): the adversarial pass above lands on top of
+the closure commits at 1619 passed / 18 skipped / 95% branch coverage
+(+27 regression pins), all gates (ruff, pyright strict, import-linter, pytest,
+UI tsc+vite) green, live PG integration pins passing against the local
+database.
 
 ## Follow-on implications
 
