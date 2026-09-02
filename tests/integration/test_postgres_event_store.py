@@ -5,6 +5,12 @@ compare-and-append conflict/duplicate parity, append-only trigger enforcement,
 concurrent-writer CAS, and the runs-index projection. Gated on a reachable
 Postgres (docker compose up -d loopforge-db); deterministic CI skips with a
 reason code when no database is available.
+
+The suite runs against a DEDICATED test database (default ``loopforge_test``,
+created on demand) and fails closed on any DSN whose database name does not
+end in ``_test``: the schema reset below (DROP SCHEMA public CASCADE)
+annihilates whatever database it points at — run against the live server's
+database it wiped real sessions mid-run (PACS-014b finding 5).
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ from datetime import UTC, datetime
 import psycopg
 import psycopg.errors
 import pytest
+from psycopg import conninfo, sql
 
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.postgres_events import (
@@ -32,15 +39,41 @@ NOW = datetime(2026, 9, 1, tzinfo=UTC)
 RUN = RunId("pg-run")
 DSN = os.environ.get(
     "LOOPFORGE_TEST_POSTGRES_DSN",
-    "postgresql://loopforge:loopforge@127.0.0.1:5432/loopforge",
+    "postgresql://loopforge:loopforge@127.0.0.1:5432/loopforge_test",
 )
+_MAINTENANCE_DATABASE = "postgres"
+
+
+def _maintenance_dsn(dsn: str) -> str:
+    """DSN of the server's maintenance database (always present on Postgres)."""
+    return conninfo.make_conninfo(dsn, dbname=_MAINTENANCE_DATABASE)
+
+
+def _test_database_name(dsn: str) -> str:
+    """Fail closed unless the DSN targets a dedicated test database.
+
+    The suite resets the public schema (DROP SCHEMA public CASCADE); pointed
+    at a database a live server uses, that reset annihilates live sessions
+    (PACS-014b finding 5). Only database names ending in ``_test`` are
+    accepted — a mistargeted DSN is a loud error, never a silent wipe.
+    """
+    raw_dbname = conninfo.conninfo_to_dict(dsn).get("dbname")
+    dbname = raw_dbname if isinstance(raw_dbname, str) else ""
+    if not dbname.endswith("_test"):
+        msg = (
+            "PG integration suite requires a dedicated test database (dbname "
+            f"ending in '_test'), got {dbname!r}; refusing to run destructive "
+            "schema resets against a database a live server may be using"
+        )
+        raise RuntimeError(msg)
+    return dbname
 
 
 def _postgres_available() -> bool:
     try:
-        with psycopg.connect(DSN, connect_timeout=2):
+        with psycopg.connect(_maintenance_dsn(DSN), connect_timeout=2):
             return True
-    except psycopg.OperationalError:
+    except psycopg.Error:
         return False
 
 
@@ -63,9 +96,23 @@ def _started(*, event_id: str = "e1", sequence: int = 1, run_id: RunId = RUN) ->
     )
 
 
+@pytest.fixture(scope="session", autouse=True)
+def test_database() -> str:
+    """Create the dedicated test database if absent; fail closed on live DSNs."""
+    dbname = _test_database_name(DSN)
+    with psycopg.connect(_maintenance_dsn(DSN), autocommit=True) as connection:
+        exists = connection.execute(
+            "SELECT 1 FROM pg_database WHERE datname = %s", (dbname,)
+        ).fetchone()
+        if exists is None:
+            connection.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(dbname)))
+    return dbname
+
+
 @pytest.fixture(scope="module")
-def fresh_schema() -> None:
+def fresh_schema(test_database: str) -> None:
     """Reset the public schema once per module so migrations execute under test."""
+    del test_database  # ensures the dedicated database exists before any reset
     with psycopg.connect(DSN, autocommit=True) as connection:
         connection.execute("DROP SCHEMA public CASCADE")
         connection.execute("CREATE SCHEMA public")
@@ -82,6 +129,26 @@ def store(fresh_schema: None) -> PostgresEventStore:
 def test_empty_dsn_is_rejected() -> None:
     with pytest.raises(ValueError, match="dsn cannot be empty"):
         PostgresEventStore("  ", codec=JsonEventCodec())
+
+
+# --- dedicated-test-database guard (PACS-014b finding 5) ------------------------
+
+
+def test_test_database_guard_allows_dedicated_test_dsn() -> None:
+    assert _test_database_name("postgresql://u:p@db:5432/loopforge_test") == "loopforge_test"
+
+
+def test_test_database_guard_refuses_a_production_database() -> None:
+    with pytest.raises(RuntimeError, match="dedicated test database"):
+        _test_database_name("postgresql://loopforge:loopforge@127.0.0.1:5432/loopforge")
+
+
+def test_suite_executes_against_the_dedicated_test_database(store: PostgresEventStore) -> None:
+    del store
+    with psycopg.connect(DSN) as connection:
+        row = connection.execute("SELECT current_database()").fetchone()
+    assert row is not None
+    assert str(row[0]).endswith("_test")
 
 
 def test_store_initializes_versioned_schema_and_is_idempotent(store: PostgresEventStore) -> None:

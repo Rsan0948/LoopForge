@@ -105,6 +105,11 @@ trusted-operator local tool. `--sqlite PATH` swaps the store for a local
 SQLite file with identical semantics. See `ui/README.md` and
 `docs/process/cycles/PACS-014-operator-command-center.md`.
 
+The Postgres integration suite never touches the server's database: it runs
+against a dedicated `loopforge_test` database (created on demand, or override
+with `LOOPFORGE_TEST_POSTGRES_DSN`) and fails closed on any DSN whose database
+name does not end in `_test`.
+
 ## Operator usability (PACS-014b)
 
 - **macOS**: the local sandbox fails closed on macOS (the platform rejects
