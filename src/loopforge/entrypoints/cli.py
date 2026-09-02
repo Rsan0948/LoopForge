@@ -597,11 +597,50 @@ def _profile_loop(
     return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
+def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
+    *,
+    host: str,
+    port: int,
+    dsn: str,
+    sqlite: str | None,
+    data_dir: str,
+    static_dir: str | None,
+) -> int:
+    """Run the operator server (PACS-014): REST + WebSocket over the durable store.
+
+    Trusted-operator local tool (D10): no authentication; the default bind is
+    loopback only. Postgres is the default store; ``--sqlite`` switches to a
+    local SQLite file (the same codec and store semantics).
+    """
+    # Lazy imports: sessions.py reuses this module's model builders, so a
+    # top-level server import here would close an import cycle.
+    import uvicorn  # noqa: PLC0415
+
+    from loopforge.entrypoints.server import ServerSettings, create_app  # noqa: PLC0415
+
+    settings = ServerSettings(
+        store_kind="sqlite" if sqlite is not None else "postgres",
+        dsn=dsn,
+        sqlite_path=sqlite if sqlite is not None else ".loopforge/server/events.db",
+        data_dir=Path(data_dir),
+        static_dir=Path(static_dir) if static_dir else None,
+    )
+    uvicorn.run(create_app(settings), host=host, port=port)
+    return 0
+
+
 def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
     parser = argparse.ArgumentParser(prog="loopforge", epilog="legacy commands: {demo,repair-demo}")
     parser.add_argument(
         "command",
-        choices=["demo", "repair-demo", "orchestrated-repair-demo", "civicml-loop", "loop"],
+        choices=[
+            "demo",
+            "repair-demo",
+            "orchestrated-repair-demo",
+            "civicml-loop",
+            "loop",
+            "serve",
+        ],
     )
     parser.add_argument(
         "profile",
@@ -654,6 +693,41 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         help="honest context window of the deployed Ollama model, registered as "
         "routing capability metadata (default: 131072)",
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="serve only: bind host (default: 127.0.0.1; trusted-operator local tool)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8123,
+        help="serve only: bind port (default: 8123)",
+    )
+    parser.add_argument(
+        "--dsn",
+        metavar="DSN",
+        default="postgresql://loopforge:loopforge@127.0.0.1:5432/loopforge",
+        help="serve only: Postgres event-store DSN (default store)",
+    )
+    parser.add_argument(
+        "--sqlite",
+        metavar="PATH",
+        default=None,
+        help="serve only: use a SQLite event store at PATH instead of Postgres",
+    )
+    parser.add_argument(
+        "--data-dir",
+        metavar="DIR",
+        default=".loopforge/server",
+        help="serve only: server-owned state dir (session registry, inline profiles)",
+    )
+    parser.add_argument(
+        "--static-dir",
+        metavar="DIR",
+        default=None,
+        help="serve only: built UI directory (for example ui/dist) mounted at /",
+    )
     args = parser.parse_args()
     if args.profile is not None and args.command != "loop":
         parser.error(f"unrecognized arguments: {args.profile}")
@@ -685,6 +759,15 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
             dry_run=args.dry_run,
             ollama_url=args.ollama_url,
             ollama_context_window=args.ollama_context_window,
+        )
+    if args.command == "serve":
+        return _serve(
+            host=args.host,
+            port=args.port,
+            dsn=args.dsn,
+            sqlite=args.sqlite,
+            data_dir=args.data_dir,
+            static_dir=args.static_dir,
         )
     return 2
 

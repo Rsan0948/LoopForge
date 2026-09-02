@@ -26,6 +26,9 @@ dev = [
   "ruff>=0.12,<1",
   "pyright>=1.1.400,<2",
   "import-linter>=2.3,<3",
+  # Starlette's TestClient is statically typed against httpx2 (a TYPE_CHECKING
+  # import); without it pyright-strict sees every TestClient call as Unknown.
+  "httpx2>=2.12",
 ]
 
 [project.scripts]
