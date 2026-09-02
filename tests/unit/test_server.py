@@ -338,6 +338,20 @@ def test_create_session_via_inline_fields(tmp_path: Path) -> None:
         assert detail["iteration"] == 0
 
 
+def test_create_session_inline_round_trips_no_progress_limit(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    data_dir = tmp_path / "data"
+    body = _inline_body(repo)
+    body["inline"]["budget"]["no_progress_limit"] = 9
+    with _client(tmp_path, _plain_factory(), data_dir=data_dir) as client:
+        response = client.post("/api/sessions", json=body)
+        assert response.status_code == 201, response.text
+
+    persisted = list((data_dir / "profiles").glob("inline-*.toml"))
+    assert len(persisted) == 1
+    assert "no_progress_limit = 9" in persisted[0].read_text(encoding="utf-8")
+
+
 def test_create_session_via_profile_path(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     profile_path = tmp_path / "profile.toml"

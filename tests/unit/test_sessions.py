@@ -721,6 +721,26 @@ def test_production_factory_builds_a_scripted_bundle_from_inline_wiring(
     try:
         assert bundle.runtime.store is store
         assert bundle.workspace.root == repo.resolve()
+        assert bundle.runtime.control.no_progress_limit == 3
+    finally:
+        bundle.close()
+
+
+@_REQUIRES_GIT
+def test_production_factory_applies_the_profile_no_progress_limit(
+    tmp_path: Path,
+) -> None:
+    repo = _git_repo(tmp_path / "repo")
+    fields = replace(
+        _inline_fields(repo),
+        budget=InlineBudgetFields(max_cost_usd=5.0, max_iterations=30, no_progress_limit=7),
+    )
+    wiring = wiring_from_inline(fields, profiles_dir=tmp_path / "profiles")
+    factory = build_production_bundle_factory(tmp_path / "profiles")
+
+    bundle = factory.build(wiring, InMemoryEventStore())
+    try:
+        assert bundle.runtime.control.no_progress_limit == 7
     finally:
         bundle.close()
 

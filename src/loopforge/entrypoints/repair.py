@@ -124,6 +124,8 @@ class RepairRuntimeDeps:
     """Optional live model; defaults to the deterministic scripted model."""
     model_tier: ModelTier = ModelTier.ECONOMY
     """Code-owned routing tier for the wired model (scripted default is ECONOMY)."""
+    no_progress_limit: int | None = None
+    """Operator-tuned stall threshold (PACS-014b); None = ControlPolicy default."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -316,7 +318,10 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
         tools=tools,
         verifier=RepairVerifier(sandbox, workspace, task.acceptance),
         store=deps.store,
-        control=ControlPolicy(deps.budget or BudgetLimit(max_cost_usd=1.0, max_iterations=8)),
+        control=ControlPolicy(
+            deps.budget or BudgetLimit(max_cost_usd=1.0, max_iterations=8),
+            no_progress_limit=deps.no_progress_limit or 3,
+        ),
         permissions=PermissionPolicy(frozenset({Permission.READ, Permission.LOCAL_WRITE})),
         reliability=ReliabilityPolicy(),
         context=RepairContextBuilder(

@@ -570,6 +570,7 @@ def _profile_loop(
             model=model,
             model_tier=profile.model_tier,
             budget=profile.budget,
+            no_progress_limit=profile.no_progress_limit,
         )
         bundle = build_adopted_repair_runtime(
             task,

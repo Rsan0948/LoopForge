@@ -298,6 +298,30 @@ def test_optional_budget_limits_are_loaded(tmp_path: Path) -> None:
     assert profile.budget.max_elapsed_seconds == 600
 
 
+def test_no_progress_limit_defaults_to_none(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    profile = load_profile(_write_profile(tmp_path, _valid_body(repo)))
+    assert profile.no_progress_limit is None
+
+
+def test_no_progress_limit_is_loaded(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo).replace(
+        "max_iterations = 30", "max_iterations = 30\nno_progress_limit = 10"
+    )
+    profile = load_profile(_write_profile(tmp_path, body))
+    assert profile.no_progress_limit == 10
+
+
+def test_non_positive_no_progress_limit_is_denied(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo).replace(
+        "max_iterations = 30", "max_iterations = 30\nno_progress_limit = 0"
+    )
+    with pytest.raises(ProfileError, match="no_progress_limit"):
+        load_profile(_write_profile(tmp_path, body))
+
+
 def test_approval_required_for_is_loaded(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path / "repo")
     body = _valid_body(repo) + '\n[approval]\nrequired_for = ["write_file", "edit_file"]\n'

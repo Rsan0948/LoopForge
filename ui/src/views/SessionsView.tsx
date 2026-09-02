@@ -41,6 +41,7 @@ interface InlineForm {
   maxIterations: string;
   maxTotalTokens: string;
   maxElapsedSeconds: string;
+  noProgressLimit: string;
 }
 
 function defaultInlineForm(): InlineForm {
@@ -59,6 +60,7 @@ function defaultInlineForm(): InlineForm {
     maxIterations: "10",
     maxTotalTokens: "",
     maxElapsedSeconds: "",
+    noProgressLimit: "",
   };
 }
 
@@ -109,6 +111,11 @@ function buildInlineProfile(form: InlineForm): { error: string } | { profile: In
   if (maxElapsedSeconds !== null && (!Number.isFinite(maxElapsedSeconds) || maxElapsedSeconds <= 0)) {
     return { error: "max_elapsed_seconds must be positive" };
   }
+  const progressTrim = form.noProgressLimit.trim();
+  const noProgressLimit = progressTrim === "" ? null : Number(progressTrim);
+  if (noProgressLimit !== null && (!Number.isInteger(noProgressLimit) || noProgressLimit <= 0)) {
+    return { error: "no_progress_limit must be a positive integer" };
+  }
   return {
     profile: {
       repository: form.repository.trim(),
@@ -136,6 +143,7 @@ function buildInlineProfile(form: InlineForm): { error: string } | { profile: In
         max_iterations: maxIterations,
         max_total_tokens: maxTotalTokens,
         max_elapsed_seconds: maxElapsedSeconds,
+        no_progress_limit: noProgressLimit,
       },
       // The write tools are the local repair stack's only mutation surface;
       // gating them pauses the run for durable operator approval (PACS-014).
@@ -392,6 +400,14 @@ function NewSessionPanel(): ReactElement {
                   value={form.maxElapsedSeconds}
                   onChange={(e) => patch({ maxElapsedSeconds: e.target.value })}
                   placeholder="(optional)"
+                />
+              </label>
+              <label className="field">
+                <span>budget.no_progress_limit</span>
+                <input
+                  value={form.noProgressLimit}
+                  onChange={(e) => patch({ noProgressLimit: e.target.value })}
+                  placeholder="(optional, default 3)"
                 />
               </label>
             </div>

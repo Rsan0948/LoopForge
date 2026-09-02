@@ -144,6 +144,7 @@ class InlineBudgetRequest(BaseModel):
     max_iterations: int
     max_total_tokens: int | None = None
     max_elapsed_seconds: float | None = None
+    no_progress_limit: int | None = None
 
 
 class InlineApprovalRequest(BaseModel):
@@ -249,6 +250,7 @@ def _inline_fields(request: InlineProfileRequest) -> InlineProfileFields:
             max_iterations=request.budget.max_iterations,
             max_total_tokens=request.budget.max_total_tokens,
             max_elapsed_seconds=request.budget.max_elapsed_seconds,
+            no_progress_limit=request.budget.no_progress_limit,
         ),
         approval_required_for=(
             tuple(request.approval.required_for) if request.approval is not None else ()

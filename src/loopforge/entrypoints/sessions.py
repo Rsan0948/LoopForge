@@ -637,6 +637,7 @@ class InlineBudgetFields:
     max_iterations: int
     max_total_tokens: int | None = None
     max_elapsed_seconds: float | None = None
+    no_progress_limit: int | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -723,7 +724,11 @@ def render_inline_profile_toml(fields: InlineProfileFields) -> str:
         lines.append("[approval]")
         lines.append(f"required_for = {_toml_str_list(fields.approval_required_for)}")
         lines.append("")
-    budget = fields.budget
+    _render_budget_section(lines, fields.budget)
+    return "\n".join(lines)
+
+
+def _render_budget_section(lines: list[str], budget: InlineBudgetFields) -> None:
     lines.append("[budget]")
     lines.append(f"max_cost_usd = {float(budget.max_cost_usd)!r}")
     lines.append(f"max_iterations = {budget.max_iterations}")
@@ -731,8 +736,9 @@ def render_inline_profile_toml(fields: InlineProfileFields) -> str:
         lines.append(f"max_total_tokens = {budget.max_total_tokens}")
     if budget.max_elapsed_seconds is not None:
         lines.append(f"max_elapsed_seconds = {float(budget.max_elapsed_seconds)!r}")
+    if budget.no_progress_limit is not None:
+        lines.append(f"no_progress_limit = {budget.no_progress_limit}")
     lines.append("")
-    return "\n".join(lines)
 
 
 def _inline_profile_path(profiles_dir: Path, toml_text: str) -> Path:
@@ -856,6 +862,7 @@ def build_production_bundle_factory(
                     model=model,
                     model_tier=profile.model_tier,
                     budget=profile.budget,
+                    no_progress_limit=profile.no_progress_limit,
                 )
                 bundle = build_adopted_repair_runtime(
                     profile.task,

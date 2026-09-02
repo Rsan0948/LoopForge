@@ -65,6 +65,8 @@ class LoopProfile:
     model_name: str
     model_tier: ModelTier
     budget: BudgetLimit
+    no_progress_limit: int | None
+    """Operator-tuned stall threshold (PACS-014b); None = ControlPolicy default."""
     approval_required_for: frozenset[str]
     """Tools the operator gates behind durable approval (PACS-014); empty = none."""
 
@@ -135,7 +137,7 @@ def load_profile(path: str | Path) -> LoopProfile:  # noqa: PLR0915 - sequential
         msg_6 = f"model.tier must be one of {tuple(_MODEL_TIERS)}, got {tier_name!r}"
         raise ProfileError(msg_6)
 
-    budget = _require_budget(raw)
+    budget, no_progress_limit = _require_budget(raw)
     approval_required_for = _require_approval(raw)
 
     try:
@@ -162,6 +164,7 @@ def load_profile(path: str | Path) -> LoopProfile:  # noqa: PLR0915 - sequential
         model_name=model_name,
         model_tier=tier,
         budget=budget,
+        no_progress_limit=no_progress_limit,
         approval_required_for=approval_required_for,
     )
 
@@ -391,7 +394,7 @@ def _require_approval(raw: dict[str, Any]) -> frozenset[str]:
     return frozenset(names)
 
 
-def _require_budget(raw: dict[str, Any]) -> BudgetLimit:
+def _require_budget(raw: dict[str, Any]) -> tuple[BudgetLimit, int | None]:
     table = _require_table(raw, "budget")
     max_cost = _require_positive_number(table, "max_cost_usd", section="budget")
     max_iterations = _optional_positive_int(table, "max_iterations", section="budget", default=0)
@@ -406,9 +409,18 @@ def _require_budget(raw: dict[str, Any]) -> BudgetLimit:
     max_elapsed: float | None = None
     if max_elapsed_raw is not None:
         max_elapsed = _require_positive_number(table, "max_elapsed_seconds", section="budget")
-    return BudgetLimit(
-        max_cost_usd=max_cost,
-        max_iterations=max_iterations,
-        max_total_tokens=max_tokens,
-        max_elapsed_seconds=max_elapsed,
+    no_progress_raw: object = table.get("no_progress_limit")
+    no_progress_limit: int | None = None
+    if no_progress_raw is not None:
+        no_progress_limit = _optional_positive_int(
+            table, "no_progress_limit", section="budget", default=-1
+        )
+    return (
+        BudgetLimit(
+            max_cost_usd=max_cost,
+            max_iterations=max_iterations,
+            max_total_tokens=max_tokens,
+            max_elapsed_seconds=max_elapsed,
+        ),
+        no_progress_limit,
     )
