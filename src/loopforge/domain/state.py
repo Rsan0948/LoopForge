@@ -17,6 +17,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
@@ -139,6 +140,7 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
         RunStatus.VERIFYING,
         RunStatus.REFLECTING,
     },
+    ModelTurnRecorded: {RunStatus.READY},
     ApprovalRequested: {RunStatus.READY},
     ApprovalGranted: {RunStatus.WAITING_FOR_APPROVAL},
     ApprovalRejected: {RunStatus.WAITING_FOR_APPROVAL},
@@ -437,6 +439,11 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 output_tokens=base.output_tokens + usage.output_tokens,
                 cached_input_tokens=base.cached_input_tokens + usage.cached_input_tokens,
             )
+        case ModelTurnRecorded():
+            # Evidence-only model-identity record (PACS-015): the provenance
+            # graph attributes the turn's action to this provider/model. No
+            # control-state effect; the payload stays in the event stream.
+            return base
         case ApprovalRequested():
             return replace(base, status=RunStatus.WAITING_FOR_APPROVAL)
         case ApprovalGranted(action_id=action_id):
@@ -528,7 +535,8 @@ _TERMINAL_STATUS_BY_REASON: dict[StopReason, RunStatus] = {
 # Deterministic post-status for events whose reducer arm always lands in one
 # status. Events absent from this table leave the run status unchanged
 # (BudgetDebited, ArtifactRecorded, CircuitOpened, OperatorInstruction,
-# WorkerStopped, WorkerMerged); RunStopped is reason-dependent and handled by
+# ModelTurnRecorded, WorkerStopped, WorkerMerged); RunStopped is reason-dependent
+# and handled by
 # status_after_event. The reducer above remains the authority — store adapters
 # use this projection only to maintain their runs index, and a conformance
 # suite pins it equal to full replay.

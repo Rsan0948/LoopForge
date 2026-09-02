@@ -32,6 +32,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
@@ -369,6 +370,16 @@ EXAMPLES: tuple[Event, ...] = (
         instruction="focus on the failing test only",
         amends_objective=True,
     ),
+    ModelTurnRecorded(
+        event_id=EventId("e28"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=28,
+        caused_by=EventId("e14"),
+        provider="ollama",
+        model="devstral-small-2:latest",
+        action_id=ActionId("a1"),
+    ),
 )
 
 (
@@ -399,6 +410,7 @@ EXAMPLES: tuple[Event, ...] = (
     WORKER_MERGED,
     APPROVAL_REJECTED,
     OPERATOR_INSTRUCTION,
+    MODEL_TURN_RECORDED,
 ) = EXAMPLES
 
 
@@ -440,7 +452,7 @@ def _legacy_tool_failed_payload(retryable: Any) -> str:
 
 def test_examples_cover_every_registered_event_type() -> None:
     assert {type(event).__name__ for event in EXAMPLES} == set(_EVENT_TYPES)
-    assert len(_EVENT_TYPES) == 24
+    assert len(_EVENT_TYPES) == 25
 
 
 @pytest.mark.parametrize(
@@ -521,6 +533,9 @@ def test_decode_rejects_non_object_event_body(body: Any) -> None:
         (VERIFICATION_PASSED, None, "summary", 1, "summary must be a string"),
         (VERIFICATION_FAILED, None, "summary", None, "summary must be a string"),
         (REFLECTION_RECORDED, None, "reflection", [], "reflection must be a string"),
+        (MODEL_TURN_RECORDED, None, "provider", 7, "provider must be a string"),
+        (MODEL_TURN_RECORDED, None, "model", None, "model must be a string"),
+        (MODEL_TURN_RECORDED, None, "action_id", [], "action_id must be a string"),
         (APPROVAL_REQUESTED, None, "action_id", 8, "action_id must be a string"),
         (APPROVAL_REQUESTED, None, "reason", None, "reason must be a string"),
         (APPROVAL_GRANTED, None, "action_id", None, "action_id must be a string"),
@@ -549,6 +564,13 @@ def test_decode_rejects_mistyped_required_strings(
 ) -> None:
     with pytest.raises(TypeError, match=match):
         CODEC.decode(_mutated_body(event, key, value, section=section))
+
+
+def test_decode_model_turn_recorded_rejects_blank_identity() -> None:
+    with pytest.raises(ValueError, match="model turn provider cannot be empty"):
+        CODEC.decode(_mutated_body(MODEL_TURN_RECORDED, "provider", "   "))
+    with pytest.raises(ValueError, match="model turn model cannot be empty"):
+        CODEC.decode(_mutated_body(MODEL_TURN_RECORDED, "model", ""))
 
 
 @pytest.mark.parametrize(

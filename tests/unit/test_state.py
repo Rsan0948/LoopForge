@@ -22,6 +22,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
@@ -1478,3 +1479,45 @@ def test_worker_merged_conflict_still_resolves_the_worker() -> None:
 
     assert state.workers[0].merge_outcome is MergeOutcome.CONFLICT
     assert state.status is RunStatus.VERIFYING
+
+
+# --- PACS-015: ModelTurnRecorded evidence-only reducer pins ---
+
+
+def _model_turn_recorded(sequence: int, action_id: str = "a1") -> ModelTurnRecorded:
+    return ModelTurnRecorded(
+        event_id=_event_id(sequence),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=sequence,
+        provider="ollama",
+        model="devstral-small-2:latest",
+        action_id=ActionId(action_id),
+    )
+
+
+def test_model_turn_recorded_is_evidence_only_in_ready() -> None:
+    before = _state_at("ready")
+
+    after = reduce_event(before, _model_turn_recorded(3))
+
+    # No control-state effect beyond the universal version/last-occurred fold:
+    # the identity lives in the stream, not RunState.
+    assert after == replace(
+        before, version=before.version + 1, last_occurred_at=after.last_occurred_at
+    )
+
+
+def test_model_turn_recorded_is_rejected_outside_ready() -> None:
+    with pytest.raises(
+        InvalidTransitionError, match="ModelTurnRecorded is invalid while run is acting"
+    ):
+        reduce_event(_state_at("acting"), _model_turn_recorded(5))
+
+
+def test_model_turn_recorded_is_rejected_on_a_terminal_run() -> None:
+    terminal = replay(RUN, (_started(1), _planned(2), _stopped(3)))
+    with pytest.raises(
+        InvalidTransitionError, match="terminal run cannot accept ModelTurnRecorded"
+    ):
+        reduce_event(terminal, _model_turn_recorded(4))

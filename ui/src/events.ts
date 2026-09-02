@@ -117,6 +117,11 @@ export interface ArtifactRecordedPayload extends EventBase {
 export interface BudgetDebitedPayload extends EventBase {
   usage: UsageDelta;
 }
+export interface ModelTurnRecordedPayload extends EventBase {
+  provider: string;
+  model: string;
+  action_id: string;
+}
 export interface ApprovalRequestedPayload extends EventBase {
   action_id: string;
   reason: string;
@@ -172,6 +177,7 @@ export type EventPayload =
   | ContextAssembledPayload
   | ArtifactRecordedPayload
   | BudgetDebitedPayload
+  | ModelTurnRecordedPayload
   | ApprovalRequestedPayload
   | ApprovalGrantedPayload
   | ApprovalRejectedPayload
@@ -268,6 +274,10 @@ export function describeEvent(envelope: EventEnvelope): { label: string; summary
         label: "Budget debited",
         summary: `$${p.usage.cost_usd.toFixed(4)} · ${p.usage.input_tokens} in / ${p.usage.output_tokens} out`,
       };
+    }
+    case "ModelTurnRecorded": {
+      const p = e as ModelTurnRecordedPayload;
+      return { label: "Model turn", summary: `${p.provider}/${p.model}` };
     }
     case "ApprovalRequested": {
       const p = e as ApprovalRequestedPayload;

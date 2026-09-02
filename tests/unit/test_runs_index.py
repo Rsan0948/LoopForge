@@ -18,6 +18,7 @@ from loopforge.domain.events import (
     ApprovalRequested,
     BudgetDebited,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     RunStarted,
@@ -142,9 +143,19 @@ def test_status_after_event_leaves_status_unchanged_for_projection_events() -> N
         revision="abc123",
         detail="merged",
     )
+    model_turn = ModelTurnRecorded(
+        event_id=EventId("e12"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=12,
+        provider="ollama",
+        model="devstral-small-2:latest",
+        action_id=ActionId("a1"),
+    )
     assert status_after_event(debited) is None
     assert status_after_event(instruction) is None
     assert status_after_event(merged) is None
+    assert status_after_event(model_turn) is None
 
 
 # --- fold conformance with replay -------------------------------------------------

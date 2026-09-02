@@ -20,6 +20,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     RetryScheduled,
@@ -573,6 +574,14 @@ class Runtime:
             self.sleeper.sleep(backoff)
             return None
         drive.model_failure_streak = 0
+        # Boundary validation is intentional: adapters may violate port types.
+        capabilities = turn_model.capabilities
+        if not isinstance(capabilities, ModelCapabilities):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_14 = (
+                f"model adapter advertised {type(capabilities).__name__} capabilities, "
+                "expected ModelCapabilities"
+            )
+            raise ModelContractError(msg_14)
         self._persist(
             run_id,
             lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
@@ -581,6 +590,26 @@ class Runtime:
                 occurred_at=occurred_at,
                 sequence=sequence,
                 usage=usage,
+            ),
+        )
+        # Durable per-turn model identity (PACS-015): which provider/model
+        # produced this turn and which action it yielded, from the adapter's
+        # code-owned capabilities — provenance derives attribution from the
+        # authoritative stream alone. Recorded even when the budget stop
+        # below ends the run before the action is proposed.
+        turn_action_id = turn.action.action_id
+        self._persist(
+            run_id,
+            lambda event_id, rid, occurred_at, sequence, caps=capabilities, aid=turn_action_id: (
+                ModelTurnRecorded(
+                    event_id=event_id,
+                    run_id=rid,
+                    occurred_at=occurred_at,
+                    sequence=sequence,
+                    provider=caps.provider,
+                    model=caps.model,
+                    action_id=aid,
+                )
             ),
         )
 

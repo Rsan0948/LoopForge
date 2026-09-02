@@ -17,6 +17,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
@@ -500,6 +501,17 @@ class RuntimeTelemetry:
                             unit=unit,
                         )
                     )
+            case ModelTurnRecorded(provider=provider, model=model, action_id=action_id):
+                self._log(
+                    event,
+                    LogSeverity.INFO,
+                    "model turn recorded",
+                    action_id=action_id,
+                    attributes={
+                        "loopforge.model.provider": provider,
+                        "loopforge.model.name": model,
+                    },
+                )
             case ApprovalRequested(action_id=action_id, reason=reason):
                 self._log(
                     event,

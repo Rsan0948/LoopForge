@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from collections import deque
 from datetime import UTC, datetime
+from typing import Any, cast
 
 import pytest
 
@@ -25,7 +26,7 @@ from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
-from loopforge.domain.events import RunStopped
+from loopforge.domain.events import ActionProposed, ModelTurnRecorded, RunStopped
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy, RetrySettings
 from loopforge.domain.routing import (
@@ -401,3 +402,90 @@ def test_routing_policy_contract_violation_fails_loudly() -> None:
     )
     with pytest.raises(ModelContractError, match="expected RoutingDecision"):
         runtime.run("objective")
+
+
+# --- PACS-015: per-turn model-identity provenance ---------------------------------
+
+
+def _model_turns(store: InMemoryEventStore, run_id: RunId) -> list[ModelTurnRecorded]:
+    return [event for event in store.events_for(run_id) if isinstance(event, ModelTurnRecorded)]
+
+
+def test_every_successful_turn_records_its_model_identity() -> None:
+    model = RoutedFakeModel(
+        [
+            ActionProposal(ActionId("a1"), "inspect", {}),
+            ActionProposal(ActionId("a2"), "inspect", {}),
+        ],
+        provider="p",
+        name="direct",
+    )
+    store = InMemoryEventStore()
+    runtime = _runtime(model, store=store, observations=["still failing", "all tests pass"])
+
+    state = runtime.run("objective")
+
+    assert state.status is RunStatus.SUCCEEDED
+    turns = _model_turns(store, state.run_id)
+    assert [(turn.provider, turn.model) for turn in turns] == [("p", "direct"), ("p", "direct")]
+    assert [turn.action_id for turn in turns] == [ActionId("a1"), ActionId("a2")]
+    # Each identity record lands immediately before the ActionProposed it yielded.
+    events = store.events_for(state.run_id)
+    proposed = [event for event in events if isinstance(event, ActionProposed)]
+    assert len(proposed) == 2
+    for proposal in proposed:
+        predecessor = events[proposal.sequence - 2]
+        assert isinstance(predecessor, ModelTurnRecorded)
+        assert predecessor.action_id == proposal.proposal.action_id
+
+
+def test_failed_turn_records_nothing_and_the_fallback_turn_records_the_fallback_model() -> None:
+    failing = RoutedFakeModel([_transient()], provider="provider-a", name="standard")
+    fallback = RoutedFakeModel(
+        [ActionProposal(ActionId("a1"), "inspect", {})],
+        provider="provider-b",
+        name="standard",
+    )
+    store = InMemoryEventStore()
+    runtime = _runtime(
+        failing,
+        router=_router(
+            (
+                (failing, ModelTier.STANDARD),
+                (fallback, ModelTier.STANDARD),
+            )
+        ),
+        store=store,
+        sleeper=RecordingSleeper(),
+    )
+
+    state = runtime.run("objective")
+
+    assert state.status is RunStatus.SUCCEEDED
+    turns = _model_turns(store, state.run_id)
+    # The transient failure never produced a turn; the one successful turn is
+    # attributed to the fallback model that actually produced it.
+    assert [(turn.provider, turn.model) for turn in turns] == [("provider-b", "standard")]
+
+
+class _BrokenCapabilitiesModel(RoutedFakeModel):
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        # Deliberate port-contract violation: the runtime must fail loudly
+        # instead of recording a garbage model identity into the durable stream.
+        return cast(Any, object())
+
+
+def test_adapter_with_broken_capabilities_fails_closed() -> None:
+    model = _BrokenCapabilitiesModel(
+        [ActionProposal(ActionId("a1"), "inspect", {})], provider="p", name="broken"
+    )
+    store = InMemoryEventStore()
+    runtime = _runtime(model, store=store)
+
+    with pytest.raises(ModelContractError, match="expected ModelCapabilities"):
+        runtime.run("objective")
+
+    # Nothing about the turn entered the durable stream.
+    (record,) = store.list_runs()
+    assert _model_turns(store, record.run_id) == []

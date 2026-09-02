@@ -20,6 +20,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
@@ -483,6 +484,12 @@ def _catalog_examples() -> dict[type[Event], Event]:
             **_event_fields(16),
             usage=UsageDelta(cost_usd=0.01, input_tokens=10, output_tokens=5),
         ),
+        ModelTurnRecorded: ModelTurnRecorded(
+            **_event_fields(24),
+            provider="ollama",
+            model="devstral-small-2:latest",
+            action_id=ACTION_ID,
+        ),
         ApprovalRequested: ApprovalRequested(
             **_event_fields(17), action_id=ACTION_ID, reason="risky"
         ),
@@ -524,7 +531,7 @@ def _catalog_examples() -> dict[type[Event], Event]:
 
 def test_projector_maps_every_event_type_in_the_union() -> None:
     examples = _catalog_examples()
-    # Drift guard: adding a 20th event type fails this test until a projector
+    # Drift guard: adding an event type fails this test until a projector
     # arm (and its example here) exists — silent drops are not possible.
     assert set(examples) == set(get_args(Event))
     for event in examples.values():

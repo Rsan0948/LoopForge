@@ -27,6 +27,7 @@ from loopforge.domain.events import (
     ContextAssembled,
     DomainEvent,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
@@ -85,6 +86,7 @@ ALL_EVENT_CLASSES: tuple[type[DomainEvent], ...] = (
     ReflectionRecorded,
     ArtifactRecorded,
     BudgetDebited,
+    ModelTurnRecorded,
     ApprovalRequested,
     ApprovalGranted,
     ApprovalRejected,
@@ -275,6 +277,15 @@ def _all_events() -> tuple[Event, ...]:
             occurred_at=NOW,
             sequence=13,
             usage=UsageDelta(cost_usd=0.01, input_tokens=1, output_tokens=1),
+        ),
+        ModelTurnRecorded(
+            event_id=EventId("e13t"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=13,
+            provider="ollama",
+            model="devstral-small-2:latest",
+            action_id=ActionId("a1"),
         ),
         ApprovalRequested(
             event_id=EventId("e14"),
@@ -668,6 +679,29 @@ def test_budget_debited_records_usage() -> None:
     )
 
     assert event.usage is usage
+
+
+def test_model_turn_recorded_requires_a_non_empty_identity() -> None:
+    with pytest.raises(ValueError, match="model turn provider cannot be empty"):
+        ModelTurnRecorded(
+            event_id=EventId("e1"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=1,
+            provider="   ",
+            model="devstral-small-2:latest",
+            action_id=ActionId("a1"),
+        )
+    with pytest.raises(ValueError, match="model turn model cannot be empty"):
+        ModelTurnRecorded(
+            event_id=EventId("e2"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=2,
+            provider="ollama",
+            model="",
+            action_id=ActionId("a1"),
+        )
 
 
 def test_approval_requested_records_action_and_reason() -> None:

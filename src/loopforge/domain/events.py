@@ -222,6 +222,32 @@ class BudgetDebited(DomainEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ModelTurnRecorded(DomainEvent):
+    """Durable per-turn model-identity record (PACS-015).
+
+    Recorded on every successful model turn: which provider/model produced
+    the turn and which action the turn yielded. Evidence-only — the reducer
+    projects it without any control-state effect — so the derived provenance
+    graph can attribute every proposed action to the model that produced it
+    from the authoritative stream alone. Identity comes from the adapter's
+    code-owned ``ModelCapabilities``, never from model output.
+    """
+
+    provider: str
+    model: str
+    action_id: ActionId
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if not isinstance(self.provider, str) or not self.provider.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_11 = "model turn provider cannot be empty"
+            raise ValueError(msg_11)
+        if not isinstance(self.model, str) or not self.model.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_12 = "model turn model cannot be empty"
+            raise ValueError(msg_12)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ApprovalRequested(DomainEvent):
     action_id: ActionId
     reason: str
@@ -384,6 +410,7 @@ Event = (
     | ContextAssembled
     | ArtifactRecorded
     | BudgetDebited
+    | ModelTurnRecorded
     | ApprovalRequested
     | ApprovalGranted
     | ApprovalRejected

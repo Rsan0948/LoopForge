@@ -23,6 +23,7 @@ from loopforge.domain.events import (
     ContextAssembled,
     DomainEvent,
     Event,
+    ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
@@ -83,6 +84,7 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         ContextAssembled,
         ArtifactRecorded,
         BudgetDebited,
+        ModelTurnRecorded,
         ApprovalRequested,
         ApprovalGranted,
         ApprovalRejected,
@@ -425,6 +427,15 @@ def _construct_worker_merged(base: dict[str, Any], data: dict[str, Any]) -> Even
     )
 
 
+def _construct_model_turn_recorded(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ModelTurnRecorded(
+        **base,
+        provider=_required_str(data, "provider"),
+        model=_required_str(data, "model"),
+        action_id=ActionId(_required_str(data, "action_id")),
+    )
+
+
 _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]]] = {
     "RunStarted": _construct_run_started,
     "PlanCreated": _construct_plan_created,
@@ -442,6 +453,7 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "ContextAssembled": _construct_context_assembled,
     "ArtifactRecorded": _construct_artifact_recorded,
     "BudgetDebited": _construct_budget_debited,
+    "ModelTurnRecorded": _construct_model_turn_recorded,
     "ApprovalRequested": _construct_approval_requested,
     "ApprovalGranted": _construct_approval_granted,
     "ApprovalRejected": _construct_approval_rejected,
