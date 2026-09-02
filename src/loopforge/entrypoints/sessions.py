@@ -566,6 +566,7 @@ class InlineProfileFields:
     model: InlineModelFields
     budget: InlineBudgetFields
     sandbox: InlineSandboxFields = field(default_factory=InlineSandboxFields)
+    approval_required_for: tuple[str, ...] = ()
     task_id: str = "server-session"
 
 
@@ -629,6 +630,10 @@ def render_inline_profile_toml(fields: InlineProfileFields) -> str:
         lines.append(f"name = {_toml_str(fields.model.name)}")
     lines.append(f"tier = {_toml_str(fields.model.tier)}")
     lines.append("")
+    if fields.approval_required_for:
+        lines.append("[approval]")
+        lines.append(f"required_for = {_toml_str_list(fields.approval_required_for)}")
+        lines.append("")
     budget = fields.budget
     lines.append("[budget]")
     lines.append(f"max_cost_usd = {float(budget.max_cost_usd)!r}")
@@ -755,6 +760,7 @@ def build_production_bundle_factory(
                     container_image=profile.container_image,
                     environment=profile.environment,
                     limits=profile.limits,
+                    approval_required_for=profile.approval_required_for,
                 )
                 bundle_owned = True
                 return bundle

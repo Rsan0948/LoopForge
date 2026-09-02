@@ -33,6 +33,7 @@ interface InlineForm {
   required: string;
   allowedPrefixes: string;
   requireChange: boolean;
+  gateFileWrites: boolean;
   provider: string;
   modelName: string;
   tier: string;
@@ -50,6 +51,7 @@ function defaultInlineForm(): InlineForm {
     required: "tests",
     allowedPrefixes: "src/ tests/",
     requireChange: false,
+    gateFileWrites: false,
     provider: "scripted",
     modelName: "",
     tier: "standard",
@@ -125,6 +127,9 @@ function buildInlineProfile(form: InlineForm): { error: string } | { profile: In
         max_total_tokens: maxTotalTokens,
         max_elapsed_seconds: maxElapsedSeconds,
       },
+      // The write tools are the local repair stack's only mutation surface;
+      // gating them pauses the run for durable operator approval (PACS-014).
+      approval: form.gateFileWrites ? { required_for: ["write_file", "edit_file"] } : null,
     },
   };
 }
@@ -314,6 +319,14 @@ function NewSessionPanel(): ReactElement {
                   type="checkbox"
                   checked={form.requireChange}
                   onChange={(e) => patch({ requireChange: e.target.checked })}
+                />
+              </label>
+              <label className="field field-inline" title="write_file/edit_file pause the run for durable operator approval">
+                <span>gate file writes</span>
+                <input
+                  type="checkbox"
+                  checked={form.gateFileWrites}
+                  onChange={(e) => patch({ gateFileWrites: e.target.checked })}
                 />
               </label>
               <label className="field">

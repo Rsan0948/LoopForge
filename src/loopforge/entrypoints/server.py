@@ -128,6 +128,12 @@ class InlineBudgetRequest(BaseModel):
     max_elapsed_seconds: float | None = None
 
 
+class InlineApprovalRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    required_for: list[str]
+
+
 class InlineProfileRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -139,6 +145,7 @@ class InlineProfileRequest(BaseModel):
     sandbox: InlineSandboxRequest = Field(default_factory=InlineSandboxRequest)
     model: InlineModelRequest
     budget: InlineBudgetRequest
+    approval: InlineApprovalRequest | None = None
 
 
 class CreateSessionRequest(BaseModel):
@@ -224,6 +231,9 @@ def _inline_fields(request: InlineProfileRequest) -> InlineProfileFields:
             max_iterations=request.budget.max_iterations,
             max_total_tokens=request.budget.max_total_tokens,
             max_elapsed_seconds=request.budget.max_elapsed_seconds,
+        ),
+        approval_required_for=(
+            tuple(request.approval.required_for) if request.approval is not None else ()
         ),
     )
 

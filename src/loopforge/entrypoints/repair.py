@@ -23,7 +23,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from loopforge.adapters.composite_tools import CompositeToolExecutor
+from loopforge.adapters.approval_gate_tools import ApprovalGateTools
+from loopforge.adapters.composite_tools import CompositeToolExecutor, NamedToolExecutor
 from loopforge.adapters.container_sandbox import ContainerSandbox, ContainerSandboxConfig
 from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
 from loopforge.adapters.file_tools import WorkspaceFileTools
@@ -192,6 +193,7 @@ def build_adopted_repair_runtime(  # noqa: PLR0913 - composition roots keep auth
     container_image: str | None = None,
     environment: Mapping[str, str] | None = None,
     limits: SandboxLimits | None = None,
+    approval_required_for: frozenset[str] | None = None,
 ) -> RepairRuntimeBundle:
     """Run a repair task against an existing checkout, without copying it.
 
@@ -229,6 +231,7 @@ def build_adopted_repair_runtime(  # noqa: PLR0913 - composition roots keep auth
         sandbox=sandbox,
         requirements=SandboxRequirements(),
         deps=deps,
+        approval_required_for=approval_required_for or frozenset(),
     )
 
 
@@ -269,15 +272,16 @@ def _materialize_workspace(task: RepairTask, *, workspaces_dir: str | Path) -> W
     return manager.materialize(task.fixture)
 
 
-def _repair_bundle(
+def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
     task: RepairTask,
     *,
     workspace: WorkspacePort,
     sandbox: SandboxPort,
     requirements: SandboxRequirements,
     deps: RepairRuntimeDeps,
+    approval_required_for: frozenset[str] = frozenset(),
 ) -> RepairRuntimeBundle:
-    tools = CompositeToolExecutor(
+    tools: NamedToolExecutor = CompositeToolExecutor(
         (
             WorkspaceFileTools(sandbox, workspace.root),
             WorkspaceGitTools(workspace),
@@ -287,6 +291,11 @@ def _repair_bundle(
             ),
         )
     )
+    if approval_required_for:
+        # Operator-tightened authority (PACS-014): the named tools quiesce
+        # the run on a durable ApprovalRequested; unknown names fail closed
+        # here at wiring time, before any run starts.
+        tools = ApprovalGateTools(tools, required_for=approval_required_for)
     model = deps.model if deps.model is not None else ScriptedModel(scripted_repair_actions(task))
     # The wired model is registered with its honest capabilities and routed
     # through the tiered policy against the workload's code-owned model

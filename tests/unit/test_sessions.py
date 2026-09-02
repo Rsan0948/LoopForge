@@ -785,3 +785,28 @@ def test_shutdown_pauses_drivers_and_closes_bundles(tmp_path: Path) -> None:
     assert factory.sandboxes[-1].destroyed is True
     assert manager.list_sessions()[0]["managed"] is True
     tools.release.set()  # let the abandoned driver thread finish
+
+
+@_REQUIRES_GIT
+def test_production_factory_gates_operator_selected_tools(tmp_path: Path) -> None:
+    repo = _git_repo(tmp_path / "repo")
+    fields = replace(
+        _inline_fields(repo),
+        approval_required_for=("write_file", "edit_file"),
+    )
+    wiring = wiring_from_inline(fields, profiles_dir=tmp_path / "profiles")
+    factory = build_production_bundle_factory(tmp_path / "profiles")
+
+    bundle = factory.build(wiring, InMemoryEventStore())
+    try:
+        assert bundle.runtime.tools.metadata_for("write_file").approval is ApprovalClass.REQUIRED
+        assert bundle.runtime.tools.metadata_for("edit_file").approval is ApprovalClass.REQUIRED
+        assert bundle.runtime.tools.metadata_for("read_file").approval is ApprovalClass.NONE
+    finally:
+        bundle.close()
+
+    # Unknown gated names fail closed at wiring time, before any run starts.
+    bogus = replace(_inline_fields(repo), approval_required_for=("deploy_prod",))
+    bogus_wiring = wiring_from_inline(bogus, profiles_dir=tmp_path / "profiles")
+    with pytest.raises(ValueError, match="not registered"):
+        factory.build(bogus_wiring, InMemoryEventStore())

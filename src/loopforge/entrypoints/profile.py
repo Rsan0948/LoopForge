@@ -40,6 +40,7 @@ _LOCAL_PYTHON_TOKEN: Final = "{python}"
 _ENV_KEY_PATTERN: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _CHECK_KINDS: Final = {kind.name: kind for kind in RepairCommandKind}
 _MODEL_PROVIDERS: Final = ("scripted", "ollama", "deepseek")
+_TOOL_NAME_PATTERN: Final = re.compile(r"[a-z][a-z0-9_]*")
 _MODEL_TIERS: Final = {
     "economy": ModelTier.ECONOMY,
     "standard": ModelTier.STANDARD,
@@ -64,6 +65,8 @@ class LoopProfile:
     model_name: str
     model_tier: ModelTier
     budget: BudgetLimit
+    approval_required_for: frozenset[str]
+    """Tools the operator gates behind durable approval (PACS-014); empty = none."""
 
 
 def load_profile(path: str | Path) -> LoopProfile:  # noqa: PLR0915 - sequential validation pipeline
@@ -133,6 +136,7 @@ def load_profile(path: str | Path) -> LoopProfile:  # noqa: PLR0915 - sequential
         raise ProfileError(msg_6)
 
     budget = _require_budget(raw)
+    approval_required_for = _require_approval(raw)
 
     try:
         task = RepairTask(
@@ -158,6 +162,7 @@ def load_profile(path: str | Path) -> LoopProfile:  # noqa: PLR0915 - sequential
         model_name=model_name,
         model_tier=tier,
         budget=budget,
+        approval_required_for=approval_required_for,
     )
 
 
@@ -366,6 +371,21 @@ def _require_acceptance(
             ),
         ),
     )
+
+
+def _require_approval(raw: dict[str, Any]) -> frozenset[str]:
+    table = _optional_table(raw, "approval")
+    value: object = table.get("required_for", [])
+    if not isinstance(value, list):
+        msg = "approval.required_for must be a list of tool names"
+        raise ProfileError(msg)
+    names: set[str] = set()
+    for item in cast("list[Any]", value):
+        if not isinstance(item, str) or _TOOL_NAME_PATTERN.fullmatch(item) is None:
+            msg_2 = f"approval.required_for entries must be tool names, got {item!r}"
+            raise ProfileError(msg_2)
+        names.add(item)
+    return frozenset(names)
 
 
 def _require_budget(raw: dict[str, Any]) -> BudgetLimit:

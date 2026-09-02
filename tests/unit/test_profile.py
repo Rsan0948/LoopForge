@@ -289,3 +289,30 @@ def test_optional_budget_limits_are_loaded(tmp_path: Path) -> None:
     profile = load_profile(_write_profile(tmp_path, body))
     assert profile.budget.max_total_tokens == 100000
     assert profile.budget.max_elapsed_seconds == 600
+
+
+def test_approval_required_for_is_loaded(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo) + '\n[approval]\nrequired_for = ["write_file", "edit_file"]\n'
+    profile = load_profile(_write_profile(tmp_path, body))
+    assert profile.approval_required_for == frozenset({"write_file", "edit_file"})
+
+
+def test_approval_required_for_defaults_to_empty(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    profile = load_profile(_write_profile(tmp_path, _valid_body(repo)))
+    assert profile.approval_required_for == frozenset()
+
+
+def test_approval_required_for_non_list_is_denied(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo) + '\n[approval]\nrequired_for = "write_file"\n'
+    with pytest.raises(ProfileError, match=r"approval\.required_for"):
+        load_profile(_write_profile(tmp_path, body))
+
+
+def test_approval_required_for_bad_entry_is_denied(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo) + '\n[approval]\nrequired_for = ["Write File!"]\n'
+    with pytest.raises(ProfileError, match=r"approval\.required_for"):
+        load_profile(_write_profile(tmp_path, body))

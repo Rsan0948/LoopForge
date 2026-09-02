@@ -136,6 +136,8 @@ export interface InlineProfile {
     max_total_tokens: number | null;
     max_elapsed_seconds: number | null;
   };
+  /** Operator approval gate (PACS-014): named tools pause for durable approval. */
+  approval: { required_for: string[] } | null;
 }
 
 // -- Errors --------------------------------------------------------------------
