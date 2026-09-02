@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactEle
 import {
   ApiError,
   approveAction,
+  followUp,
   getArtifacts,
   getEvents,
   getSession,
@@ -17,6 +18,7 @@ import {
   type ArtifactInfo,
   type SessionDetail,
 } from "../api";
+import { navigateToSession } from "../App";
 import DiffViewer from "../DiffViewer";
 import { describeEvent, type EventEnvelope } from "../events";
 import { formatClock, formatCost, formatTime } from "../format";
@@ -240,6 +242,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   );
 
   const terminal = detail !== null && TERMINAL_STATUSES.has(detail.status);
+  const canFollowUp = terminal && detail.managed;
   const canStart = detail !== null && !terminal && !detail.driving && detail.managed;
   const canPause = detail !== null && !terminal && detail.driving;
   const canResume = detail !== null && !terminal && !detail.driving && detail.managed;
@@ -255,9 +258,19 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
     runCommand(() => stopSession(runId, summary === "" ? undefined : summary));
   };
 
+  const onFollowUp = (): void => {
+    void (async () => {
+      try {
+        const { run_id } = await followUp(runId);
+        navigateToSession(run_id);
+      } catch (err) {
+        setToast(err instanceof ApiError ? err.detail : String(err));
+      }
+    })();
+  };
+
   const onReject = (event: FormEvent): void => {
-    event.preventDefault();
-    if (pending === null || !rejectReason.trim()) return;
+    event.preventDefault();    if (pending === null || !rejectReason.trim()) return;
     const reason = rejectReason.trim();
     setRejectOpen(false);
     setRejectReason("");
@@ -477,6 +490,15 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
           >
             amend objective…
           </button>
+          {canFollowUp && (
+            <button
+              type="button"
+              title="Create a new session on the same repository, seeded with a consolidated report from this finished run. You review the objective and press start — nothing auto-chains."
+              onClick={onFollowUp}
+            >
+              follow up →
+            </button>
+          )}
         </div>
         {amendOpen && detail !== null && (
           <form onSubmit={onAmend} className="amend-panel">

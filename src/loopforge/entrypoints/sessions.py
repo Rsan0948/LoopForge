@@ -37,7 +37,7 @@ import os
 import threading
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -50,6 +50,7 @@ from loopforge.domain.events import Event
 from loopforge.domain.state import RunState, replay
 from loopforge.domain.types import ActionId, RunId, RunStatus
 from loopforge.entrypoints.cli import build_deepseek_model, build_ollama_model
+from loopforge.entrypoints.followup import consolidate_follow_up_report
 from loopforge.entrypoints.profile import LoopProfile, ProfileError, load_profile
 from loopforge.entrypoints.repair import (
     RepairRuntimeBundle,
@@ -480,6 +481,36 @@ class SessionManager:
                 session.bundle.workspace.reset()
             else:
                 session.bundle.workspace.checkout(paths)
+
+    def follow_up(self, run_id: RunId | str) -> str:
+        """Create a quiescent successor session seeded with a terminal run's report.
+
+        The follow-up clones the source run's wiring (same repository,
+        profile, model, and budgets) with the objective extended by a
+        bounded, deterministic report consolidated from the durable event
+        stream (PACS-014b). The new session is left READY but undriven:
+        the operator reviews the seeded objective and presses start —
+        nothing auto-chains. Denied for non-terminal runs (the source must
+        be finished) and unmanaged runs (there is no wiring to clone). The
+        repository-exclusivity guard passes because the source run is
+        terminal.
+        """
+        rid = RunId(str(run_id))
+        state = self.state(rid)
+        if not state.status.is_terminal:
+            msg = f"run {rid} is {state.status.value}; follow-up requires a terminal (finished) run"
+            raise SessionStateError(msg)
+        wiring = self.wiring(rid)
+        if wiring is None:
+            msg_2 = f"run {rid} is unmanaged; there is no wiring to follow up from"
+            raise UnmanagedRunError(msg_2)
+        report = consolidate_follow_up_report(str(rid), self.events(rid), state)
+        successor = replace(
+            wiring,
+            objective=f"{state.objective}\n\n{report}",
+            created_at=datetime.now(UTC).isoformat(),
+        )
+        return self.create_session(successor)
 
     # -- projections ----------------------------------------------------------
 

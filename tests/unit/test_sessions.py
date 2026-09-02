@@ -561,6 +561,62 @@ def test_start_driving_denied_on_terminal_and_unknown_runs(tmp_path: Path) -> No
     assert manager.resume(run_id).status is RunStatus.SUCCEEDED
 
 
+# --- Follow-up (PACS-014b) -----------------------------------------------------
+
+
+def test_follow_up_clones_wiring_with_a_report_seeded_objective(tmp_path: Path) -> None:
+    factory = _plain_factory()
+    manager = _manager(tmp_path, factory)
+    run_id = manager.create_session(_wiring())
+    manager.start_driving(run_id)
+    _wait_for(lambda: manager.state(run_id).status is RunStatus.SUCCEEDED)
+
+    successor_id = manager.follow_up(run_id)
+
+    assert successor_id != run_id
+    assert manager.state(successor_id).status is RunStatus.READY
+    source_wiring = manager.wiring(run_id)
+    successor_wiring = manager.wiring(successor_id)
+    assert source_wiring is not None
+    assert successor_wiring is not None
+    assert successor_wiring.repository == source_wiring.repository
+    assert successor_wiring.profile_source == source_wiring.profile_source
+    assert successor_wiring.max_iterations == source_wiring.max_iterations
+    assert successor_wiring.created_at != source_wiring.created_at
+    objective = successor_wiring.objective
+    assert objective.startswith("fix the checks")
+    assert f"Follow-up report from run {run_id}" in objective
+    assert "success_verified" in objective
+    assert "build on its verified state" in objective
+    assert "probe x1" in objective
+    # The new session is quiescent: the operator reviews and starts it.
+    listing = {entry["run_id"]: entry for entry in manager.list_sessions()}
+    assert listing[successor_id]["driving"] is False
+
+
+def test_follow_up_is_denied_for_a_non_terminal_run(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+    run_id = manager.create_session(_wiring())
+
+    with pytest.raises(SessionStateError, match="follow-up requires a terminal"):
+        manager.follow_up(run_id)
+
+
+def test_follow_up_is_denied_for_an_unmanaged_run(tmp_path: Path) -> None:
+    store = FanOutEventStore(InMemoryEventStore())
+    factory = _plain_factory()
+    manager_a = _manager(tmp_path, factory, store=store)
+    run_id = manager_a.create_session(_wiring())
+    manager_a.start_driving(run_id)
+    _wait_for(lambda: manager_a.state(run_id).status is RunStatus.SUCCEEDED)
+
+    manager_b = _manager(
+        tmp_path, factory, store=store, registry_path=tmp_path / "other" / "sessions.json"
+    )
+    with pytest.raises(UnmanagedRunError, match="no wiring to follow up from"):
+        manager_b.follow_up(run_id)
+
+
 def test_pause_is_bounded_while_a_step_is_in_flight(tmp_path: Path) -> None:
     tools = BlockingTools([_metadata("probe", ApprovalClass.NONE)])
     factory = FakeBundleFactory(

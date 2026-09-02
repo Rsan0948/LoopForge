@@ -369,6 +369,41 @@ def test_create_session_inline_round_trips_container_image(tmp_path: Path) -> No
     assert 'container_image = "python:3.12-alpine"' in persisted[0].read_text(encoding="utf-8")
 
 
+# --- Follow-up (PACS-014b) -----------------------------------------------------
+
+
+def test_follow_up_creates_a_successor_session(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+        client.post(f"/api/sessions/{run_id}/start")
+        _wait_for_status(client, run_id, "succeeded")
+
+        response = client.post(f"/api/sessions/{run_id}/follow-up")
+        assert response.status_code == 201, response.text
+        successor_id = response.json()["run_id"]
+        assert successor_id != run_id
+
+        detail = _detail(client, successor_id)
+        assert detail["status"] == "ready"
+        assert detail["objective"].startswith("Fix the failing checks.")
+        assert f"Follow-up report from run {run_id}" in detail["objective"]
+        assert detail["repository"] == str(repo)
+
+
+def test_follow_up_is_denied_for_non_terminal_and_unknown_runs(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+
+        live = client.post(f"/api/sessions/{run_id}/follow-up")
+        assert live.status_code == 409, live.text
+        assert "terminal" in live.json()["detail"]
+
+        missing = client.post("/api/sessions/run_missing/follow-up")
+        assert missing.status_code == 404, missing.text
+
+
 def test_create_session_via_profile_path(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     profile_path = tmp_path / "profile.toml"

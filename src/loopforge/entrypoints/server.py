@@ -459,6 +459,9 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
         manager.rollback(run_id, paths)
         return _status_response(run_id)
 
+    def follow_up_route(run_id: str) -> dict[str, str]:
+        return {"run_id": manager.follow_up(run_id)}
+
     def profiles_route() -> dict[str, object]:
         profiles: list[dict[str, str]] = []
         for directory in (profiles_dir, Path.cwd() / ".loopforge"):
@@ -483,6 +486,9 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_route("/api/sessions/{run_id}/reject", reject_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/instructions", instructions_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/rollback", rollback_route, methods=["POST"])
+    app.add_api_route(
+        "/api/sessions/{run_id}/follow-up", follow_up_route, methods=["POST"], status_code=201
+    )
 
     # -- WebSocket: live event stream --------------------------------------------
 

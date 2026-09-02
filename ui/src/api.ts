@@ -280,6 +280,12 @@ export function rollbackRun(runId: string, paths?: string[]): Promise<StatusResp
   );
 }
 
+/** Follow-up (PACS-014b): clone a TERMINAL run's wiring into a quiescent
+ *  successor session whose objective carries the consolidated report. */
+export function followUp(runId: string): Promise<{ run_id: string }> {
+  return post<{ run_id: string }>(`/api/sessions/${encodeURIComponent(runId)}/follow-up`);
+}
+
 export function sessionWsUrl(runId: string): string {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${window.location.host}/ws/sessions/${encodeURIComponent(runId)}`;
