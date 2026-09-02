@@ -37,7 +37,40 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-013.
+Completed: PACS-001 through PACS-014.
+
+PACS-014 (operator command center, 2026-09-02) gave the operator a durable
+authority channel and a live console without ceding any runtime authority.
+Scope was confirmed up front as operator control + console only — the
+evaluator and evidence-grounded Reflexion portions of the originally planned
+PACS-014 are deferred (operator decision 1, dated). The schema-v1 event
+catalog grew 22→24 (operator-signed-off): `ApprovalRejected` and
+`OperatorInstruction` through all five touchpoints, reusing
+`WAITING_FOR_APPROVAL` for the pause (no new PAUSED status). Approval-gated
+tools quiesce a run on durable `ApprovalRequested`; runtime
+`grant_approval`/`reject_approval`/`add_operator_instruction` move it, with
+permissions re-authorized on the approved path (a grant never expands
+authority, and is spent by exactly one completed execution — a live-found
+stream-poisoning defect, fixed and pinned). Production gating is operator
+wiring: `ApprovalGateTools` + profile `[approval] required_for` (adapters
+honestly classify `approval=NONE`; unknown gated names fail closed at bundle
+build). A runs-index projection (`StateStorePort.list_runs`, store schema v2
+with migration precedent) feeds session enumeration; a `PostgresEventStore`
+mirrors SQLite semantics exactly (append-only triggers, compare-and-append,
+12-test live conformance suite, docker-compose Postgres). The FastAPI server
+(D2/ADR-0010 dependency relaxation) is projection + command issuer only:
+one driver thread per run (D5), fan-out strictly after durable append (D6),
+restart rediscovery from the runs index + session registry (D9), no auth on
+127.0.0.1 (D10). The `ui/` Vite+React+TS console (sessions list, WS-driven
+session detail with reconcile-on-reconnect, approval banner, diff viewer,
+selective rollback, objective amendment) builds to static assets mounted by
+the backend. The §10 live round-trip passed end-to-end: local Ollama
+session paused on the approval-gated write, approved in the GUI, executed
+in the container sandbox, verifier-granted success, patch in the diff
+viewer, selective rollback of one file, and server restart resuming the
+session from Postgres. Adversarial review ran continuously; every finding
+fixed and pinned — see `docs/process/cycles/PACS-014-operator-command-center.md`.
+Checkpoint committed as `29d6e85`.
 
 PACS-013 (orchestrator/worker and worktree isolation, 2026-08-30) added bounded
 multi-agent execution as an opt-in, benchmarkable path without ceding any
@@ -317,18 +350,21 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-013-orchestrator-worker-and-worktree-isolation.md`
+- `docs/process/cycles/PACS-014-operator-command-center.md`
 
 ## Next authorized work
 
-None. PACS-014 through PACS-017 are PLANNED, not active.
+None. PACS-015 through PACS-017 are PLANNED, not active; the evaluator +
+evidence-grounded Reflexion remainder of the original PACS-014 scope is also
+available as an explicitly named follow-on.
 
-The PACS-013 checkpoint is committed as `5bb4f05` (`feat: add
-orchestrator/worker execution with worktree isolation (PACS-013)`); the
-schema-v1 catalog extension 19→22 was explicitly signed off as operator
-decision 1 of the cycle. The operator may manually initiate PACS-014
-(evaluator + evidence-grounded Reflexion + async HITL) or another explicitly
-named scope.
+PACS-014 (operator command center) closed 2026-09-02 at 1592 tests passing
+(18 platform-gated skips), 95% branch coverage, all lint/type/import gates
+green, UI typecheck/build green, and the §10 live operator round-trip
+complete against Postgres in Docker and a local Ollama model. The schema-v1
+catalog extension 22→24 was explicitly signed off as operator decision 2 of
+the cycle; the serving-plane dependency relaxation is ADR-0010 (operator
+decision 3). The operator may manually initiate the next cycle.
 
 ### Operator-authorized addition (2026-09-01): profile-driven `loop` command
 

@@ -84,3 +84,23 @@ python -m loopforge.entrypoints.cli demo
 ```
 
 The repository is designed to move to `uv` as the canonical environment manager once the first lockfile is generated in a network-enabled development environment.
+
+## Operator command center (PACS-014)
+
+A local, trusted-operator console (REST + WebSocket API and a React SPA) drives
+runs as durable sessions with an approval gate for operator-selected tools.
+Postgres is the default session store and runs in Docker:
+
+```bash
+docker compose up -d loopforge-db   # postgres:17 on 127.0.0.1:5432 (loopforge/loopforge)
+cd ui && npm ci && npm run build && cd ..
+.venv/bin/python -m loopforge.entrypoints.cli serve \
+  --dsn postgresql://loopforge:loopforge@127.0.0.1:5432/loopforge \
+  --static-dir ui/dist
+# open http://127.0.0.1:8123
+```
+
+The server binds 127.0.0.1 only and has no authentication — it is a
+trusted-operator local tool. `--sqlite PATH` swaps the store for a local
+SQLite file with identical semantics. See `ui/README.md` and
+`docs/process/cycles/PACS-014-operator-command-center.md`.
