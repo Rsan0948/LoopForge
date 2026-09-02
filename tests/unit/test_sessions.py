@@ -35,10 +35,12 @@ from loopforge.adapters.scripted import (
 from loopforge.application.runtime import Runtime, UnknownRunError
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
+from loopforge.domain.events import Event, RunStopped
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import SandboxCapabilities
+from loopforge.domain.state import RunRecord
 from loopforge.domain.tooling import (
     ApprovalClass,
     IdempotencyClass,
@@ -53,6 +55,7 @@ from loopforge.domain.types import (
     RiskLevel,
     RunId,
     RunStatus,
+    StopReason,
     WorkspaceId,
 )
 from loopforge.domain.workspace import WorkspaceStatus
@@ -68,6 +71,7 @@ from loopforge.entrypoints.sessions import (
     InlineSandboxFields,
     SessionManager,
     SessionRegistry,
+    SessionRegistryError,
     SessionStateError,
     SessionWiring,
     UnmanagedRunError,
@@ -79,6 +83,7 @@ from loopforge.ports.model import ModelTurn
 from loopforge.ports.sandbox import SandboxCommandResult
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolError
+from loopforge.ports.workspace import WorkspaceError
 
 NOW = datetime(2026, 9, 1, tzinfo=UTC)
 
@@ -126,6 +131,11 @@ class FakeWorkspace:
         return ""
 
     def checkout(self, paths: tuple[str, ...]) -> None:
+        # Mirror the production contract: an empty selection is an error,
+        # never a silent no-op.
+        if not paths:
+            msg = "checkout requires at least one path"
+            raise WorkspaceError(msg)
         self.checkout_calls.append(tuple(paths))
 
     def reset(self) -> None:
@@ -308,7 +318,11 @@ def test_registry_rejects_a_corrupted_file(tmp_path: Path) -> None:
     path = tmp_path / "sessions.json"
     path.write_text(json.dumps(["not", "a", "mapping"]), encoding="utf-8")
 
-    with pytest.raises(TypeError, match="not a JSON object"):
+    with pytest.raises(SessionRegistryError, match="not a JSON object"):
+        SessionRegistry(path).as_dict()
+
+    path.write_text("{not json", encoding="utf-8")
+    with pytest.raises(SessionRegistryError, match="not valid JSON"):
         SessionRegistry(path).as_dict()
 
 
@@ -329,7 +343,7 @@ def test_registry_rejects_malformed_wiring_entries(tmp_path: Path) -> None:
     for label, entry in cases.items():
         path = tmp_path / f"{label}.json"
         path.write_text(json.dumps({"run_1": entry}), encoding="utf-8")
-        with pytest.raises(TypeError, match="session wiring"):
+        with pytest.raises(SessionRegistryError, match="session registry entry drifted"):
             SessionRegistry(path).as_dict()
 
 
@@ -810,3 +824,198 @@ def test_production_factory_gates_operator_selected_tools(tmp_path: Path) -> Non
     bogus_wiring = wiring_from_inline(bogus, profiles_dir=tmp_path / "profiles")
     with pytest.raises(ValueError, match="not registered"):
         factory.build(bogus_wiring, InMemoryEventStore())
+
+
+# --- Hardening: lifecycle cleanup, repository exclusivity, shutdown locking ----
+
+
+class _FailingStore:
+    """StateStorePort-conformant stub whose append always fails (store down)."""
+
+    def append(self, event: Event, *, expected_version: int) -> int:
+        del event, expected_version
+        msg = "store down"
+        raise RuntimeError(msg)
+
+    def events_for(self, run_id: RunId) -> tuple[Event, ...]:
+        del run_id
+        return ()
+
+    def current_version(self, run_id: RunId) -> int:
+        del run_id
+        return 0
+
+    def list_runs(self) -> tuple[RunRecord, ...]:
+        return ()
+
+
+def test_create_session_closes_the_bundle_when_start_fails(tmp_path: Path) -> None:
+    """A failed runtime.start must not leak the freshly built bundle."""
+    factory = _plain_factory()
+    manager = _manager(tmp_path, factory, store=FanOutEventStore(_FailingStore()))
+
+    with pytest.raises(RuntimeError, match="store down"):
+        manager.create_session(_wiring())
+
+    assert len(factory.bundles) == 1
+    assert factory.sandboxes[0].destroyed is True
+
+
+def test_create_session_tears_down_when_registration_fails(tmp_path: Path) -> None:
+    """A registry failure must never leave a live-but-unmanaged run behind."""
+
+    class _PutFailingRegistry(SessionRegistry):
+        """Registry whose put fails (disk full) while reads still work."""
+
+        def put(self, run_id: str, wiring: SessionWiring) -> None:
+            del run_id, wiring
+            msg = "disk full"
+            raise OSError(msg)
+
+    store = FanOutEventStore(InMemoryEventStore())
+    factory = _plain_factory()
+    manager = SessionManager(
+        store,
+        _PutFailingRegistry(tmp_path / "sessions.json"),
+        factory,
+    )
+
+    with pytest.raises(OSError, match="disk full"):
+        manager.create_session(_wiring())
+
+    # The bundle is closed, the durable run is cancelled (never left READY),
+    # and no live session lingers in memory.
+    assert factory.sandboxes[0].destroyed is True
+    (run_record,) = store.list_runs()
+    assert run_record.status is RunStatus.CANCELLED
+    stream = store.events_for(run_record.run_id)
+    stopped = [event for event in stream if isinstance(event, RunStopped)]
+    assert [event.reason for event in stopped] == [StopReason.CANCELLED]
+    # The run is visible but NOT drivable (it was never registered) — and
+    # terminal besides.
+    (entry,) = manager.list_sessions()
+    assert entry["managed"] is False
+    assert entry["status"] == "cancelled"
+
+
+def test_second_session_on_the_same_repository_is_denied(tmp_path: Path) -> None:
+    """One active session per adopted checkout (deny + allow pair)."""
+    factory = _plain_factory()
+    manager = _manager(tmp_path, factory)
+    first = manager.create_session(_wiring())
+
+    with pytest.raises(SessionStateError, match="already has an active session"):
+        manager.create_session(_wiring())
+
+    # Once the first run is terminal the claim is released.
+    manager.stop(first)
+    second = manager.create_session(_wiring())
+
+    assert second != first
+    manager.shutdown()
+
+
+def test_repository_claim_survives_a_restart(tmp_path: Path) -> None:
+    """The exclusivity claim derives from the durable registry, not memory."""
+    store = FanOutEventStore(InMemoryEventStore())
+    registry_path = tmp_path / "sessions.json"
+    factory = _plain_factory()
+    manager_a = _manager(tmp_path, factory, store=store, registry_path=registry_path)
+    manager_a.create_session(_wiring())
+    manager_a.shutdown()
+
+    # A fresh manager over the same store + registry still sees the live run.
+    manager_b = _manager(tmp_path, factory, store=store, registry_path=registry_path)
+
+    with pytest.raises(SessionStateError, match="already has an active session"):
+        manager_b.create_session(_wiring())
+
+
+def test_registry_sweeps_stale_tmp_files_on_init(tmp_path: Path) -> None:
+    path = tmp_path / "sessions.json"
+    stale = tmp_path / "sessions.json.4242.tmp"
+    stale.write_text("garbage from a crashed write", encoding="utf-8")
+
+    SessionRegistry(path)
+
+    assert not stale.exists()
+
+
+def test_shutdown_does_not_close_the_bundle_under_an_in_flight_step(tmp_path: Path) -> None:
+    """bundle.close() serializes behind a live step via the per-run lock."""
+    tools = BlockingTools([_metadata("probe", ApprovalClass.NONE)])
+    factory = FakeBundleFactory(
+        actions=[_proposal("a1", "probe")],
+        tools_override=tools,
+    )
+    manager = _manager(tmp_path, factory, join_timeout=0.05)
+    run_id = manager.create_session(_wiring())
+    manager.start_driving(run_id)
+    assert tools.entered.wait(timeout=5)
+
+    shutdown_thread = threading.Thread(target=manager.shutdown)
+    shutdown_thread.start()
+    # Well past the bounded driver join: the step is still in flight, so the
+    # bundle (and its sandbox) must NOT be torn down underneath it.
+    time.sleep(0.3)
+    assert factory.sandboxes[0].destroyed is False
+
+    tools.release.set()
+    shutdown_thread.join(timeout=10)
+
+    assert not shutdown_thread.is_alive()
+    assert factory.sandboxes[0].destroyed is True
+
+
+@dataclass(slots=True)
+class _BarrierFactory(FakeBundleFactory):
+    """FakeBundleFactory whose build blocks until two builders race inside it."""
+
+    armed: bool = False
+    barrier: threading.Barrier = field(default_factory=lambda: threading.Barrier(2), repr=False)
+
+    def build(self, wiring: SessionWiring, store: StateStorePort) -> RepairRuntimeBundle:
+        if self.armed:
+            self.barrier.wait(timeout=10)
+        return super().build(wiring, store)
+
+
+def test_ensure_session_rebuild_race_keeps_one_session_and_closes_the_loser(
+    tmp_path: Path,
+) -> None:
+    """Two concurrent bundle rebuilds: exactly one survives; the loser is closed."""
+    factory = _BarrierFactory(
+        actions=[_proposal("a1", "probe")],
+        results=[ToolResult(ok=True, observation="all tests pass")],
+        tool_metadata=[_metadata("probe", ApprovalClass.NONE)],
+    )
+    manager = _manager(tmp_path, factory)
+    run_id = manager.create_session(_wiring())
+    manager.shutdown()  # evict the live session; store + registry persist
+
+    factory.armed = True
+    results: list[object] = []
+    errors: list[BaseException] = []
+
+    def race() -> None:
+        try:
+            results.append(
+                manager._ensure_session(RunId(run_id))  # pyright: ignore[reportPrivateUsage]
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=race) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=15)
+
+    assert errors == []
+    assert len(results) == 2
+    assert results[0] is results[1]
+    # create + two racing rebuilds = three bundles; exactly one racing loser
+    # was closed (sandboxes[0] was already closed by the first shutdown).
+    assert len(factory.bundles) == 3
+    assert [sandbox.destroyed for sandbox in factory.sandboxes[1:]].count(True) == 1
+    manager.shutdown()

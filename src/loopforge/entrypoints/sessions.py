@@ -36,6 +36,7 @@ import json
 import os
 import threading
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -67,6 +68,15 @@ class SessionStateError(RuntimeError):
 
 class UnmanagedRunError(RuntimeError):
     """Raised when a driving command targets a run the server does not manage."""
+
+
+class SessionRegistryError(RuntimeError):
+    """Raised when the on-disk session registry cannot be decoded.
+
+    The registry fails closed on read: a corrupt file is never silently
+    ignored (that would misreport managed sessions as unmanaged), and the
+    operator must repair or remove the file.
+    """
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -104,16 +114,28 @@ class SessionRegistry:
     def __init__(self, path: str | Path) -> None:
         self._path = Path(path)
         self._lock = threading.Lock()
+        # Sweep orphaned tmp files from crashed writes (write-tmp-then-rename
+        # leaves one behind when the process dies between the two steps).
+        for stale in self._path.parent.glob(f"{self._path.name}.*.tmp"):
+            stale.unlink(missing_ok=True)
 
     def _read_all(self) -> dict[str, SessionWiring]:
         if not self._path.is_file():
             return {}
-        raw: object = json.loads(self._path.read_text(encoding="utf-8"))
+        try:
+            raw: object = json.loads(self._path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            msg = f"session registry is not valid JSON: {self._path} ({exc})"
+            raise SessionRegistryError(msg) from exc
         if not isinstance(raw, dict):
-            msg = f"session registry is not a JSON object: {self._path}"
-            raise TypeError(msg)
+            msg_2 = f"session registry is not a JSON object: {self._path}"
+            raise SessionRegistryError(msg_2)
         entries = cast("dict[object, object]", raw)
-        return {str(run_id): _wiring_from_dict(data) for run_id, data in entries.items()}
+        try:
+            return {str(run_id): _wiring_from_dict(data) for run_id, data in entries.items()}
+        except TypeError as exc:
+            msg_3 = f"session registry entry drifted from the wiring schema: {exc}"
+            raise SessionRegistryError(msg_3) from exc
 
     def get(self, run_id: str) -> SessionWiring | None:
         with self._lock:
@@ -246,6 +268,8 @@ class SessionManager:
         self._join_timeout = join_timeout_seconds
         self._lock = threading.Lock()
         self._sessions: dict[RunId, _Session] = {}
+        # Creates in flight by resolved repository path (see create_session).
+        self._creating: set[str] = set()
 
     # -- session creation ---------------------------------------------------
 
@@ -253,14 +277,66 @@ class SessionManager:
         """Build a bundle, durably start the run, and register the session.
 
         ``runtime.start`` leaves the run durable and quiescent (READY) — no
-        driving begins until ``start_driving``/``resume`` is called.
+        driving begins until ``start_driving``/``resume`` is called. One
+        active (non-terminal) session may adopt a given checkout at a time;
+        a second create for the same repository is denied while the first
+        session's run is still live. The claim is derived from the durable
+        registry and runs index (not process memory), so it survives server
+        restarts.
         """
-        bundle = self._factory.build(wiring, self._store)
-        run_id = bundle.runtime.start(wiring.objective)
+        repository_key = str(Path(wiring.repository).expanduser().resolve())
         with self._lock:
-            self._sessions[run_id] = _Session(bundle=bundle)
-        self._registry.put(str(run_id), wiring)
-        return str(run_id)
+            claimant = self._active_repository_claim(repository_key)
+            if claimant is not None:
+                msg = (
+                    f"repository {repository_key} already has an active session "
+                    f"({claimant}); stop it before starting another"
+                )
+                raise SessionStateError(msg)
+            if repository_key in self._creating:
+                msg_2 = f"repository {repository_key} already has a session being created"
+                raise SessionStateError(msg_2)
+            self._creating.add(repository_key)
+        try:
+            bundle = self._factory.build(wiring, self._store)
+            try:
+                run_id = bundle.runtime.start(wiring.objective)
+            except BaseException:
+                # A failed start must not leak the freshly built bundle
+                # (model HTTP client, container sandbox).
+                bundle.close()
+                raise
+            with self._lock:
+                self._sessions[run_id] = _Session(bundle=bundle)
+            try:
+                self._registry.put(str(run_id), wiring)
+            except BaseException:
+                # Registration failed: tear the session down so the durable
+                # run is never left live-but-unmanaged after a restart.
+                with self._lock:
+                    self._sessions.pop(run_id, None)
+                # Best-effort cleanup must not mask the registration failure.
+                with suppress(Exception):
+                    bundle.runtime.cancel(run_id, summary="session registration failed")
+                bundle.close()
+                raise
+            return str(run_id)
+        finally:
+            with self._lock:
+                self._creating.discard(repository_key)
+
+    def _active_repository_claim(self, repository_key: str) -> RunId | None:
+        """The live (non-terminal) managed run adopting this checkout, if any."""
+        wiring_by_run = self._registry.as_dict()
+        for record in self._store.list_runs():
+            if record.status.is_terminal:
+                continue
+            wiring = wiring_by_run.get(str(record.run_id))
+            if wiring is None:
+                continue
+            if str(Path(wiring.repository).expanduser().resolve()) == repository_key:
+                return record.run_id
+        return None
 
     # -- driving ------------------------------------------------------------
 
@@ -473,7 +549,11 @@ class SessionManager:
             driver = session.driver
             if driver is not None and driver.is_alive():
                 driver.join(timeout=self._join_timeout)
-            session.bundle.close()
+            # Close under the per-run lock: an in-flight step holds it, so the
+            # bundle (and its container sandbox) is never torn down underneath
+            # a running step — close serializes behind the step instead.
+            with session.lock:
+                session.bundle.close()
         with self._lock:
             self._sessions.clear()
 
@@ -501,10 +581,14 @@ class SessionManager:
         session = _Session(bundle=bundle)
         with self._lock:
             existing = self._sessions.get(run_id)
-            if existing is not None:
-                bundle.close()
-                return existing
-            self._sessions[run_id] = session
+            if existing is None:
+                self._sessions[run_id] = session
+        if existing is not None:
+            # Loser of a double-build race: closed AFTER releasing the
+            # manager-wide lock so container teardown never stalls unrelated
+            # sessions.
+            bundle.close()
+            return existing
         return session
 
 
@@ -615,8 +699,13 @@ def render_inline_profile_toml(fields: InlineProfileFields) -> str:
     if sandbox.container_image is not None:
         lines.append(f"container_image = {_toml_str(sandbox.container_image)}")
     if sandbox.environment:
+        # Keys are quoted too: a raw key containing a newline would inject
+        # arbitrary TOML lines (e.g. an extra [[checks]] allowlist entry).
+        # Quoted keys stay one token, and load_profile's environment-key
+        # validation then fails closed on any key outside its pattern.
         pairs = ", ".join(
-            f"{key} = {_toml_str(value)}" for key, value in sorted(sandbox.environment.items())
+            f"{_toml_str(key)} = {_toml_str(value)}"
+            for key, value in sorted(sandbox.environment.items())
         )
         lines.append(f"environment = {{ {pairs} }}")
     if sandbox.max_memory_bytes is not None:
@@ -652,11 +741,26 @@ def _inline_profile_path(profiles_dir: Path, toml_text: str) -> Path:
 
 
 def _validate_inline_toml(toml_text: str, profiles_dir: Path) -> LoopProfile:
-    """Persist the inline TOML under the server's profiles dir and validate it."""
+    """Persist the inline TOML under the server's profiles dir and validate it.
+
+    Validation runs BEFORE the digest-named file appears: a rejected profile
+    must never linger in ``profiles_dir`` (it would show up in the profiles
+    listing despite never having created a session). The write goes to a
+    sibling tmp file first and is renamed into place only after
+    ``load_profile`` accepts it; the digest name makes the rename idempotent
+    across restarts.
+    """
     profiles_dir.mkdir(parents=True, exist_ok=True)
     path = _inline_profile_path(profiles_dir, toml_text)
-    path.write_text(toml_text, encoding="utf-8")
-    return load_profile(path)
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(toml_text, encoding="utf-8")
+    try:
+        profile = load_profile(tmp_path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    tmp_path.replace(path)
+    return profile
 
 
 def wiring_from_inline(fields: InlineProfileFields, *, profiles_dir: Path) -> SessionWiring:
