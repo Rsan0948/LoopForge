@@ -602,6 +602,36 @@ def test_amending_instruction_edges_to_the_requirement() -> None:
     ) in edge_set
 
 
+def test_requirement_node_exposes_the_parent_run_link_for_lineage() -> None:
+    events: tuple[Event, ...] = (
+        RunStarted(
+            event_id=_event_id(1),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=1,
+            objective="continue the repair",
+            parent_run_id=RunId("run-parent"),
+        ),
+    )
+
+    graph = build_provenance_graph(events)
+
+    assert graph.node("requirement:1").attribute("parent_run_id") == "run-parent"
+
+
+def test_root_requirement_node_omits_the_parent_run_link() -> None:
+    # Root runs carry no lineage fabrications: the attribute is absent, not empty.
+    events: tuple[Event, ...] = (
+        RunStarted(
+            event_id=_event_id(1), run_id=RUN, occurred_at=NOW, sequence=1, objective="repair"
+        ),
+    )
+
+    graph = build_provenance_graph(events)
+
+    assert graph.node("requirement:1").attribute("parent_run_id") is None
+
+
 def test_worker_lifecycle_nodes_correlate_in_order() -> None:
     events: tuple[Event, ...] = (
         RunStarted(

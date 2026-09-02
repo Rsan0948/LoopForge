@@ -148,17 +148,23 @@ class Runtime:
         run_id = self.start(objective)
         return self.resume(run_id)
 
-    def start(self, objective: str) -> RunId:
-        """Create a durable, quiescent run stream without beginning tool execution."""
+    def start(self, objective: str, *, parent_run_id: RunId | None = None) -> RunId:
+        """Create a durable, quiescent run stream without beginning tool execution.
+
+        ``parent_run_id`` (PACS-015) durably links a follow-up successor to
+        the terminal run it was seeded from; the operator console derives run
+        lineages from it. It is lineage metadata only — never authority.
+        """
         run_id = RunId(f"run_{uuid4().hex[:12]}")
         self._persist(
             run_id,
-            lambda event_id, rid, occurred_at, sequence: RunStarted(
+            lambda event_id, rid, occurred_at, sequence, parent=parent_run_id: RunStarted(
                 event_id=event_id,
                 run_id=rid,
                 occurred_at=occurred_at,
                 sequence=sequence,
                 objective=objective,
+                parent_run_id=parent,
             ),
         )
         self._persist_plan(run_id, "Execute bounded actions until verifier passes.")

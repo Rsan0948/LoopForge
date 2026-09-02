@@ -380,6 +380,15 @@ EXAMPLES: tuple[Event, ...] = (
         model="devstral-small-2:latest",
         action_id=ActionId("a1"),
     ),
+    # Nullable-field variant exercising the PACS-015 lineage link.
+    RunStarted(
+        event_id=EventId("e29"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=29,
+        objective="continue the repair",
+        parent_run_id=RunId("parent-run-1"),
+    ),
 )
 
 (
@@ -411,6 +420,7 @@ EXAMPLES: tuple[Event, ...] = (
     APPROVAL_REJECTED,
     OPERATOR_INSTRUCTION,
     MODEL_TURN_RECORDED,
+    RUN_STARTED_WITH_PARENT,
 ) = EXAMPLES
 
 
@@ -473,7 +483,8 @@ def test_round_trip_preserves_every_event_type(event: Event) -> None:
 def test_encode_produces_byte_exact_canonical_envelope() -> None:
     assert CODEC.encode(RUN_STARTED) == (
         '{"event":{"caused_by":null,"event_id":"e01","objective":"repair auth",'
-        '"occurred_at":"2026-08-22T12:30:15+00:00","run_id":"run-json","sequence":1},'
+        '"occurred_at":"2026-08-22T12:30:15+00:00","parent_run_id":null,'
+        '"run_id":"run-json","sequence":1},'
         '"event_type":"RunStarted","schema_version":1}'
     )
 
@@ -564,6 +575,19 @@ def test_decode_rejects_mistyped_required_strings(
 ) -> None:
     with pytest.raises(TypeError, match=match):
         CODEC.decode(_mutated_body(event, key, value, section=section))
+
+
+def test_decode_run_started_decodes_a_missing_parent_run_id_as_none() -> None:
+    # Pre-PACS-015 payloads simply lack the key; they must keep decoding.
+    decoded = CODEC.decode(_mutated_body(RUN_STARTED, "parent_run_id", _MISSING))
+
+    assert isinstance(decoded, RunStarted)
+    assert decoded.parent_run_id is None
+
+
+def test_decode_run_started_rejects_a_mistyped_parent_run_id() -> None:
+    with pytest.raises(TypeError, match="parent_run_id must be a string or null"):
+        CODEC.decode(_mutated_body(RUN_STARTED, "parent_run_id", 7))
 
 
 def test_decode_model_turn_recorded_rejects_blank_identity() -> None:

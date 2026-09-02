@@ -52,6 +52,7 @@ export interface ContextItemSnapshot {
 
 export interface RunStartedPayload extends EventBase {
   objective: string;
+  parent_run_id: string | null;
 }
 export interface PlanCreatedPayload extends EventBase {
   plan: string;

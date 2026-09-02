@@ -91,9 +91,12 @@ def _node_for(event: Event) -> ProvenanceNode:  # noqa: PLR0912, PLR0915 - the f
     summary: str
     attributes: tuple[tuple[str, str], ...] = ()
     match event:
-        case RunStarted(objective=objective):
+        case RunStarted(objective=objective, parent_run_id=parent_run_id):
             kind = ProvenanceNodeKind.REQUIREMENT
             summary = _truncate(objective)
+            attributes = _attributes(
+                parent_run_id=str(parent_run_id) if parent_run_id is not None else None
+            )
         case PlanCreated(plan=plan):
             kind = ProvenanceNodeKind.PLAN
             summary = _truncate(plan)

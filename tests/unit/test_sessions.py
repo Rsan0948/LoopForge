@@ -35,7 +35,7 @@ from loopforge.adapters.scripted import (
 from loopforge.application.runtime import Runtime, UnknownRunError
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
-from loopforge.domain.events import Event, RunStopped
+from loopforge.domain.events import Event, RunStarted, RunStopped
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.routing import ModelCapabilities
@@ -592,6 +592,74 @@ def test_follow_up_clones_wiring_with_a_report_seeded_objective(tmp_path: Path) 
     # The new session is quiescent: the operator reviews and starts it.
     listing = {entry["run_id"]: entry for entry in manager.list_sessions()}
     assert listing[successor_id]["driving"] is False
+
+
+def test_follow_up_records_the_parent_run_id_durably(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+    run_id = manager.create_session(_wiring())
+    manager.start_driving(run_id)
+    _wait_for(lambda: manager.state(run_id).status is RunStatus.SUCCEEDED)
+
+    successor_id = manager.follow_up(run_id)
+
+    # The wiring mirrors the structured link...
+    successor_wiring = manager.wiring(successor_id)
+    assert successor_wiring is not None
+    assert successor_wiring.parent_run_id == run_id
+    # ...and the authoritative stream carries it on RunStarted, projected by
+    # the reducer — lineage never depends on parsing the report text.
+    started = manager.events(successor_id)[0]
+    assert isinstance(started, RunStarted)
+    assert started.parent_run_id == RunId(run_id)
+    assert manager.state(successor_id).parent_run_id == RunId(run_id)
+
+
+def test_lineage_resolves_a_two_hop_chain_in_order(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+    run_id = manager.create_session(_wiring())
+    manager.start_driving(run_id)
+    _wait_for(lambda: manager.state(run_id).status is RunStatus.SUCCEEDED)
+    successor_id = manager.follow_up(run_id)
+    manager.start_driving(successor_id)
+    _wait_for(lambda: manager.state(successor_id).status is RunStatus.SUCCEEDED)
+
+    grandchild_id = manager.follow_up(successor_id)
+
+    lineage = manager.lineage(grandchild_id)
+    assert lineage.parent_run_id == successor_id
+    assert lineage.ancestors == (successor_id, run_id)
+    assert manager.lineage(run_id).parent_run_id is None
+    assert manager.lineage(run_id).children == (successor_id,)
+    assert manager.lineage(successor_id).children == (grandchild_id,)
+
+
+def test_lineage_walk_is_bounded_and_cycle_safe(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+    run_a = manager.create_session(_wiring())
+    manager.start_driving(run_a)
+    _wait_for(lambda: manager.state(run_a).status is RunStatus.SUCCEEDED)
+    run_b = manager.create_session(_wiring())
+
+    # A hand-edited or corrupt registry can link parents in a cycle;
+    # resolution must terminate instead of wedging the debugging surface.
+    registry = SessionRegistry(tmp_path / "sessions.json")
+    wiring_a = registry.get(run_a)
+    wiring_b = registry.get(run_b)
+    assert wiring_a is not None
+    assert wiring_b is not None
+    registry.put(run_a, replace(wiring_a, parent_run_id=run_b))
+    registry.put(run_b, replace(wiring_b, parent_run_id=run_a))
+
+    lineage = manager.lineage(run_a)
+    assert lineage.parent_run_id == run_b
+    assert lineage.ancestors == (run_b,)  # the cycle back to run_a is cut
+
+
+def test_lineage_rejects_an_unknown_run(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+
+    with pytest.raises(UnknownRunError, match="no persisted run"):
+        manager.lineage("run_missing")
 
 
 def test_follow_up_is_denied_for_a_non_terminal_run(tmp_path: Path) -> None:

@@ -50,7 +50,17 @@ class DomainEvent:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RunStarted(DomainEvent):
+    """Durable run-creation record.
+
+    ``parent_run_id`` (PACS-015) links a follow-up successor run to the
+    terminal run it was seeded from, so run lineages are derivable from the
+    authoritative stream alone (previously the parent existed only as free
+    text inside the follow-up report in the objective). Optional and
+    payload-backward-compatible: pre-PACS-015 payloads decode as ``None``.
+    """
+
     objective: str
+    parent_run_id: RunId | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

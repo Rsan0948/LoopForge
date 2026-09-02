@@ -69,6 +69,7 @@ class RunState:
     run_id: RunId
     status: RunStatus = RunStatus.CREATED
     objective: str = ""
+    parent_run_id: RunId | None = None
     plan: str | None = None
     iteration: int = 0
     current_action_id: str | None = None
@@ -274,10 +275,11 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
     )
 
     match event:
-        case RunStarted(objective=objective):
+        case RunStarted(objective=objective, parent_run_id=parent_run_id):
             return replace(
                 base,
                 objective=objective,
+                parent_run_id=parent_run_id,
                 status=RunStatus.PLANNING,
                 started_at=event.occurred_at,
             )

@@ -46,7 +46,7 @@ from loopforge.adapters.fanout_store import FanOutEventStore
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.application.runtime import UnknownRunError
-from loopforge.domain.events import Event
+from loopforge.domain.events import Event, RunStarted
 from loopforge.domain.state import RunState, replay
 from loopforge.domain.types import ActionId, RunId, RunStatus
 from loopforge.entrypoints.cli import build_deepseek_model, build_ollama_model
@@ -61,6 +61,10 @@ from loopforge.ports.model import ModelPort
 from loopforge.ports.state_store import StateStorePort
 
 DEFAULT_JOIN_TIMEOUT_SECONDS = 30.0
+
+_MAX_LINEAGE_DEPTH = 32
+"""Bound on lineage walks: a corrupt or cyclic parent link can never wedge
+resolution (the follow-up flow mints one-hop chains, so 32 is generous)."""
 
 
 class SessionStateError(RuntimeError):
@@ -101,6 +105,24 @@ class SessionWiring:
     model_name: str
     container_image: str | None
     created_at: str
+    # PACS-015: the terminal run this session was seeded from as a manual
+    # follow-up (None for root sessions). Mirrored into RunStarted so run
+    # lineages are derivable from the authoritative stream.
+    parent_run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SessionLineage:
+    """One run's position in its follow-up lineage (PACS-015).
+
+    ``ancestors`` is ordered parent-first; ``children`` are the run's direct
+    follow-up successors, sorted for determinism.
+    """
+
+    run_id: str
+    parent_run_id: str | None
+    ancestors: tuple[str, ...]
+    children: tuple[str, ...]
 
 
 class SessionRegistry:
@@ -221,6 +243,7 @@ def _wiring_from_dict(data: object) -> SessionWiring:
         model_name=_require_str_field(record, "model_name"),
         container_image=_optional_str_field(record, "container_image"),
         created_at=_require_str_field(record, "created_at"),
+        parent_run_id=_optional_str_field(record, "parent_run_id"),
     )
 
 
@@ -301,7 +324,10 @@ class SessionManager:
         try:
             bundle = self._factory.build(wiring, self._store)
             try:
-                run_id = bundle.runtime.start(wiring.objective)
+                run_id = bundle.runtime.start(
+                    wiring.objective,
+                    parent_run_id=RunId(wiring.parent_run_id) if wiring.parent_run_id else None,
+                )
             except BaseException:
                 # A failed start must not leak the freshly built bundle
                 # (model HTTP client, container sandbox).
@@ -509,6 +535,10 @@ class SessionManager:
             wiring,
             objective=f"{state.objective}\n\n{report}",
             created_at=datetime.now(UTC).isoformat(),
+            # PACS-015: the durable structured lineage link. The report text
+            # still names the source run for the model; this field is what
+            # provenance and the console derive run lineages from.
+            parent_run_id=str(rid),
         )
         return self.create_session(successor)
 
@@ -539,6 +569,50 @@ class SessionManager:
     def wiring(self, run_id: RunId | str) -> SessionWiring | None:
         """The registry wiring for a run, or ``None`` when unmanaged."""
         return self._registry.get(str(run_id))
+
+    def lineage(self, run_id: RunId | str) -> SessionLineage:
+        """Resolve a run's follow-up lineage (PACS-015).
+
+        Parent links come from the registry wiring, falling back to the
+        durable ``RunStarted.parent_run_id`` (covers unmanaged runs and
+        registry drift); children come from a reverse scan of the registry.
+        The walk is bounded and cycle-safe, and an undecodable stream
+        degrades to "no known parent" rather than wedging the debugging
+        surface. Unknown runs raise ``UnknownRunError``.
+        """
+        rid = str(run_id)
+        wiring_by_run = self._registry.as_dict()
+        if rid not in wiring_by_run and self._store.current_version(RunId(rid)) == 0:
+            msg = f"no persisted run: {rid}"
+            raise UnknownRunError(msg)
+        ancestors: list[str] = []
+        seen = {rid}
+        current = rid
+        while len(ancestors) < _MAX_LINEAGE_DEPTH:
+            parent = self._parent_run_of(current, wiring_by_run)
+            if parent is None or parent in seen:
+                break
+            seen.add(parent)
+            ancestors.append(parent)
+            current = parent
+        children = tuple(sorted(r for r, w in wiring_by_run.items() if w.parent_run_id == rid))
+        return SessionLineage(
+            run_id=rid,
+            parent_run_id=ancestors[0] if ancestors else None,
+            ancestors=tuple(ancestors),
+            children=children,
+        )
+
+    def _parent_run_of(self, run_id: str, wiring_by_run: dict[str, SessionWiring]) -> str | None:
+        wiring = wiring_by_run.get(run_id)
+        if wiring is not None and wiring.parent_run_id:
+            return wiring.parent_run_id
+        with suppress(Exception):
+            # An undecodable (corrupted) stream degrades to "no known parent".
+            events = self._store.events_for(RunId(run_id))
+            if events and isinstance(events[0], RunStarted) and events[0].parent_run_id:
+                return str(events[0].parent_run_id)
+        return None
 
     def session_error(self, run_id: RunId | str) -> BaseException | None:
         """The exception that ended the driver, if one was recorded."""

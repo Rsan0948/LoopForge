@@ -170,7 +170,15 @@ def _base(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _construct_run_started(base: dict[str, Any], data: dict[str, Any]) -> Event:
-    return RunStarted(**base, objective=_required_str(data, "objective"))
+    parent_raw = data.get("parent_run_id")
+    if parent_raw is not None and not isinstance(parent_raw, str):
+        msg = "parent_run_id must be a string or null"
+        raise TypeError(msg)
+    return RunStarted(
+        **base,
+        objective=_required_str(data, "objective"),
+        parent_run_id=RunId(parent_raw) if isinstance(parent_raw, str) else None,
+    )
 
 
 def _construct_plan_created(base: dict[str, Any], data: dict[str, Any]) -> Event:

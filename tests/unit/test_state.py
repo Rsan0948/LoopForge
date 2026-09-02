@@ -1515,6 +1515,21 @@ def test_model_turn_recorded_is_rejected_outside_ready() -> None:
         reduce_event(_state_at("acting"), _model_turn_recorded(5))
 
 
+def test_run_started_projects_the_parent_run_id() -> None:
+    started = RunStarted(
+        event_id=_event_id(1),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=1,
+        objective="continue the repair",
+        parent_run_id=RunId("parent-run-1"),
+    )
+
+    state = reduce_event(RunState(run_id=RUN), started)
+
+    assert state.parent_run_id == RunId("parent-run-1")
+
+
 def test_model_turn_recorded_is_rejected_on_a_terminal_run() -> None:
     terminal = replay(RUN, (_started(1), _planned(2), _stopped(3)))
     with pytest.raises(
