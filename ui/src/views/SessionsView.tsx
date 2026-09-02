@@ -42,6 +42,7 @@ interface InlineForm {
   maxTotalTokens: string;
   maxElapsedSeconds: string;
   noProgressLimit: string;
+  containerImage: string;
 }
 
 function defaultInlineForm(): InlineForm {
@@ -61,6 +62,7 @@ function defaultInlineForm(): InlineForm {
     maxTotalTokens: "",
     maxElapsedSeconds: "",
     noProgressLimit: "",
+    containerImage: "",
   };
 }
 
@@ -128,7 +130,7 @@ function buildInlineProfile(form: InlineForm): { error: string } | { profile: In
         max_changed_files: null,
       },
       sandbox: {
-        container_image: null,
+        container_image: form.containerImage.trim() === "" ? null : form.containerImage.trim(),
         environment: {},
         max_memory_bytes: null,
         local_python: null,
@@ -345,6 +347,17 @@ function NewSessionPanel(): ReactElement {
                   type="checkbox"
                   checked={form.gateFileWrites}
                   onChange={(e) => patch({ gateFileWrites: e.target.checked })}
+                />
+              </label>
+              <label
+                className="field"
+                title="Container image for check execution (e.g. python:3.12-alpine). When set, check argv must be in-container paths; {python} is not substituted. Required on macOS, where the local sandbox fails closed."
+              >
+                <span>sandbox.container_image</span>
+                <input
+                  value={form.containerImage}
+                  onChange={(e) => patch({ containerImage: e.target.value })}
+                  placeholder="(optional; required on macOS)"
                 />
               </label>
               <label className="field">

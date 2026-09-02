@@ -352,6 +352,23 @@ def test_create_session_inline_round_trips_no_progress_limit(tmp_path: Path) -> 
     assert "no_progress_limit = 9" in persisted[0].read_text(encoding="utf-8")
 
 
+def test_create_session_inline_round_trips_container_image(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    data_dir = tmp_path / "data"
+    body = _inline_body(repo)
+    body["inline"]["sandbox"] = {"container_image": "python:3.12-alpine"}
+    # Container mode: {python} is not substituted; argv must use the
+    # in-container interpreter path.
+    body["inline"]["checks"][0]["argv"] = ["/usr/local/bin/python", "-m", "pytest", "-q"]
+    with _client(tmp_path, _plain_factory(), data_dir=data_dir) as client:
+        response = client.post("/api/sessions", json=body)
+        assert response.status_code == 201, response.text
+
+    persisted = list((data_dir / "profiles").glob("inline-*.toml"))
+    assert len(persisted) == 1
+    assert 'container_image = "python:3.12-alpine"' in persisted[0].read_text(encoding="utf-8")
+
+
 def test_create_session_via_profile_path(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     profile_path = tmp_path / "profile.toml"
