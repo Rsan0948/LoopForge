@@ -6,6 +6,13 @@ This document decomposes the remaining LoopForge v1.0 work after PACS-001 throug
 
 > **Planned ≠ authorized. The operator must manually initiate every PACS cycle.**
 
+> **Standing gate (operator decision, 2026-09-02): every cycle keeps the
+> operator console current.** Any cycle that adds or changes operator-visible
+> capability must surface it in the console (REST + React UI) in the same
+> cycle — or record an explicit operator decision for why no UI change is
+> warranted. The console must never fall behind the engine it drives. This
+> is repeated in each remaining cycle's acceptance gate below.
+
 The dependency order is intentional:
 
 ```text
@@ -281,7 +288,8 @@ context authority
 - event log remains authoritative and the provenance graph can be rebuilt from it;
 - every material patch can be traced to triggering evidence/actions and subsequent verification;
 - provenance never fabricates hidden chain-of-thought;
-- graph reconstruction is deterministic for the same event stream.
+- graph reconstruction is deterministic for the same event stream;
+- the console exposes the provenance/`explain` surface for operator sessions (standing UI gate).
 
 ---
 
@@ -307,7 +315,8 @@ context authority
 - multiple trials produce aggregate nondeterministic metrics;
 - false-success rate is first-class;
 - deterministic tests and live-model evals remain separate;
-- benchmark reports can compare runtime configurations, not merely model brands.
+- benchmark reports can compare runtime configurations, not merely model brands;
+- the console exposes benchmark/trial results for operator inspection (standing UI gate).
 
 ---
 
@@ -354,7 +363,8 @@ context authority
 - counterfactual/shadow results are auditable through provenance and telemetry;
 - deterministic safety policy remains immutable during execution;
 - v1 benchmark/report demonstrates quality, cost, latency, context, recovery, and human-intervention tradeoffs across at least two execution policies/model configurations;
-- documentation and release artifacts describe limits honestly.
+- documentation and release artifacts describe limits honestly;
+- the console exposes shadow-policy/candidate comparisons (or an explicit operator decision records why no UI change is warranted — standing UI gate).
 
 ---
 
