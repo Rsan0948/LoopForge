@@ -283,8 +283,13 @@ class Runtime:
 
         Instructions can steer or amend the objective; they can never amend
         budgets, permissions, or sandbox boundaries mid-run (AGENTS.md rule
-        11) — those have no mutation path at all.
+        11) — those have no mutation path at all. A blank instruction carries
+        no steering signal and — with ``amend_objective`` — would blank the
+        objective, so it fails closed before any event is persisted.
         """
+        if not instruction.strip():
+            msg = "operator instruction must not be blank"
+            raise ValueError(msg)
         state = self.state_for(run_id)
         if state.status.is_terminal:
             msg = f"terminal run {run_id} cannot accept operator instructions"
@@ -426,12 +431,16 @@ class Runtime:
 
         After a grant the reducer returns the run to READY with the approved
         proposal still pending; the next drive cycle must execute exactly that
-        action instead of asking the model for a new one.
+        action instead of asking the model for a new one. A proposal that was
+        already attempted (``current_attempt > 0``) is never resurfaced, even
+        if a future reducer change let a grant survive an outcome: execution
+        of an approved action is exactly-once per grant.
         """
         if (
             state.status is RunStatus.READY
             and state.current_proposal is not None
             and state.current_action_id is not None
+            and state.current_attempt == 0
             and state.current_action_id in state.approved_action_ids
         ):
             return state.current_proposal

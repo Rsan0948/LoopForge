@@ -311,6 +311,17 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 current_idempotency_key=None,
                 retry_not_before=None,
                 execution_in_flight=False,
+                # A grant dies with its action: an approved action that is
+                # permanently rejected must not leave its grant behind. Grants
+                # are keyed by action id, and action ids are not unique across
+                # adapter rebuilds (e.g. the Ollama adapter restarts its turn
+                # counter after a process restart), so a lingering grant would
+                # silently authorize a later gated proposal that reuses the id.
+                approved_action_ids=tuple(
+                    action_id
+                    for action_id in base.approved_action_ids
+                    if action_id != base.current_action_id
+                ),
                 status=RunStatus.READY,
             )
         case ToolExecutionStarted(
@@ -357,6 +368,19 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 execution_in_flight=False,
                 tool_failure_streaks=_update_streak(
                     base.tool_failure_streaks, tool_name, success=False
+                ),
+                # A grant is spent by the execution of its action, whatever the
+                # outcome. A failed-but-granted action that re-plans back to
+                # READY must not keep its grant: the next cycle would
+                # re-execute the stale approved proposal at attempt 1 while the
+                # journal expects attempt 2 — the same durable stream poison as
+                # the successful-outcome case above. Retries never consult the
+                # grant (the retry path re-executes the in-flight action
+                # directly), so consuming here cannot starve a bounded retry.
+                approved_action_ids=tuple(
+                    action_id
+                    for action_id in base.approved_action_ids
+                    if action_id != base.current_action_id
                 ),
                 status=RunStatus.VERIFYING,
             )

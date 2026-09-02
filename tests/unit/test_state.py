@@ -862,6 +862,37 @@ def test_approval_rejection_clears_the_pending_action() -> None:
     assert state.approved_action_ids == ()
 
 
+def test_action_rejection_spends_the_grant() -> None:
+    waiting = _state_at("waiting")
+    granted = reduce_event(waiting, _approval_granted(4))
+    assert granted.approved_action_ids == ("a1",)
+
+    rejected = reduce_event(granted, _rejected(5))
+
+    assert rejected.status is RunStatus.READY
+    assert rejected.current_proposal is None
+    # The grant dies with its action: a permanent rejection of a granted
+    # action must not leave the grant behind (action ids are not unique
+    # across adapter rebuilds, so a lingering grant could silently
+    # authorize a later gated proposal reusing the id).
+    assert rejected.approved_action_ids == ()
+
+
+def test_tool_failure_spends_the_grant() -> None:
+    waiting = _state_at("waiting")
+    granted = reduce_event(waiting, _approval_granted(4))
+    acting = reduce_event(granted, _authorized(5))
+    started = reduce_event(acting, _tool_started(6))
+
+    failed = reduce_event(
+        started,
+        _tool_failed(7, failure_class=ToolFailureClass.PERMANENT),
+    )
+
+    assert failed.status is RunStatus.VERIFYING
+    assert failed.approved_action_ids == ()
+
+
 def test_approval_rejection_requires_waiting_with_matching_action() -> None:
     rejected = ApprovalRejected(
         event_id=_event_id(5),

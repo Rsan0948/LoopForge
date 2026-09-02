@@ -39,7 +39,7 @@ from loopforge.domain.events import (
     ToolSucceeded,
 )
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
-from loopforge.domain.reliability import ReliabilityPolicy
+from loopforge.domain.reliability import ReliabilityPolicy, ToolFailureClass
 from loopforge.domain.state import InvalidTransitionError
 from loopforge.domain.tooling import (
     ApprovalClass,
@@ -64,14 +64,20 @@ from loopforge.ports.tools import ToolResult
 NOW = datetime(2026, 9, 1, tzinfo=UTC)
 
 
-def _metadata(name: str, approval: ApprovalClass) -> ToolMetadata:
+def _metadata(
+    name: str,
+    approval: ApprovalClass,
+    *,
+    retry: RetryClass = RetryClass.NEVER,
+    idempotency: IdempotencyClass = IdempotencyClass.NONE,
+) -> ToolMetadata:
     return ToolMetadata(
         name=name,
         risk=RiskLevel.LOCAL_WRITE,
         required_permission=Permission.LOCAL_WRITE,
         side_effect=SideEffectClass.LOCAL_WRITE,
-        retry=RetryClass.NEVER,
-        idempotency=IdempotencyClass.NONE,
+        retry=retry,
+        idempotency=idempotency,
         approval=approval,
         timeout_seconds=5.0,
     )
@@ -455,3 +461,166 @@ def test_spent_grant_is_not_re_executed_after_failed_verification() -> None:
     # The stream stays fully replayable from a fresh runtime (poison guard).
     fresh = _runtime(_model(), store=store)
     assert fresh.state_for(run_id).status is RunStatus.WAITING_FOR_APPROVAL
+
+
+def test_failed_approved_action_spends_its_grant_and_replans_safely() -> None:
+    """Regression pin: the permanent-failure twin of the spent-grant defect.
+
+    A granted action whose execution fails permanently re-plans back to READY
+    with the stale proposal still projected. The grant must be spent by the
+    failed execution — otherwise the next cycle re-executes the stale approved
+    proposal at attempt 1 while the journal expects attempt 2, poisoning the
+    stream exactly like the successful-outcome case fixed earlier.
+    """
+    store = InMemoryEventStore()
+    runtime = _runtime(
+        _model("turn-1", "turn-2"),
+        store=store,
+        tools=ScriptedTools(
+            [
+                ToolResult(
+                    ok=False,
+                    observation="boom",
+                    failure_class=ToolFailureClass.PERMANENT,
+                )
+            ],
+            metadata=[_metadata("deploy", ApprovalClass.REQUIRED)],
+        ),
+    )
+    run_id = runtime.start("approved edit, failed execution")
+    assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
+    runtime.grant_approval(run_id, ActionId("turn-1"))
+
+    ready = runtime.step(run_id)  # executes turn-1; permanent failure; re-plans
+
+    assert ready.status is RunStatus.READY
+    # The grant is spent by the failed execution.
+    assert ready.approved_action_ids == ()
+    started = [e for e in store.events_for(run_id) if isinstance(e, ToolExecutionStarted)]
+    assert [(e.action_id, e.attempt) for e in started] == [(ActionId("turn-1"), 1)]
+
+    # The next cycle proposes a FRESH action instead of re-executing the stale
+    # approved one — and the fresh gated action re-quiesces the run.
+    waiting = runtime.step(run_id)
+
+    assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
+    assert waiting.current_action_id == "turn-2"
+    events = store.events_for(run_id)
+    assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 2
+    # The stream stays fully replayable from a fresh runtime (poison guard).
+    fresh = _runtime(_model(), store=store)
+    assert fresh.state_for(run_id).status is RunStatus.WAITING_FOR_APPROVAL
+
+
+def test_reused_action_id_after_failed_grant_requires_fresh_approval() -> None:
+    """A spent grant must not silently authorize a later proposal with the same id.
+
+    Action ids are not unique across adapter rebuilds (the Ollama adapter
+    restarts its turn counter after a process restart), so a proposal can
+    legitimately re-use an id that was once granted. Approval is per-action,
+    not per-id-forever: the re-proposed gated action must quiesce again.
+    """
+    store = InMemoryEventStore()
+    runtime = _runtime(
+        _model("turn-1", "turn-1"),
+        store=store,
+        tools=ScriptedTools(
+            [
+                ToolResult(
+                    ok=False,
+                    observation="boom",
+                    failure_class=ToolFailureClass.PERMANENT,
+                ),
+                ToolResult(ok=True, observation="all tests pass"),
+            ],
+            metadata=[_metadata("deploy", ApprovalClass.REQUIRED)],
+        ),
+    )
+    run_id = runtime.start("reused action id")
+    assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
+    runtime.grant_approval(run_id, ActionId("turn-1"))
+    # Executed once, failed permanently, re-planned back to READY.
+    assert runtime.step(run_id).status is RunStatus.READY
+
+    waiting = runtime.step(run_id)  # the model re-proposes the same action id
+
+    assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
+    assert waiting.current_action_id == "turn-1"
+    events = store.events_for(run_id)
+    assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 2
+    # Nothing executed without the second grant.
+    started = [e for e in events if isinstance(e, ToolExecutionStarted)]
+    assert [(e.action_id, e.attempt) for e in started] == [(ActionId("turn-1"), 1)]
+
+    runtime.grant_approval(run_id, ActionId("turn-1"))
+    final = runtime.resume(run_id)
+
+    assert final.status is RunStatus.SUCCEEDED
+    started = [e for e in store.events_for(run_id) if isinstance(e, ToolExecutionStarted)]
+    assert [(e.action_id, e.attempt) for e in started] == [
+        (ActionId("turn-1"), 1),
+        (ActionId("turn-1"), 1),
+    ]
+
+
+def test_retried_approved_action_needs_no_second_grant() -> None:
+    """A grant covers the bounded retry of its action (allow case).
+
+    Consuming the grant on a failed outcome must not starve the retry path:
+    retries re-execute the in-flight action directly and never consult the
+    gateway again.
+    """
+    store = InMemoryEventStore()
+    runtime = _runtime(
+        _model("turn-1"),
+        store=store,
+        tools=ScriptedTools(
+            [
+                ToolResult(
+                    ok=False,
+                    observation="flaky",
+                    failure_class=ToolFailureClass.TRANSIENT,
+                ),
+                ToolResult(ok=True, observation="all tests pass"),
+            ],
+            metadata=[
+                _metadata(
+                    "deploy",
+                    ApprovalClass.REQUIRED,
+                    retry=RetryClass.TRANSIENT_ONLY,
+                    idempotency=IdempotencyClass.KEYED,
+                )
+            ],
+        ),
+    )
+    run_id = runtime.start("approved flaky action")
+    assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
+    runtime.grant_approval(run_id, ActionId("turn-1"))
+
+    final = runtime.resume(run_id)
+
+    assert final.status is RunStatus.SUCCEEDED
+    events = store.events_for(run_id)
+    started = [e for e in events if isinstance(e, ToolExecutionStarted)]
+    assert [(e.action_id, e.attempt) for e in started] == [
+        (ActionId("turn-1"), 1),
+        (ActionId("turn-1"), 2),
+    ]
+    assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 1
+    assert len([e for e in events if isinstance(e, ApprovalGranted)]) == 1
+
+
+def test_blank_operator_instruction_fails_closed() -> None:
+    """A blank instruction carries no signal and must never be persisted."""
+    store = InMemoryEventStore()
+    runtime = _runtime(_model("gated-1"), store=store)
+    run_id = runtime.start("no blank instructions")
+    assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
+
+    for blank in ("", "   ", "\n\t "):
+        with pytest.raises(ValueError, match="must not be blank"):
+            runtime.add_operator_instruction(run_id, blank, amend_objective=True)
+
+    # Nothing was persisted; the objective is untouched.
+    assert [e for e in store.events_for(run_id) if isinstance(e, OperatorInstruction)] == []
+    assert runtime.state_for(run_id).objective == "no blank instructions"
