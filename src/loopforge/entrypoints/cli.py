@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -597,6 +598,20 @@ def _profile_loop(
     return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+
+
+def _warn_unless_loopback(host: str, port: int) -> None:
+    """Loudly flag off-loopback binds on a deliberately unauthenticated server."""
+    if host not in _LOOPBACK_HOSTS:
+        print(
+            f"warning: serve is binding {host}:{port} with NO authentication; "
+            "every reachable host can drive runs, execute sandboxed checks, and "
+            "roll back adopted checkouts. Bind 127.0.0.1 unless you know why.",
+            file=sys.stderr,
+        )
+
+
 def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
     *,
     host: str,
@@ -617,6 +632,8 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
     import uvicorn  # noqa: PLC0415
 
     from loopforge.entrypoints.server import ServerSettings, create_app  # noqa: PLC0415
+
+    _warn_unless_loopback(host, port)
 
     settings = ServerSettings(
         store_kind="sqlite" if sqlite is not None else "postgres",

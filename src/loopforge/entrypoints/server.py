@@ -46,12 +46,15 @@ from loopforge.entrypoints.sessions import (
     InlineSandboxFields,
     SessionManager,
     SessionRegistry,
+    SessionRegistryError,
     SessionStateError,
     UnmanagedRunError,
     build_production_bundle_factory,
     wiring_from_inline,
     wiring_from_profile_path,
 )
+from loopforge.ports.state_store import StreamVersionConflictError
+from loopforge.ports.workspace import WorkspaceError
 
 WS_CLOSE_UNKNOWN_RUN = 4404
 _WS_POLL_SECONDS = 0.1
@@ -64,6 +67,21 @@ def _next_event(subscriber: queue.Queue[Event]) -> Event:
     shutdown) when a client disconnects while no events flow.
     """
     return subscriber.get(timeout=_WS_POLL_SECONDS)
+
+
+async def _send_new_events(
+    websocket: WebSocket,
+    codec: JsonEventCodec,
+    events: tuple[Event, ...],
+    last_sequence: int,
+) -> int:
+    """Send every event newer than ``last_sequence``; return the new high-water mark."""
+    for event in events:
+        if event.sequence <= last_sequence:
+            continue
+        last_sequence = event.sequence
+        await websocket.send_text(codec.encode(event))
+    return last_sequence
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -279,12 +297,22 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     async def unprocessable_handler(_request: Request, exc: Exception) -> JSONResponse:
         return JSONResponse(status_code=422, content={"detail": str(exc)})
 
+    async def registry_error_handler(_request: Request, exc: Exception) -> JSONResponse:
+        # Server-side wiring corruption is never the client's fault (so not
+        # 4xx) but must still carry the consistent {"detail": ...} shape.
+        return JSONResponse(status_code=500, content={"detail": str(exc)})
+
     app.add_exception_handler(UnknownRunError, unknown_run_handler)
     app.add_exception_handler(UnmanagedRunError, conflict_handler)
     app.add_exception_handler(InvalidTransitionError, conflict_handler)
     app.add_exception_handler(SessionStateError, conflict_handler)
+    # A cross-process compare-and-append race (two servers on one store).
+    app.add_exception_handler(StreamVersionConflictError, conflict_handler)
     app.add_exception_handler(ProfileError, unprocessable_handler)
+    # Workspace checkout/reset failures (empty or unrevertible paths).
+    app.add_exception_handler(WorkspaceError, unprocessable_handler)
     app.add_exception_handler(ValueError, unprocessable_handler)
+    app.add_exception_handler(SessionRegistryError, registry_error_handler)
 
     # -- REST: sessions ---------------------------------------------------------
 
@@ -470,12 +498,13 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
         subscriber = store.subscribe(rid)
         try:
             # Subscribe BEFORE reading history so no durable event is missed;
-            # live events replayed from history are skipped by sequence.
-            last_sequence = 0
-            for event in store.events_for(rid):
-                await websocket.send_text(codec.encode(event))
-                last_sequence = event.sequence
+            # live events replayed from history are skipped by sequence. The
+            # history read runs on the executor: decoding a long stream must
+            # never stall the event loop (and every other client) behind one
+            # connecting socket.
             loop = asyncio.get_running_loop()
+            history = await loop.run_in_executor(None, store.events_for, rid)
+            last_sequence = await _send_new_events(websocket, codec, history, 0)
             receive_task: asyncio.Future[str] | None = None
             try:
                 while True:
@@ -492,6 +521,16 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
                     except queue.Empty:
                         continue
                     if event.sequence <= last_sequence:
+                        continue
+                    if event.sequence > last_sequence + 1:
+                        # Cross-process publishes are not ordered against
+                        # commits: a skipped sequence would otherwise stay
+                        # missing for the life of this connection. Resync
+                        # from the durable store instead of skipping forward.
+                        missed = await loop.run_in_executor(None, store.events_for, rid)
+                        last_sequence = await _send_new_events(
+                            websocket, codec, missed, last_sequence
+                        )
                         continue
                     last_sequence = event.sequence
                     await websocket.send_text(codec.encode(event))

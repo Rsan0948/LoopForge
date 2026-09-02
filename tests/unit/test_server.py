@@ -10,12 +10,13 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from fastapi import FastAPI
@@ -23,6 +24,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from loopforge.adapters.context import BasicContextBuilder
+from loopforge.adapters.fanout_store import FanOutEventStore
 from loopforge.adapters.scripted import (
     FixedClock,
     ObservationContainsVerifier,
@@ -32,6 +34,7 @@ from loopforge.adapters.scripted import (
 )
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.events import OperatorInstruction
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.security import SandboxCapabilities
@@ -45,18 +48,21 @@ from loopforge.domain.tooling import (
 from loopforge.domain.types import (
     ActionId,
     BudgetLimit,
+    EventId,
     Permission,
     RiskLevel,
+    RunId,
     WorkspaceId,
 )
 from loopforge.domain.workspace import WorkspaceStatus
 from loopforge.entrypoints.cli import main
 from loopforge.entrypoints.repair import RepairRuntimeBundle
 from loopforge.entrypoints.server import ServerSettings, create_app
-from loopforge.entrypoints.sessions import SessionWiring
+from loopforge.entrypoints.sessions import SessionManager, SessionWiring
 from loopforge.ports.sandbox import SandboxCommandResult
-from loopforge.ports.state_store import StateStorePort
-from loopforge.ports.tools import ToolResult
+from loopforge.ports.state_store import StateStorePort, StreamVersionConflictError
+from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolError
+from loopforge.ports.workspace import WorkspaceError
 
 NOW = datetime(2026, 9, 1, tzinfo=UTC)
 
@@ -82,6 +88,28 @@ TOOL_METADATA = [
     _metadata("probe", ApprovalClass.NONE),
     _metadata("deploy", ApprovalClass.REQUIRED),
 ]
+
+
+class BlockingTools:
+    """Tool executor whose execute() blocks until released (deterministic driving tests)."""
+
+    def __init__(self) -> None:
+        self._metadata = {item.name: item for item in TOOL_METADATA}
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    def metadata_for(self, tool_name: str) -> ToolMetadata:
+        try:
+            return self._metadata[tool_name]
+        except KeyError as exc:
+            msg = f"unknown tool: {tool_name}"
+            raise UnknownToolError(msg) from exc
+
+    def execute(self, request: ToolExecutionRequest) -> ToolResult:
+        self.metadata_for(request.proposal.tool_name)
+        self.entered.set()
+        self.release.wait(timeout=10)
+        return ToolResult(ok=True, observation="all tests pass")
 
 
 class FakeWorkspace:
@@ -110,6 +138,11 @@ class FakeWorkspace:
         return ""
 
     def checkout(self, paths: tuple[str, ...]) -> None:
+        # Mirror the production contract: an empty selection is an error,
+        # never a silent no-op.
+        if not paths:
+            msg = "checkout requires at least one path"
+            raise WorkspaceError(msg)
         self.checkout_calls.append(tuple(paths))
 
     def reset(self) -> None:
@@ -153,15 +186,21 @@ class FakeBundleFactory:
 
     actions: list[ActionProposal]
     results: list[ToolResult]
+    tools_override: BlockingTools | None = None
     bundles: list[RepairRuntimeBundle] = field(default_factory=list[RepairRuntimeBundle])
     workspaces: list[FakeWorkspace] = field(default_factory=list[FakeWorkspace])
 
     def build(self, wiring: SessionWiring, store: StateStorePort) -> RepairRuntimeBundle:
         del wiring  # the fake does not reconstruct profiles
         workspace = FakeWorkspace()
+        tools = (
+            self.tools_override
+            if self.tools_override is not None
+            else ScriptedTools(list(self.results), metadata=list(TOOL_METADATA))
+        )
         runtime = Runtime(
             model=ScriptedModel(list(self.actions)),
-            tools=ScriptedTools(list(self.results), metadata=list(TOOL_METADATA)),
+            tools=tools,
             verifier=ObservationContainsVerifier("all tests pass"),
             store=store,
             control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
@@ -857,6 +896,40 @@ def test_serve_defaults_to_postgres_on_loopback(
     assert captured["port"] == 8123
 
 
+def test_serve_warns_on_an_off_loopback_bind(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _fake_run(app: Any, *, host: str, port: int, **kwargs: Any) -> None:
+        del app, host, port, kwargs
+
+    monkeypatch.setattr("uvicorn.run", _fake_run)
+    _argv(
+        monkeypatch,
+        "serve",
+        "--sqlite",
+        str(tmp_path / "events.db"),
+        "--data-dir",
+        str(tmp_path / "data"),
+        "--host",
+        "0.0.0.0",  # deliberate: exercises the off-loopback warning
+    )
+
+    assert main() == 0
+    assert "NO authentication" in capsys.readouterr().err
+
+    # The loopback default stays silent.
+    _argv(
+        monkeypatch,
+        "serve",
+        "--sqlite",
+        str(tmp_path / "events.db"),
+        "--data-dir",
+        str(tmp_path / "data"),
+    )
+    assert main() == 0
+    assert capsys.readouterr().err == ""
+
+
 def test_create_app_rejects_an_unknown_store_kind(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="unknown store kind"):
         create_app(
@@ -866,3 +939,181 @@ def test_create_app_rejects_an_unknown_store_kind(tmp_path: Path) -> None:
                 data_dir=tmp_path / "data",
             )
         )
+
+
+# --- Hardening: error mapping, request bounds, WS resync -------------------------
+
+
+def test_rollback_with_empty_paths_is_422(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+
+        denied = client.post(f"/api/sessions/{run_id}/rollback", json={"paths": []})
+
+        assert denied.status_code == 422
+        assert "at least one path" in denied.json()["detail"]
+
+
+def test_cas_conflict_maps_to_409(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A cross-process compare-and-append loss is a conflict, never a 500."""
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+        manager = cast("SessionManager", cast("FastAPI", client.app).state.manager)
+
+        def racing_approve(_run_id: object, _action_id: object) -> None:
+            raise StreamVersionConflictError(RunId(run_id), expected=3, actual=4)
+
+        monkeypatch.setattr(manager, "approve", racing_approve)
+
+        response = client.post(f"/api/sessions/{run_id}/approve", json={"action_id": "a1"})
+
+        assert response.status_code == 409
+        assert "version conflict" in response.json()["detail"]
+
+
+def test_corrupt_registry_maps_to_500_with_detail(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    data_dir = tmp_path / "data"
+    with _client(tmp_path, _plain_factory(), data_dir=data_dir) as client:
+        _create(client, repo)
+        data_dir.mkdir(parents=True, exist_ok=True)
+        (data_dir / "sessions.json").write_text("{not json", encoding="utf-8")
+
+        response = client.get("/api/sessions")
+
+        assert response.status_code == 500
+        assert "not valid JSON" in response.json()["detail"]
+
+
+def test_events_route_bounds_are_enforced(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+
+        assert client.get(f"/api/sessions/{run_id}/events?limit=0").status_code == 422
+        assert client.get(f"/api/sessions/{run_id}/events?limit=5001").status_code == 422
+        assert client.get(f"/api/sessions/{run_id}/events?after_sequence=-1").status_code == 422
+        assert client.get(f"/api/sessions/{run_id}/events?limit=1").status_code == 200
+
+
+def test_blank_instruction_is_422(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _gated_factory()) as client:
+        run_id = _create(client, repo)
+        client.post(f"/api/sessions/{run_id}/start")
+        _wait_for_status(client, run_id, "waiting_for_approval")
+
+        for blank in ("", "   "):
+            denied = client.post(
+                f"/api/sessions/{run_id}/instructions",
+                json={"instruction": blank, "amend_objective": True},
+            )
+            assert denied.status_code == 422
+            assert "must not be blank" in denied.json()["detail"]
+
+        # The objective survives: no blanking event was persisted.
+        assert _detail(client, run_id)["objective"] != ""
+        allowed = client.post(
+            f"/api/sessions/{run_id}/instructions",
+            json={"instruction": "focus on the adder"},
+        )
+        assert allowed.status_code == 200
+
+
+def test_failed_inline_profile_is_not_persisted(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    data_dir = tmp_path / "data"
+    with _client(tmp_path, _plain_factory(), data_dir=data_dir) as client:
+        body = _inline_body(repo)
+        body["inline"]["acceptance"]["allowed_prefixes"] = ["../outside"]
+
+        denied = client.post("/api/sessions", json=body)
+
+        assert denied.status_code == 422
+        profiles_dir = data_dir / "profiles"
+        orphan_profiles = list(profiles_dir.glob("inline-*.toml")) if profiles_dir.is_dir() else []
+        assert orphan_profiles == []
+        assert not any(
+            entry["name"].startswith("inline-")
+            for entry in client.get("/api/profiles").json()["profiles"]
+        )
+
+
+def test_start_while_driving_and_start_on_terminal_are_409(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    tools = BlockingTools()
+    factory = FakeBundleFactory(
+        actions=[_proposal("a1", "probe")],
+        results=[ToolResult(ok=True, observation="all tests pass")],
+        tools_override=tools,
+    )
+    with _client(tmp_path, factory) as client:
+        run_id = _create(client, repo)
+        assert client.post(f"/api/sessions/{run_id}/start").status_code == 200
+        assert tools.entered.wait(timeout=5)
+
+        driving = client.post(f"/api/sessions/{run_id}/start")
+        assert driving.status_code == 409
+        assert "already driving" in driving.json()["detail"]
+
+        tools.release.set()
+        _wait_for_status(client, run_id, "succeeded")
+
+        terminal = client.post(f"/api/sessions/{run_id}/start")
+        assert terminal.status_code == 409
+        assert "terminal" in terminal.json()["detail"]
+
+
+def test_websocket_resyncs_when_a_live_frame_skips_a_sequence(tmp_path: Path) -> None:
+    """Cross-process publishes are unordered: a skipped sequence must be healed.
+
+    A commit from another process advances the durable stream without touching
+    this server's subscriber queues; the next published frame then arrives with
+    a sequence gap. The consumer must resync from the durable store instead of
+    dropping the missed sequence for the life of the connection.
+    """
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)  # stream: RunStarted(1), PlanCreated(2)
+        rid = RunId(run_id)
+        app_store = cast("FanOutEventStore", cast("FastAPI", client.app).state.store)
+        delegate: StateStorePort = app_store._delegate  # pyright: ignore[reportPrivateUsage]
+
+        with client.websocket_connect(f"/ws/sessions/{run_id}") as websocket:
+            history = [json.loads(websocket.receive_text()) for _ in range(2)]
+            assert [frame["event"]["sequence"] for frame in history] == [1, 2]
+
+            # An append that bypasses this process's fan-out publish.
+            delegate.append(
+                OperatorInstruction(
+                    event_id=EventId("evt-off-channel"),
+                    run_id=rid,
+                    occurred_at=NOW,
+                    sequence=3,
+                    instruction="off-channel",
+                    amends_objective=False,
+                ),
+                expected_version=2,
+            )
+            # The next published frame arrives as sequence 4: a gap.
+            app_store.append(
+                OperatorInstruction(
+                    event_id=EventId("evt-on-channel"),
+                    run_id=rid,
+                    occurred_at=NOW,
+                    sequence=4,
+                    instruction="on-channel",
+                    amends_objective=False,
+                ),
+                expected_version=3,
+            )
+
+            frames = [json.loads(websocket.receive_text()) for _ in range(2)]
+
+            assert [frame["event"]["sequence"] for frame in frames] == [3, 4]
+            assert [frame["event"]["instruction"] for frame in frames] == [
+                "off-channel",
+                "on-channel",
+            ]
