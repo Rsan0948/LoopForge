@@ -448,13 +448,15 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
 
     async def session_stream_route(websocket: WebSocket, run_id: str) -> None:
         rid = RunId(run_id)
-        # Unknown runs are rejected BEFORE accept with a dedicated close code;
-        # a run known to the registry but with an empty stream is accepted —
-        # its events may arrive later.
+        await websocket.accept()
+        # Unknown runs are closed with a dedicated code AFTER accept: a
+        # pre-accept close is translated into an HTTP 403 handshake rejection
+        # by real ASGI servers and the code would never reach the client. A
+        # run known to the registry but with an empty stream stays open — its
+        # events may arrive later.
         if store.current_version(rid) == 0 and registry.get(run_id) is None:
             await websocket.close(code=WS_CLOSE_UNKNOWN_RUN)
             return
-        await websocket.accept()
         subscriber = store.subscribe(rid)
         try:
             # Subscribe BEFORE reading history so no durable event is missed;

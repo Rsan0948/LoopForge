@@ -748,11 +748,12 @@ def test_detail_surfaces_driver_errors(tmp_path: Path) -> None:
 
 def test_websocket_rejects_an_unknown_run_with_4404(tmp_path: Path) -> None:
     with _client(tmp_path, _plain_factory()) as client:
+        # The close lands after accept so the code reaches real ASGI clients.
         with (
+            client.websocket_connect("/ws/sessions/run_missing") as websocket,
             pytest.raises(WebSocketDisconnect) as exc_info,
-            client.websocket_connect("/ws/sessions/run_missing"),
         ):
-            pass
+            websocket.receive_text()
         assert exc_info.value.code == 4404
 
 
