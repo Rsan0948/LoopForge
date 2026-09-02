@@ -519,3 +519,136 @@ textarea:focus {
   align-items: center;
   flex-wrap: wrap;
 }
+
+/* -- diff viewer (workspace_snapshot artifacts) --------------------------------- */
+
+.diff-viewer {
+  margin-top: 6px;
+}
+
+.snapshot-header {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 4px 14px;
+  margin: 0 0 8px;
+  font-size: 12px;
+}
+
+.snapshot-header dt {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.snapshot-header dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.rollback-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.diff-file {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  margin-bottom: 6px;
+  background: var(--bg-inset);
+}
+
+.diff-file summary {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 8px;
+  cursor: pointer;
+  list-style: none;
+  font-size: 12.5px;
+}
+
+.diff-file summary::-webkit-details-marker {
+  display: none;
+}
+
+.diff-file summary:hover {
+  background: rgba(88, 166, 255, 0.06);
+}
+
+.diff-path {
+  overflow-wrap: anywhere;
+}
+
+.diff-counts {
+  margin-left: auto;
+  white-space: nowrap;
+}
+
+.diff-add-text {
+  color: var(--green);
+}
+
+.diff-del-text {
+  color: var(--red);
+}
+
+.diff-lines {
+  overflow-x: auto;
+  padding: 4px 0;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.diff-lines > div {
+  white-space: pre;
+  padding: 0 8px;
+}
+
+.diff-add {
+  color: #7ee787;
+  background: rgba(63, 185, 80, 0.1);
+}
+
+.diff-del {
+  color: #ffa198;
+  background: rgba(248, 81, 73, 0.1);
+}
+
+.diff-hunk {
+  color: var(--accent);
+  background: rgba(88, 166, 255, 0.07);
+}
+
+.diff-context {
+  color: var(--text-muted);
+}
+
+.diff-meta {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+/* -- objective amendment panel ---------------------------------------------------- */
+
+.amend-panel {
+  margin-top: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.amend-panel textarea {
+  width: 100%;
+}
+
+.amend-current {
+  margin: 0;
+  padding: 6px 8px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

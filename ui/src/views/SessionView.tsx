@@ -8,6 +8,7 @@ import {
   pauseSession,
   rejectAction,
   resumeSession,
+  rollbackRun,
   sendInstruction,
   sessionWsUrl,
   startSession,
@@ -16,6 +17,7 @@ import {
   type ArtifactInfo,
   type SessionDetail,
 } from "../api";
+import DiffViewer from "../DiffViewer";
 import { describeEvent, type EventEnvelope } from "../events";
 import { formatClock, formatCost, formatTime } from "../format";
 import { ErrorBanner, StatusBadge } from "../widgets";
@@ -52,6 +54,8 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
 
   const [stopOpen, setStopOpen] = useState(false);
   const [stopSummary, setStopSummary] = useState("");
+  const [amendOpen, setAmendOpen] = useState(false);
+  const [amendText, setAmendText] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
   const [instruction, setInstruction] = useState("");
@@ -210,7 +214,14 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
       void (async () => {
         try {
           await command();
-          setDetail(await getSession(runId));
+          // The server is authoritative; re-pull projections after every
+          // command (a rollback's effect shows up in the next snapshot).
+          const [freshDetail, freshArtifacts] = await Promise.all([
+            getSession(runId),
+            getArtifacts(runId),
+          ]);
+          setDetail(freshDetail);
+          setArtifacts(freshArtifacts);
         } catch (err) {
           setToast(err instanceof ApiError ? err.detail : String(err));
         }
@@ -250,6 +261,15 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
     const text = instruction.trim();
     setInstruction("");
     runCommand(() => sendInstruction(runId, text));
+  };
+
+  const onAmend = (event: FormEvent): void => {
+    event.preventDefault();
+    if (!amendText.trim()) return;
+    const text = amendText.trim();
+    setAmendOpen(false);
+    setAmendText("");
+    runCommand(() => sendInstruction(runId, text, true));
   };
 
   const budget = detail?.budget ?? null;
@@ -438,7 +458,48 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
               send
             </button>
           </form>
+          <button
+            type="button"
+            disabled={!canInstruct}
+            onClick={() => {
+              setAmendText(detail?.objective ?? "");
+              setAmendOpen(true);
+            }}
+          >
+            amend objective…
+          </button>
         </div>
+        {amendOpen && detail !== null && (
+          <form onSubmit={onAmend} className="amend-panel">
+            <p className="muted">
+              This durably <strong>replaces</strong> the run&apos;s objective (an{" "}
+              <span className="mono">OperatorInstruction</span> with{" "}
+              <span className="mono">amends_objective=true</span>) and pauses the driver. Budgets,
+              permissions, and sandbox boundaries are unaffected.
+            </p>
+            <label className="field">
+              <span>current objective</span>
+              <p className="amend-current">{detail.objective}</p>
+            </label>
+            <label className="field">
+              <span>new objective</span>
+              <textarea
+                autoFocus
+                rows={3}
+                value={amendText}
+                onChange={(e) => setAmendText(e.target.value)}
+              />
+            </label>
+            <div className="button-row">
+              <button type="submit" className="danger" disabled={!amendText.trim()}>
+                confirm amendment
+              </button>
+              <button type="button" onClick={() => setAmendOpen(false)}>
+                cancel
+              </button>
+            </div>
+          </form>
+        )}
       </section>
 
       <div className="columns">
@@ -466,15 +527,30 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
           {artifacts.length === 0 ? (
             <p className="muted">no artifacts recorded</p>
           ) : (
-            artifacts.map((artifact) => (
-              <details key={artifact.sequence} className="artifact">
-                <summary>
-                  <span className="badge badge-muted">{artifact.kind}</span> {artifact.label}{" "}
-                  <span className="muted mono">{formatTime(artifact.occurred_at)}</span>
-                </summary>
-                <pre className="artifact-content">{artifact.content}</pre>
-              </details>
-            ))
+            artifacts.map((artifact) =>
+              artifact.kind === "workspace_snapshot" ? (
+                <details key={artifact.sequence} className="artifact">
+                  <summary>
+                    <span className="badge badge-muted">{artifact.kind}</span> {artifact.label}{" "}
+                    <span className="muted mono">{formatTime(artifact.occurred_at)}</span>
+                  </summary>
+                  <DiffViewer
+                    content={artifact.content}
+                    rollbackDisabled={detail?.driving !== false}
+                    onRollbackPaths={(paths) => runCommand(() => rollbackRun(runId, paths))}
+                    onRollbackAll={() => runCommand(() => rollbackRun(runId))}
+                  />
+                </details>
+              ) : (
+                <details key={artifact.sequence} className="artifact">
+                  <summary>
+                    <span className="badge badge-muted">{artifact.kind}</span> {artifact.label}{" "}
+                    <span className="muted mono">{formatTime(artifact.occurred_at)}</span>
+                  </summary>
+                  <pre className="artifact-content">{artifact.content}</pre>
+                </details>
+              ),
+            )
           )}
         </section>
       </div>

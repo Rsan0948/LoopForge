@@ -256,11 +256,25 @@ export function rejectAction(runId: string, actionId: string, reason: string): P
   });
 }
 
-export function sendInstruction(runId: string, instruction: string): Promise<StatusResponse> {
+export function sendInstruction(
+  runId: string,
+  instruction: string,
+  amendObjective = false,
+): Promise<StatusResponse> {
   return post<StatusResponse>(`/api/sessions/${encodeURIComponent(runId)}/instructions`, {
     instruction,
-    amend_objective: false,
+    amend_objective: amendObjective,
   });
+}
+
+/** Selective rollback reverts `paths`; omitting `paths` sends an empty body,
+ *  which the server treats as a full workspace reset to the base revision
+ *  (see rollback_route in server.py). Denied with 409 while driving. */
+export function rollbackRun(runId: string, paths?: string[]): Promise<StatusResponse> {
+  return post<StatusResponse>(
+    `/api/sessions/${encodeURIComponent(runId)}/rollback`,
+    paths === undefined ? undefined : { paths },
+  );
 }
 
 export function sessionWsUrl(runId: string): string {
