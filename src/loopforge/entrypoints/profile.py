@@ -217,6 +217,9 @@ def _optional_positive_int(table: dict[str, Any], key: str, *, section: str, def
 
 
 def _require_positive_number(table: dict[str, Any], key: str, *, section: str) -> float:
+    if key not in table:
+        msg = f"{section}.{key} is required: set a positive finite number"
+        raise ProfileError(msg)
     value: object = table.get(key)
     if (
         isinstance(value, bool)

@@ -266,6 +266,13 @@ def test_non_positive_budget_cost_is_denied(tmp_path: Path) -> None:
         load_profile(_write_profile(tmp_path, body))
 
 
+def test_missing_budget_cost_reports_required_not_invalid(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo).replace("max_cost_usd = 5.0\n", "")
+    with pytest.raises(ProfileError, match="max_cost_usd is required"):
+        load_profile(_write_profile(tmp_path, body))
+
+
 def test_missing_budget_iterations_is_denied(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path / "repo")
     body = _valid_body(repo).replace("max_iterations = 30\n", "")
