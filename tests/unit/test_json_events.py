@@ -25,12 +25,14 @@ from loopforge.domain.events import (
     ActionProposed,
     ActionRejected,
     ApprovalGranted,
+    ApprovalRejected,
     ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
     Event,
+    OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
     RetryScheduled,
@@ -349,6 +351,24 @@ EXAMPLES: tuple[Event, ...] = (
         revision=None,
         detail="merge aborted: overlapping edits",
     ),
+    ApprovalRejected(
+        event_id=EventId("e26"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=26,
+        caused_by=EventId("e15"),
+        action_id=ActionId("a9"),
+        reason="operator denied the write",
+    ),
+    OperatorInstruction(
+        event_id=EventId("e27"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=27,
+        caused_by=EventId("e15"),
+        instruction="focus on the failing test only",
+        amends_objective=True,
+    ),
 )
 
 (
@@ -377,6 +397,8 @@ EXAMPLES: tuple[Event, ...] = (
     WORKER_SPAWNED,
     WORKER_STOPPED,
     WORKER_MERGED,
+    APPROVAL_REJECTED,
+    OPERATOR_INSTRUCTION,
 ) = EXAMPLES
 
 
@@ -418,7 +440,7 @@ def _legacy_tool_failed_payload(retryable: Any) -> str:
 
 def test_examples_cover_every_registered_event_type() -> None:
     assert {type(event).__name__ for event in EXAMPLES} == set(_EVENT_TYPES)
-    assert len(_EVENT_TYPES) == 22
+    assert len(_EVENT_TYPES) == 24
 
 
 @pytest.mark.parametrize(

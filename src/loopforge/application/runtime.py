@@ -12,11 +12,15 @@ from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
     ActionRejected,
+    ApprovalGranted,
+    ApprovalRejected,
+    ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
     Event,
+    OperatorInstruction,
     PlanCreated,
     RetryScheduled,
     RunStarted,
@@ -33,9 +37,14 @@ from loopforge.domain.reliability import (
     idempotency_key_for,
 )
 from loopforge.domain.routing import ModelCapabilities
-from loopforge.domain.state import RunState, replay
+from loopforge.domain.state import InvalidTransitionError, RunState, replay
 from loopforge.domain.telemetry import SpanName, SpanStatusCode
-from loopforge.domain.tooling import IdempotencyClass, SideEffectClass, ToolMetadata
+from loopforge.domain.tooling import (
+    ApprovalClass,
+    IdempotencyClass,
+    SideEffectClass,
+    ToolMetadata,
+)
 from loopforge.domain.types import (
     ActionId,
     EventId,
@@ -77,6 +86,11 @@ class UnknownRunError(LookupError):
 
 class UnsafeResumeStateError(RuntimeError):
     """Raised when an interrupted side effect cannot be replayed safely."""
+
+
+_INSTRUCTION_STATUSES = frozenset(
+    {RunStatus.READY, RunStatus.REFLECTING, RunStatus.WAITING_FOR_APPROVAL}
+)
 
 
 @dataclass(slots=True)
@@ -206,16 +220,101 @@ class Runtime:
     def _drive(self, run_id: RunId) -> RunState:
         drive = self._drive_states.setdefault(run_id, _DriveState())
         current = self.state_for(run_id)
-        while not current.status.is_terminal:
+        while self._is_drivable(current):
             current = self._drive_cycle(run_id, drive)
         return current
 
-    def _drive_cycle(self, run_id: RunId, drive: _DriveState) -> RunState:  # noqa: PLR0911, PLR0912, PLR0915 - the drive cycle is intentionally one flat orchestration of the authorized cycle; span instrumentation pushes it over the thresholds
+    @staticmethod
+    def _is_drivable(state: RunState) -> bool:
+        return not state.status.is_terminal and state.status is not RunStatus.WAITING_FOR_APPROVAL
+
+    def grant_approval(self, run_id: RunId, action_id: ActionId) -> RunState:
+        """Durably record operator approval for a pending approval-gated action.
+
+        The grant is an ordinary authoritative event: it cannot expand
+        authority (permissions are re-authorized before execution) and it is
+        rejected unless the run is waiting on exactly this action.
+        """
+        state = self.state_for(run_id)
+        if state.status is not RunStatus.WAITING_FOR_APPROVAL:
+            msg = f"run {run_id} is not waiting for approval (status {state.status.value})"
+            raise InvalidTransitionError(msg)
+        if state.current_action_id != str(action_id):
+            msg_2 = f"run {run_id} is not waiting on action {action_id}"
+            raise InvalidTransitionError(msg_2)
+        self._persist(
+            run_id,
+            lambda event_id, rid, occurred_at, sequence: ApprovalGranted(
+                event_id=event_id,
+                run_id=rid,
+                occurred_at=occurred_at,
+                sequence=sequence,
+                action_id=action_id,
+            ),
+        )
+        return self.state_for(run_id)
+
+    def reject_approval(self, run_id: RunId, action_id: ActionId, *, reason: str) -> RunState:
+        """Durably record operator denial of a pending approval-gated action."""
+        state = self.state_for(run_id)
+        if state.status is not RunStatus.WAITING_FOR_APPROVAL:
+            msg = f"run {run_id} is not waiting for approval (status {state.status.value})"
+            raise InvalidTransitionError(msg)
+        if state.current_action_id != str(action_id):
+            msg_2 = f"run {run_id} is not waiting on action {action_id}"
+            raise InvalidTransitionError(msg_2)
+        self._persist(
+            run_id,
+            lambda event_id, rid, occurred_at, sequence: ApprovalRejected(
+                event_id=event_id,
+                run_id=rid,
+                occurred_at=occurred_at,
+                sequence=sequence,
+                action_id=action_id,
+                reason=reason,
+            ),
+        )
+        return self.state_for(run_id)
+
+    def add_operator_instruction(
+        self, run_id: RunId, instruction: str, *, amend_objective: bool = False
+    ) -> RunState:
+        """Durably record an operator steering instruction for a non-terminal run.
+
+        Instructions can steer or amend the objective; they can never amend
+        budgets, permissions, or sandbox boundaries mid-run (AGENTS.md rule
+        11) — those have no mutation path at all.
+        """
+        state = self.state_for(run_id)
+        if state.status.is_terminal:
+            msg = f"terminal run {run_id} cannot accept operator instructions"
+            raise InvalidTransitionError(msg)
+        if state.status not in _INSTRUCTION_STATUSES:
+            msg_2 = (
+                f"run {run_id} cannot accept operator instructions while "
+                f"{state.status.value}; pause the run first"
+            )
+            raise InvalidTransitionError(msg_2)
+        self._persist(
+            run_id,
+            lambda event_id, rid, occurred_at, sequence: OperatorInstruction(
+                event_id=event_id,
+                run_id=rid,
+                occurred_at=occurred_at,
+                sequence=sequence,
+                instruction=instruction,
+                amends_objective=amend_objective,
+            ),
+        )
+        return self.state_for(run_id)
+
+    def _drive_cycle(self, run_id: RunId, drive: _DriveState) -> RunState:  # noqa: PLR0911 - the drive cycle is intentionally one flat orchestration of the authorized cycle; span instrumentation pushes it over the thresholds
         current = self.state_for(run_id)
-        if current.status.is_terminal:
+        if current.status.is_terminal or current.status is RunStatus.WAITING_FOR_APPROVAL:
             # A seam invoked mid-cycle (for example fail-closed artifact
             # recording after verification) may have already terminated
-            # the run; never stop it twice.
+            # the run; never stop it twice. A run waiting on an operator
+            # approval is quiescent: only a durable grant/reject moves it.
             return current
         if current.status is RunStatus.REFLECTING:
             # Resume() can enter the drive loop straight from a failed
@@ -227,6 +326,7 @@ class Runtime:
                 "Resume after failed verification; choose a new bounded action.",
             )
             current = self.state_for(run_id)
+        action = self._approved_pending_action(current)
         cycle = current.iteration + 1
         self._telemetry.set_cycle(cycle)
         with self._telemetry.span(
@@ -242,159 +342,12 @@ class Runtime:
                 self._stop(run_id, decision.stop_reason, decision.reason_code)
                 return self.state_for(run_id)
 
-            if self.router is not None:
-                # Routing selects which registered model serves this turn
-                # (vertical tier escalation, horizontal provider fallback)
-                # from authoritative state signals. It holds no authority:
-                # budgets, permissions, and stopping stay with the control
-                # policy above (AGENTS.md rule 12). A model-less decision
-                # fails closed through the existing RunStopped path.
-                route = self._route(
-                    run_id,
-                    current,
-                    active_model=drive.active_model,
-                    model_failure_streak=drive.model_failure_streak,
-                    fallback_requested=drive.fallback_requested,
-                )
-                if route is None:
+            if action is None:
+                action = self._propose_turn(run_id, drive)
+                if action is None:
+                    # The proposal path stopped the run (policy/model failure)
+                    # or scheduled a bounded retry instead of proposing.
                     return self.state_for(run_id)
-                drive.active_model = route
-                drive.fallback_requested = False
-
-            with self._telemetry.span(run_id, name=SpanName.CONTEXT_BUILD) as context_span:
-                model_context = self.context.build_context(current)
-                # Boundary validation is intentional: adapters may violate port return types.
-                if not isinstance(model_context, ModelContext):  # pyright: ignore[reportUnnecessaryIsInstance]
-                    msg_12 = (
-                        f"context builder returned {type(model_context).__name__}, "
-                        "expected ModelContext"
-                    )
-                    raise ContextContractError(msg_12)
-                if model_context.run_id != run_id:
-                    msg_13 = (
-                        f"context builder assembled context for run {model_context.run_id}, "
-                        f"expected {run_id}"
-                    )
-                    raise ContextContractError(msg_13)
-                context_span.attributes["loopforge.context.item_count"] = len(model_context.items)
-                context_span.attributes["loopforge.context.role"] = model_context.role.value
-                if model_context.prompt_template is not None:
-                    context_span.attributes["loopforge.prompt.template_id"] = (
-                        model_context.prompt_template.template_id
-                    )
-                    context_span.attributes["loopforge.prompt.template_version"] = (
-                        model_context.prompt_template.version
-                    )
-            self._telemetry.emit_context_accounting(run_id, self.context)
-            self._persist(
-                run_id,
-                lambda event_id, rid, occurred_at, sequence, ctx=model_context: ContextAssembled(
-                    event_id=event_id,
-                    run_id=rid,
-                    occurred_at=occurred_at,
-                    sequence=sequence,
-                    context_items=tuple(snapshot_of(item) for item in ctx.items),
-                    prompt_template_id=(
-                        ctx.prompt_template.template_id if ctx.prompt_template is not None else None
-                    ),
-                    prompt_template_version=(
-                        ctx.prompt_template.version if ctx.prompt_template is not None else None
-                    ),
-                ),
-            )
-
-            turn_model = drive.active_model if drive.active_model is not None else self.model
-            try:
-                with self._telemetry.span(run_id, name=SpanName.MODEL_TURN) as model_span:
-                    turn = turn_model.propose_action(model_context)
-                    # Boundary validation is intentional: adapters may violate port types.
-                    if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
-                        msg_7 = f"model adapter returned {type(turn).__name__}, expected ModelTurn"
-                        raise ModelContractError(msg_7)
-                    if not isinstance(turn.action, ActionProposal) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
-                        turn.usage, UsageDelta
-                    ):
-                        msg_8 = "model turn contains invalid action or usage payload"
-                        raise ModelContractError(msg_8)
-                    model_span.attributes["loopforge.usage.cost_usd"] = turn.usage.cost_usd
-                    model_span.attributes["loopforge.usage.input_tokens"] = turn.usage.input_tokens
-                    model_span.attributes["loopforge.usage.output_tokens"] = (
-                        turn.usage.output_tokens
-                    )
-                    model_span.attributes["loopforge.usage.cached_input_tokens"] = (
-                        turn.usage.cached_input_tokens
-                    )
-            except ModelTurnError as error:
-                # Provider failures arrive normalized and classified by the
-                # adapter; the runtime owns the stopping decision. Permanent
-                # failures stop the run explicitly; transient failures retry
-                # with bounded backoff inside the loop (a retry never
-                # persists an action, so it cannot burn max_iterations, and
-                # a crash mid-backoff resumes safely from READY). Adapter
-                # text is bounded at this boundary before it can enter the
-                # durable stream.
-                stop_summary = _bounded_stop_text(error.reason_code, error.summary)
-                if error.failure_class is ModelFailureClass.PERMANENT:
-                    self._stop(
-                        run_id,
-                        StopReason.FAILURE,
-                        error.reason_code,
-                        summary=stop_summary,
-                    )
-                    return self.state_for(run_id)
-                drive.model_failure_streak += 1
-                if drive.model_failure_streak >= self.reliability.retry.max_attempts:
-                    self._stop(
-                        run_id,
-                        StopReason.FAILURE,
-                        error.reason_code,
-                        summary=stop_summary,
-                    )
-                    return self.state_for(run_id)
-                # Ask the router for a horizontal fallback on the next
-                # iteration; with no compatible alternative it retains the
-                # current model (FALLBACK_UNAVAILABLE) and the bounded
-                # retry proceeds unchanged.
-                drive.fallback_requested = True
-                backoff = min(
-                    self.reliability.retry.base_delay_seconds
-                    * 2 ** (drive.model_failure_streak - 1),
-                    self.reliability.retry.max_delay_seconds,
-                )
-                self.sleeper.sleep(backoff)
-                return self.state_for(run_id)
-            drive.model_failure_streak = 0
-            self._persist(
-                run_id,
-                lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
-                    event_id=event_id,
-                    run_id=rid,
-                    occurred_at=occurred_at,
-                    sequence=sequence,
-                    usage=usage,
-                ),
-            )
-
-            after_debit = self.state_for(run_id)
-            with self._telemetry.span(run_id, name=SpanName.POLICY_DECISION) as budget_span:
-                budget_decision = self.control.evaluate(after_debit, now=self.clock.now())
-                budget_span.attributes["loopforge.policy.kind"] = budget_decision.kind.value
-                budget_span.attributes["loopforge.policy.reason_code"] = budget_decision.reason_code
-            if budget_decision.stop_reason is not None:
-                self._stop(run_id, budget_decision.stop_reason, budget_decision.reason_code)
-                return self.state_for(run_id)
-
-            action = turn.action
-            self._persist(
-                run_id,
-                lambda event_id, rid, occurred_at, sequence, action=action: ActionProposed(
-                    event_id=event_id,
-                    run_id=rid,
-                    occurred_at=occurred_at,
-                    sequence=sequence,
-                    proposal=action,
-                ),
-            )
 
             try:
                 metadata = self.tools.metadata_for(action.tool_name)
@@ -414,6 +367,33 @@ class Runtime:
                 return self.state_for(run_id)
             if not self.permissions.authorizes(metadata):
                 self._reject(run_id, action, "BLOCK_PERMISSION_DENIED")
+                return self.state_for(run_id)
+
+            if (
+                metadata.approval is not ApprovalClass.NONE
+                and str(action.action_id) not in current.approved_action_ids
+            ):
+                # Approval gateway (PACS-014): an approval-gated tool quiesces
+                # the run on a durable ApprovalRequested until the operator
+                # grants or rejects it. Approval can never expand authority —
+                # the permission check above has already run and runs again on
+                # the approved path; a grant only unblocks this exact action.
+                # POLICY_DEPENDENT fails closed to operator approval until an
+                # approval policy binding exists (a later cycle).
+                self._persist(
+                    run_id,
+                    lambda event_id, rid, occurred_at, sequence: ApprovalRequested(
+                        event_id=event_id,
+                        run_id=rid,
+                        occurred_at=occurred_at,
+                        sequence=sequence,
+                        action_id=action.action_id,
+                        reason=(
+                            f"tool {metadata.name} requires operator approval "
+                            f"({metadata.approval.value})"
+                        ),
+                    ),
+                )
                 return self.state_for(run_id)
 
             self._persist(
@@ -439,6 +419,183 @@ class Runtime:
                     "Previous verification failed; choose a new bounded action.",
                 )
             return self.state_for(run_id)
+
+    @staticmethod
+    def _approved_pending_action(state: RunState) -> ActionProposal | None:
+        """The durably approved proposal awaiting execution, if one is pending.
+
+        After a grant the reducer returns the run to READY with the approved
+        proposal still pending; the next drive cycle must execute exactly that
+        action instead of asking the model for a new one.
+        """
+        if (
+            state.status is RunStatus.READY
+            and state.current_proposal is not None
+            and state.current_action_id is not None
+            and state.current_action_id in state.approved_action_ids
+        ):
+            return state.current_proposal
+        return None
+
+    def _propose_turn(self, run_id: RunId, drive: _DriveState) -> ActionProposal | None:  # noqa: PLR0915 - the proposal path is intentionally one flat orchestration; span instrumentation pushes it over the thresholds
+        """Run the routing/context/model/proposal half of one drive cycle.
+
+        Returns the durably proposed action, or ``None`` when the run was
+        stopped (policy or model failure) or a bounded transient retry was
+        scheduled instead of a proposal.
+        """
+        current = self.state_for(run_id)
+        if self.router is not None:
+            # Routing selects which registered model serves this turn
+            # (vertical tier escalation, horizontal provider fallback)
+            # from authoritative state signals. It holds no authority:
+            # budgets, permissions, and stopping stay with the control
+            # policy above (AGENTS.md rule 12). A model-less decision
+            # fails closed through the existing RunStopped path.
+            route = self._route(
+                run_id,
+                current,
+                active_model=drive.active_model,
+                model_failure_streak=drive.model_failure_streak,
+                fallback_requested=drive.fallback_requested,
+            )
+            if route is None:
+                return None
+            drive.active_model = route
+            drive.fallback_requested = False
+
+        with self._telemetry.span(run_id, name=SpanName.CONTEXT_BUILD) as context_span:
+            model_context = self.context.build_context(current)
+            # Boundary validation is intentional: adapters may violate port return types.
+            if not isinstance(model_context, ModelContext):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg_12 = (
+                    f"context builder returned {type(model_context).__name__}, "
+                    "expected ModelContext"
+                )
+                raise ContextContractError(msg_12)
+            if model_context.run_id != run_id:
+                msg_13 = (
+                    f"context builder assembled context for run {model_context.run_id}, "
+                    f"expected {run_id}"
+                )
+                raise ContextContractError(msg_13)
+            context_span.attributes["loopforge.context.item_count"] = len(model_context.items)
+            context_span.attributes["loopforge.context.role"] = model_context.role.value
+            if model_context.prompt_template is not None:
+                context_span.attributes["loopforge.prompt.template_id"] = (
+                    model_context.prompt_template.template_id
+                )
+                context_span.attributes["loopforge.prompt.template_version"] = (
+                    model_context.prompt_template.version
+                )
+        self._telemetry.emit_context_accounting(run_id, self.context)
+        self._persist(
+            run_id,
+            lambda event_id, rid, occurred_at, sequence, ctx=model_context: ContextAssembled(
+                event_id=event_id,
+                run_id=rid,
+                occurred_at=occurred_at,
+                sequence=sequence,
+                context_items=tuple(snapshot_of(item) for item in ctx.items),
+                prompt_template_id=(
+                    ctx.prompt_template.template_id if ctx.prompt_template is not None else None
+                ),
+                prompt_template_version=(
+                    ctx.prompt_template.version if ctx.prompt_template is not None else None
+                ),
+            ),
+        )
+
+        turn_model = drive.active_model if drive.active_model is not None else self.model
+        try:
+            with self._telemetry.span(run_id, name=SpanName.MODEL_TURN) as model_span:
+                turn = turn_model.propose_action(model_context)
+                # Boundary validation is intentional: adapters may violate port types.
+                if not isinstance(turn, ModelTurn):  # pyright: ignore[reportUnnecessaryIsInstance]
+                    msg_7 = f"model adapter returned {type(turn).__name__}, expected ModelTurn"
+                    raise ModelContractError(msg_7)
+                if not isinstance(turn.action, ActionProposal) or not isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+                    turn.usage, UsageDelta
+                ):
+                    msg_8 = "model turn contains invalid action or usage payload"
+                    raise ModelContractError(msg_8)
+                model_span.attributes["loopforge.usage.cost_usd"] = turn.usage.cost_usd
+                model_span.attributes["loopforge.usage.input_tokens"] = turn.usage.input_tokens
+                model_span.attributes["loopforge.usage.output_tokens"] = turn.usage.output_tokens
+                model_span.attributes["loopforge.usage.cached_input_tokens"] = (
+                    turn.usage.cached_input_tokens
+                )
+        except ModelTurnError as error:
+            # Provider failures arrive normalized and classified by the
+            # adapter; the runtime owns the stopping decision. Permanent
+            # failures stop the run explicitly; transient failures retry
+            # with bounded backoff inside the loop (a retry never
+            # persists an action, so it cannot burn max_iterations, and
+            # a crash mid-backoff resumes safely from READY). Adapter
+            # text is bounded at this boundary before it can enter the
+            # durable stream.
+            stop_summary = _bounded_stop_text(error.reason_code, error.summary)
+            if error.failure_class is ModelFailureClass.PERMANENT:
+                self._stop(
+                    run_id,
+                    StopReason.FAILURE,
+                    error.reason_code,
+                    summary=stop_summary,
+                )
+                return None
+            drive.model_failure_streak += 1
+            if drive.model_failure_streak >= self.reliability.retry.max_attempts:
+                self._stop(
+                    run_id,
+                    StopReason.FAILURE,
+                    error.reason_code,
+                    summary=stop_summary,
+                )
+                return None
+            # Ask the router for a horizontal fallback on the next
+            # iteration; with no compatible alternative it retains the
+            # current model (FALLBACK_UNAVAILABLE) and the bounded
+            # retry proceeds unchanged.
+            drive.fallback_requested = True
+            backoff = min(
+                self.reliability.retry.base_delay_seconds * 2 ** (drive.model_failure_streak - 1),
+                self.reliability.retry.max_delay_seconds,
+            )
+            self.sleeper.sleep(backoff)
+            return None
+        drive.model_failure_streak = 0
+        self._persist(
+            run_id,
+            lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
+                event_id=event_id,
+                run_id=rid,
+                occurred_at=occurred_at,
+                sequence=sequence,
+                usage=usage,
+            ),
+        )
+
+        after_debit = self.state_for(run_id)
+        with self._telemetry.span(run_id, name=SpanName.POLICY_DECISION) as budget_span:
+            budget_decision = self.control.evaluate(after_debit, now=self.clock.now())
+            budget_span.attributes["loopforge.policy.kind"] = budget_decision.kind.value
+            budget_span.attributes["loopforge.policy.reason_code"] = budget_decision.reason_code
+        if budget_decision.stop_reason is not None:
+            self._stop(run_id, budget_decision.stop_reason, budget_decision.reason_code)
+            return None
+
+        action = turn.action
+        self._persist(
+            run_id,
+            lambda event_id, rid, occurred_at, sequence, action=action: ActionProposed(
+                event_id=event_id,
+                run_id=rid,
+                occurred_at=occurred_at,
+                sequence=sequence,
+                proposal=action,
+            ),
+        )
+        return action
 
     def _route(
         self,

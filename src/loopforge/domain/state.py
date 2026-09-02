@@ -10,12 +10,14 @@ from loopforge.domain.events import (
     ActionProposed,
     ActionRejected,
     ApprovalGranted,
+    ApprovalRejected,
     ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
     Event,
+    OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
     RetryScheduled,
@@ -95,6 +97,12 @@ class RunState:
     stop_reason: StopReason | None = None
     recorded_artifacts: tuple[ArtifactFingerprint, ...] = ()
     workers: tuple[WorkerProjection, ...] = ()
+    # Operator-control projections (PACS-014): durably approved actions the
+    # drive cycle may execute without a fresh approval request, the operator
+    # steering ledger, and the most recent approval-denial reason.
+    approved_action_ids: tuple[str, ...] = ()
+    operator_instructions: tuple[str, ...] = ()
+    last_approval_rejection: str | None = None
     version: int = 0
 
     @property
@@ -133,6 +141,12 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
     },
     ApprovalRequested: {RunStatus.READY},
     ApprovalGranted: {RunStatus.WAITING_FOR_APPROVAL},
+    ApprovalRejected: {RunStatus.WAITING_FOR_APPROVAL},
+    OperatorInstruction: {
+        RunStatus.READY,
+        RunStatus.REFLECTING,
+        RunStatus.WAITING_FOR_APPROVAL,
+    },
     WorkerSpawned: {RunStatus.READY, RunStatus.ACTING},
     WorkerStopped: {RunStatus.ACTING},
     WorkerMerged: {RunStatus.ACTING},
@@ -155,6 +169,12 @@ def _validate_transition(state: RunState, event: Event) -> None:
     if state.status not in allowed:
         msg_2 = f"{type(event).__name__} is invalid while run is {state.status.value}"
         raise InvalidTransitionError(msg_2)
+
+    if isinstance(event, (ApprovalRequested, ApprovalGranted, ApprovalRejected)) and (
+        state.current_action_id is None or str(event.action_id) != state.current_action_id
+    ):
+        msg_14 = "approval event does not match the pending action"
+        raise InvalidTransitionError(msg_14)
 
     if isinstance(event, (ToolExecutionStarted, ToolSucceeded, ToolFailed, RetryScheduled)) and (
         state.current_action_id is None or str(event.action_id) != state.current_action_id
@@ -385,18 +405,37 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             )
         case ApprovalRequested():
             return replace(base, status=RunStatus.WAITING_FOR_APPROVAL)
-        case ApprovalGranted():
-            return replace(base, status=RunStatus.READY)
+        case ApprovalGranted(action_id=action_id):
+            return replace(
+                base,
+                status=RunStatus.READY,
+                approved_action_ids=(*base.approved_action_ids, str(action_id)),
+            )
+        case ApprovalRejected(reason=reason):
+            return replace(
+                base,
+                current_action_id=None,
+                current_proposal=None,
+                current_tool_metadata=None,
+                current_attempt=0,
+                current_idempotency_key=None,
+                retry_not_before=None,
+                execution_in_flight=False,
+                status=RunStatus.READY,
+                last_approval_rejection=reason,
+            )
+        case OperatorInstruction(instruction=instruction, amends_objective=amends):
+            return replace(
+                base,
+                objective=instruction if amends else base.objective,
+                operator_instructions=(*base.operator_instructions, instruction),
+            )
         case RunStopped(reason=reason):
-            status = {
-                StopReason.SUCCESS_VERIFIED: RunStatus.SUCCEEDED,
-                StopReason.FAILURE: RunStatus.FAILED,
-                StopReason.STALLED: RunStatus.STALLED,
-                StopReason.BUDGET_EXHAUSTED: RunStatus.BUDGET_EXHAUSTED,
-                StopReason.MAX_ITERATIONS: RunStatus.FAILED,
-                StopReason.CANCELLED: RunStatus.CANCELLED,
-            }[reason]
-            return replace(base, status=status, stop_reason=reason)
+            return replace(
+                base,
+                status=_TERMINAL_STATUS_BY_REASON[reason],
+                stop_reason=reason,
+            )
         case WorkerSpawned(
             worker_id=worker_id,
             worker_run_id=worker_run_id,
@@ -441,3 +480,89 @@ def budget_exceeded(state: RunState, limit: BudgetLimit) -> bool:
     if state.cost_usd >= limit.max_cost_usd or state.iteration >= limit.max_iterations:
         return True
     return limit.max_total_tokens is not None and state.total_tokens >= limit.max_total_tokens
+
+
+_TERMINAL_STATUS_BY_REASON: dict[StopReason, RunStatus] = {
+    StopReason.SUCCESS_VERIFIED: RunStatus.SUCCEEDED,
+    StopReason.FAILURE: RunStatus.FAILED,
+    StopReason.STALLED: RunStatus.STALLED,
+    StopReason.BUDGET_EXHAUSTED: RunStatus.BUDGET_EXHAUSTED,
+    StopReason.MAX_ITERATIONS: RunStatus.FAILED,
+    StopReason.CANCELLED: RunStatus.CANCELLED,
+}
+
+# Deterministic post-status for events whose reducer arm always lands in one
+# status. Events absent from this table leave the run status unchanged
+# (BudgetDebited, ArtifactRecorded, CircuitOpened, OperatorInstruction,
+# WorkerStopped, WorkerMerged); RunStopped is reason-dependent and handled by
+# status_after_event. The reducer above remains the authority — store adapters
+# use this projection only to maintain their runs index, and a conformance
+# suite pins it equal to full replay.
+_STATUS_AFTER_EVENT: dict[type[Event], RunStatus] = {
+    RunStarted: RunStatus.PLANNING,
+    PlanCreated: RunStatus.READY,
+    ActionProposed: RunStatus.READY,
+    ActionAuthorized: RunStatus.ACTING,
+    ActionRejected: RunStatus.READY,
+    ToolExecutionStarted: RunStatus.ACTING,
+    ToolSucceeded: RunStatus.VERIFYING,
+    ToolFailed: RunStatus.VERIFYING,
+    RetryScheduled: RunStatus.ACTING,
+    VerificationPassed: RunStatus.VERIFYING,
+    VerificationFailed: RunStatus.REFLECTING,
+    ReflectionRecorded: RunStatus.REFLECTING,
+    ContextAssembled: RunStatus.READY,
+    ApprovalRequested: RunStatus.WAITING_FOR_APPROVAL,
+    ApprovalGranted: RunStatus.READY,
+    ApprovalRejected: RunStatus.READY,
+    WorkerSpawned: RunStatus.ACTING,
+}
+
+
+def status_after_event(event: Event) -> RunStatus | None:
+    """The run status after ``event``, or ``None`` when the status is unchanged.
+
+    Used by durable store adapters to maintain their runs-index projection
+    transactionally with each append. Mirrors the reducer arms exactly for
+    single-runtime streams; the one known divergence is a final
+    ``WorkerMerged`` that resolves an orchestrated roster (replay: VERIFYING,
+    index: ACTING until the next event), which is transient and self-heals on
+    the following verification event.
+    """
+    if isinstance(event, RunStopped):
+        return _TERMINAL_STATUS_BY_REASON[event.reason]
+    return _STATUS_AFTER_EVENT.get(type(event))
+
+
+@dataclass(frozen=True, slots=True)
+class RunRecord:
+    """Run-metadata projection for the runs index (StateStorePort.list_runs).
+
+    A listing summary, never authority: every field derives from the
+    authoritative event stream and is recomputable by replay at any time.
+    """
+
+    run_id: RunId
+    objective: str
+    status: RunStatus
+    started_at: datetime
+    last_occurred_at: datetime
+    cost_usd: float
+    stop_reason: StopReason | None
+
+
+def summarize_run(run_id: RunId, events: tuple[Event, ...]) -> RunRecord:
+    """Project one run's metadata record from its authoritative stream by replay."""
+    state = replay(run_id, events)
+    if state.started_at is None or state.last_occurred_at is None:
+        msg = f"run {run_id} stream is missing lifecycle timestamps"
+        raise ValueError(msg)
+    return RunRecord(
+        run_id=run_id,
+        objective=state.objective,
+        status=state.status,
+        started_at=state.started_at,
+        last_occurred_at=state.last_occurred_at,
+        cost_usd=state.cost_usd,
+        stop_reason=state.stop_reason,
+    )

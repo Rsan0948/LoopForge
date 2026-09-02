@@ -10,12 +10,14 @@ from loopforge.domain.events import (
     ActionProposed,
     ActionRejected,
     ApprovalGranted,
+    ApprovalRejected,
     ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
     Event,
+    OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
     RetryScheduled,
@@ -510,6 +512,24 @@ class RuntimeTelemetry:
             case ApprovalGranted(action_id=action_id):
                 self._log(event, LogSeverity.INFO, "approval granted", action_id=action_id)
                 self._metric(event, MetricName.APPROVALS_GRANTED, 1.0, action_id=action_id)
+            case ApprovalRejected(action_id=action_id, reason=reason):
+                self._log(
+                    event,
+                    LogSeverity.WARN,
+                    "approval rejected",
+                    action_id=action_id,
+                    attributes={"loopforge.approval.rejection_reason": SensitiveText(reason)},
+                )
+            case OperatorInstruction(instruction=instruction, amends_objective=amends):
+                self._log(
+                    event,
+                    LogSeverity.INFO,
+                    "operator instruction",
+                    attributes={
+                        "loopforge.operator.instruction": SensitiveText(instruction),
+                        "loopforge.operator.amends_objective": amends,
+                    },
+                )
             case RunStopped(reason=reason, summary=summary):
                 severity = (
                     LogSeverity.INFO

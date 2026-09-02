@@ -15,6 +15,7 @@ from loopforge.domain.events import (
     ActionProposed,
     ActionRejected,
     ApprovalGranted,
+    ApprovalRejected,
     ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
@@ -22,6 +23,7 @@ from loopforge.domain.events import (
     ContextAssembled,
     DomainEvent,
     Event,
+    OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
     RetryScheduled,
@@ -83,6 +85,8 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         BudgetDebited,
         ApprovalRequested,
         ApprovalGranted,
+        ApprovalRejected,
+        OperatorInstruction,
         RunStopped,
         WorkerSpawned,
         WorkerStopped,
@@ -361,6 +365,28 @@ def _construct_approval_granted(base: dict[str, Any], data: dict[str, Any]) -> E
     return ApprovalGranted(**base, action_id=ActionId(_required_str(data, "action_id")))
 
 
+def _construct_approval_rejected(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ApprovalRejected(
+        **base,
+        action_id=ActionId(_required_str(data, "action_id")),
+        reason=_required_str(data, "reason"),
+    )
+
+
+def _construct_operator_instruction(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return OperatorInstruction(
+        **base,
+        instruction=_required_str(data, "instruction"),
+        amends_objective=_optional_bool(data, "amends_objective", default=False),
+    )
+
+
+def _optional_bool(data: dict[str, Any], key: str, *, default: bool) -> bool:
+    if key not in data:
+        return default
+    return _required_bool(data, key)
+
+
 def _construct_run_stopped(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return RunStopped(
         **base,
@@ -418,6 +444,8 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "BudgetDebited": _construct_budget_debited,
     "ApprovalRequested": _construct_approval_requested,
     "ApprovalGranted": _construct_approval_granted,
+    "ApprovalRejected": _construct_approval_rejected,
+    "OperatorInstruction": _construct_operator_instruction,
     "RunStopped": _construct_run_stopped,
     "WorkerSpawned": _construct_worker_spawned,
     "WorkerStopped": _construct_worker_stopped,

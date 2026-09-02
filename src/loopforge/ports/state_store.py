@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from loopforge.domain.events import Event
+from loopforge.domain.state import RunRecord
 from loopforge.domain.types import RunId
 
 
@@ -32,3 +33,11 @@ class StateStorePort(Protocol):
     def events_for(self, run_id: RunId) -> tuple[Event, ...]: ...
 
     def current_version(self, run_id: RunId) -> int: ...
+
+    def list_runs(self) -> tuple[RunRecord, ...]:
+        """Project run metadata for every known stream, newest first.
+
+        The listing is a read-only projection over the authoritative streams
+        (D4 runs index); it never mutates run state.
+        """
+        ...

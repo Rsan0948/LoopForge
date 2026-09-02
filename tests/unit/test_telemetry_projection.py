@@ -13,12 +13,14 @@ from loopforge.domain.events import (
     ActionProposed,
     ActionRejected,
     ApprovalGranted,
+    ApprovalRejected,
     ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
     Event,
+    OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
     RetryScheduled,
@@ -485,6 +487,14 @@ def _catalog_examples() -> dict[type[Event], Event]:
             **_event_fields(17), action_id=ACTION_ID, reason="risky"
         ),
         ApprovalGranted: ApprovalGranted(**_event_fields(18), action_id=ACTION_ID),
+        ApprovalRejected: ApprovalRejected(
+            **_event_fields(22), action_id=ACTION_ID, reason="operator denied the write"
+        ),
+        OperatorInstruction: OperatorInstruction(
+            **_event_fields(23),
+            instruction="focus on the failing test only",
+            amends_objective=True,
+        ),
         RunStopped: RunStopped(
             **_event_fields(19), reason=StopReason.SUCCESS_VERIFIED, summary="done"
         ),

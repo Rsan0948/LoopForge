@@ -233,6 +233,58 @@ class ApprovalGranted(DomainEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ApprovalRejected(DomainEvent):
+    """Durable operator denial of a pending approval-gated action.
+
+    The reducer clears the pending proposal and returns the run to READY so
+    the drive cycle can re-plan; the reason is operator-authored text bounded
+    and sanitized at construction before it enters the durable stream.
+    """
+
+    action_id: ActionId
+    reason: str
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        validate_operator_text(self.reason, "approval rejection reason")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class OperatorInstruction(DomainEvent):
+    """Durable operator steering instruction for a non-terminal run.
+
+    Operator authority (AGENTS.md rule 16): instructions arrive only through
+    this event — the runtime never accepts silent out-of-band steering. When
+    ``amends_objective`` is set the instruction replaces the run objective in
+    the reducer projection; budgets, permissions, and sandbox boundaries are
+    unaffected (rule 11 — instructions can never amend authority mid-run).
+    """
+
+    instruction: str
+    amends_objective: bool = False
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        validate_operator_text(self.instruction, "operator instruction")
+
+
+_MAX_OPERATOR_TEXT = 4000
+
+
+def validate_operator_text(value: str, field: str) -> None:
+    """Bound and sanitize operator-authored text for durable events."""
+    if not value.strip():
+        msg = f"{field} cannot be empty"
+        raise ValueError(msg)
+    if len(value) > _MAX_OPERATOR_TEXT:
+        msg_2 = f"{field} exceeds {_MAX_OPERATOR_TEXT} characters"
+        raise ValueError(msg_2)
+    if any((ord(char) < 0x20 and char not in "\n\t") or ord(char) == 0x7F for char in value):
+        msg_3 = f"{field} must not contain control characters"
+        raise ValueError(msg_3)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class RunStopped(DomainEvent):
     reason: StopReason
     summary: str
@@ -334,6 +386,8 @@ Event = (
     | BudgetDebited
     | ApprovalRequested
     | ApprovalGranted
+    | ApprovalRejected
+    | OperatorInstruction
     | RunStopped
     | WorkerSpawned
     | WorkerStopped

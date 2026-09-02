@@ -15,12 +15,14 @@ from loopforge.domain.events import (
     ActionProposed,
     ActionRejected,
     ApprovalGranted,
+    ApprovalRejected,
     ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
     CircuitOpened,
     ContextAssembled,
     Event,
+    OperatorInstruction,
     PlanCreated,
     ReflectionRecorded,
     RetryScheduled,
@@ -337,6 +339,22 @@ def _approval_granted(sequence: int, *, action_id: str = "a1") -> ApprovalGrante
     )
 
 
+def _operator_instruction(
+    sequence: int,
+    *,
+    instruction: str = "focus on the failing test only",
+    amends_objective: bool = False,
+) -> OperatorInstruction:
+    return OperatorInstruction(
+        event_id=_event_id(sequence),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=sequence,
+        instruction=instruction,
+        amends_objective=amends_objective,
+    )
+
+
 def _stopped(sequence: int, *, reason: StopReason = StopReason.SUCCESS_VERIFIED) -> RunStopped:
     return RunStopped(
         event_id=_event_id(sequence),
@@ -354,7 +372,7 @@ def _state_at(stage: str) -> RunState:
     chains: dict[str, tuple[Event, ...]] = {
         "planning": (_started(1),),
         "ready": (_started(1), _planned(2)),
-        "waiting": (_started(1), _planned(2), _approval_requested(3)),
+        "waiting": (_started(1), _planned(2), _proposed(3), _approval_requested(4)),
         "acting": (_started(1), _planned(2), _proposed(3), _authorized(4)),
         "acting_in_flight": (
             _started(1),
@@ -800,11 +818,88 @@ def test_budget_debited_accumulates_usage() -> None:
 
 
 def test_approval_request_and_grant_round_trip() -> None:
-    state = reduce_event(_state_at("ready"), _approval_requested(3))
+    state = replay(RUN, (_started(1), _planned(2), _proposed(3)))
+    state = reduce_event(state, _approval_requested(4))
     assert state.status is RunStatus.WAITING_FOR_APPROVAL
 
-    state = reduce_event(state, _approval_granted(4))
+    state = reduce_event(state, _approval_granted(5))
     assert state.status is RunStatus.READY
+    assert state.approved_action_ids == ("a1",)
+    # The approved proposal stays pending for the next drive cycle.
+    assert state.current_action_id == "a1"
+    assert state.current_proposal is not None
+
+
+def test_approval_events_require_a_matching_pending_action() -> None:
+    ready = _state_at("ready")
+    with pytest.raises(InvalidTransitionError, match="approval event does not match"):
+        reduce_event(ready, _approval_requested(3))
+
+    waiting = _state_at("waiting")
+    with pytest.raises(InvalidTransitionError, match="approval event does not match"):
+        reduce_event(waiting, _approval_granted(4, action_id="other"))
+
+
+def test_approval_rejection_clears_the_pending_action() -> None:
+    waiting = _state_at("waiting")
+
+    state = reduce_event(
+        waiting,
+        ApprovalRejected(
+            event_id=_event_id(5),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=5,
+            action_id=ActionId("a1"),
+            reason="operator denied the write",
+        ),
+    )
+
+    assert state.status is RunStatus.READY
+    assert state.current_action_id is None
+    assert state.current_proposal is None
+    assert state.last_approval_rejection == "operator denied the write"
+    assert state.approved_action_ids == ()
+
+
+def test_approval_rejection_requires_waiting_with_matching_action() -> None:
+    rejected = ApprovalRejected(
+        event_id=_event_id(5),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=5,
+        action_id=ActionId("a1"),
+        reason="no",
+    )
+    with pytest.raises(InvalidTransitionError, match="invalid while run is ready"):
+        reduce_event(_state_at("ready"), rejected)
+    with pytest.raises(InvalidTransitionError, match="approval event does not match"):
+        reduce_event(_state_at("waiting"), replace(rejected, action_id=ActionId("other")))
+
+
+@pytest.mark.parametrize("stage", ["ready", "reflecting", "waiting"])
+def test_operator_instruction_records_steering_and_preserves_status(stage: str) -> None:
+    state = reduce_event(_state_at(stage), _operator_instruction(9))
+
+    assert state.operator_instructions == ("focus on the failing test only",)
+    assert state.objective == "repair"
+    assert state.status is _state_at(stage).status
+
+
+def test_operator_instruction_can_amend_the_objective() -> None:
+    state = reduce_event(
+        _state_at("ready"),
+        _operator_instruction(3, instruction="only fix adder.py", amends_objective=True),
+    )
+
+    assert state.objective == "only fix adder.py"
+    assert state.operator_instructions == ("only fix adder.py",)
+
+
+@pytest.mark.parametrize("stage", ["planning", "acting", "verifying"])
+def test_operator_instruction_is_rejected_outside_quiescent_states(stage: str) -> None:
+    with pytest.raises(InvalidTransitionError, match="OperatorInstruction is invalid"):
+        reduce_event(_state_at(stage), _operator_instruction(9))
 
 
 @pytest.mark.parametrize(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 from loopforge.domain.events import Event
+from loopforge.domain.state import RunRecord, summarize_run
 from loopforge.domain.types import EventId, RunId
 from loopforge.ports.state_store import DuplicateEventError, StreamVersionConflictError
 
@@ -40,3 +41,12 @@ class InMemoryEventStore:
 
     def current_version(self, run_id: RunId) -> int:
         return len(self._events[run_id])
+
+    def list_runs(self) -> tuple[RunRecord, ...]:
+        records = [
+            summarize_run(run_id, tuple(events))
+            for run_id, events in self._events.items()
+            if events
+        ]
+        records.sort(key=lambda record: record.started_at, reverse=True)
+        return tuple(records)

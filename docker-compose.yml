@@ -1,0 +1,23 @@
+# Local operator session store for the LoopForge command center (PACS-014).
+# Trusted-operator local tool: the database binds localhost only and holds
+# durable run event streams. Start with: docker compose up -d loopforge-db
+services:
+  loopforge-db:
+    image: postgres:17
+    container_name: loopforge-db
+    environment:
+      POSTGRES_USER: loopforge
+      POSTGRES_PASSWORD: loopforge
+      POSTGRES_DB: loopforge
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - loopforge-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U loopforge -d loopforge"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  loopforge-pgdata:
