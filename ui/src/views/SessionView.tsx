@@ -61,6 +61,15 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   const [instruction, setInstruction] = useState("");
 
   const streamRef = useRef<HTMLDivElement | null>(null);
+  // Monotonic guard against out-of-order REST responses: two in-flight
+  // getSession calls can resolve older-last, and for a terminal run no
+  // further event would ever correct the overwritten (stale) detail.
+  const detailVersionRef = useRef(-1);
+  const applyDetail = useCallback((fresh: SessionDetail) => {
+    if (fresh.version < detailVersionRef.current) return;
+    detailVersionRef.current = fresh.version;
+    setDetail(fresh);
+  }, []);
 
   // -- data flow: REST initial load, WS live stream, REST reconcile ----------
 
@@ -76,7 +85,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
     const refreshDetail = (): void => {
       void getSession(runId)
         .then((fresh) => {
-          if (!disposed.current) setDetail(fresh);
+          if (!disposed.current) applyDetail(fresh);
         })
         .catch(() => undefined);
     };
@@ -165,7 +174,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
           getArtifacts(runId),
         ]);
         if (disposed.current) return;
-        setDetail(initial);
+        applyDetail(initial);
         setArtifacts(initialArtifacts);
         ingest(page.events);
         connect();
@@ -220,7 +229,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
             getSession(runId),
             getArtifacts(runId),
           ]);
-          setDetail(freshDetail);
+          applyDetail(freshDetail);
           setArtifacts(freshArtifacts);
         } catch (err) {
           setToast(err instanceof ApiError ? err.detail : String(err));

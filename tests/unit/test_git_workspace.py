@@ -211,6 +211,33 @@ def test_status_survives_non_utf8_file_names(tmp_path: Path) -> None:
     assert any("py" in path for path in status.untracked)
 
 
+def test_diff_marks_untracked_renders_with_a_diff_git_header(tmp_path: Path) -> None:
+    workspace = _manager(tmp_path).materialize(_fixture())
+    (workspace.root / "module.py").write_text("value = 2\n", encoding="utf-8")
+    (workspace.root / "notes.txt").write_text("hello\n", encoding="utf-8")
+
+    patch = workspace.diff()
+
+    # Every file section opens with a `diff --git` header — an untracked
+    # render must never look like a continuation of the previous file.
+    assert patch.count("diff --git ") == 2
+    assert "diff --git a/notes.txt b/notes.txt\nnew file mode 100644\n--- /dev/null" in patch
+
+
+def test_diff_renders_renames_as_delete_and_add(tmp_path: Path) -> None:
+    workspace = _manager(tmp_path).materialize(_fixture())
+    (workspace.root / "module.py").rename(workspace.root / "renamed.py")
+
+    patch = workspace.diff()
+
+    # --no-renames keeps every changed path individually revertible and in
+    # the same grammar status() reports (delete + add, never rename from/to).
+    assert "rename from" not in patch
+    assert "rename to" not in patch
+    assert "diff --git a/module.py b/module.py" in patch
+    assert "diff --git a/renamed.py b/renamed.py" in patch
+
+
 def test_diff_renders_untracked_new_files_without_index_mutation(tmp_path: Path) -> None:
     workspace = _manager(tmp_path).materialize(_fixture())
     (workspace.root / "notes.txt").write_text("hello\n", encoding="utf-8")

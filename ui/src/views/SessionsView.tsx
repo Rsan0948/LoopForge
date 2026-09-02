@@ -97,8 +97,18 @@ function buildInlineProfile(form: InlineForm): { error: string } | { profile: In
   if (!Number.isInteger(maxIterations) || maxIterations <= 0) {
     return { error: "max_iterations must be a positive integer" };
   }
-  const maxTotalTokens = form.maxTotalTokens.trim() === "" ? null : Number(form.maxTotalTokens);
-  const maxElapsedSeconds = form.maxElapsedSeconds.trim() === "" ? null : Number(form.maxElapsedSeconds);
+  const tokensTrim = form.maxTotalTokens.trim();
+  const maxTotalTokens = tokensTrim === "" ? null : Number(tokensTrim);
+  // NaN/Infinity would serialize as null over JSON — silently becoming
+  // "no limit" — so non-finite input is a form error, never a payload.
+  if (maxTotalTokens !== null && (!Number.isInteger(maxTotalTokens) || maxTotalTokens <= 0)) {
+    return { error: "max_total_tokens must be a positive integer" };
+  }
+  const elapsedTrim = form.maxElapsedSeconds.trim();
+  const maxElapsedSeconds = elapsedTrim === "" ? null : Number(elapsedTrim);
+  if (maxElapsedSeconds !== null && (!Number.isFinite(maxElapsedSeconds) || maxElapsedSeconds <= 0)) {
+    return { error: "max_elapsed_seconds must be positive" };
+  }
   return {
     profile: {
       repository: form.repository.trim(),

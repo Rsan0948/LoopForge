@@ -44,7 +44,13 @@ export default function App(): ReactElement {
         </a>
       </header>
       <main className="app-main">
-        {route.kind === "sessions" ? <SessionsView /> : <SessionView runId={route.runId} />}
+        {route.kind === "sessions" ? (
+          <SessionsView />
+        ) : (
+          // Keyed by runId: switching sessions must remount the view so no
+          // events, detail, artifacts, or fatal banners leak across runs.
+          <SessionView key={route.runId} runId={route.runId} />
+        )}
       </main>
     </div>
   );

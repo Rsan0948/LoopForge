@@ -182,7 +182,12 @@ class GitWorkspace:
         return WorkspaceStatus(changed=tuple(sorted(changed)), untracked=tuple(sorted(untracked)))
 
     def diff(self) -> str:
-        tracked = self.run_git("diff", "--no-color", "--no-ext-diff", self._base_revision, "--")
+        # --no-renames: status() reports renames as delete+add, so the diff
+        # must use the same grammar — every changed path stays individually
+        # revertible through checkout().
+        tracked = self.run_git(
+            "diff", "--no-color", "--no-ext-diff", "--no-renames", self._base_revision, "--"
+        )
         parts = [tracked] if tracked.strip() else []
         for relative in self.status().untracked:
             rendered = self._render_new_file_diff(relative)
@@ -246,7 +251,12 @@ class GitWorkspace:
             fromfile="/dev/null",
             tofile=f"b/{relative}",
         )
-        return "".join(rendered)
+        # Emit the same per-file grammar as git itself: every file section in
+        # the evidence document opens with a `diff --git` header, so downstream
+        # parsers never mistake a headerless new-file render for a continuation
+        # of the previous tracked file.
+        header = f"diff --git a/{relative} b/{relative}\nnew file mode 100644\n"
+        return header + "".join(rendered)
 
     def run_git(self, *args: str) -> str:
         if _metadata_fingerprint(self._root) != self._metadata_fingerprint:

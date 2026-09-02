@@ -50,6 +50,65 @@ function stripGitPrefix(path: string): string {
   return path.replace(/^[ab]\//, "");
 }
 
+/**
+ * Decode git's C-style quoting for paths with special/non-ASCII bytes
+ * (`"a/f\303\251.py"`). Unquoted paths pass through unchanged; a path that
+ * stays quoted after a failed decode is returned as-is (display-only).
+ */
+function decodeGitCQuote(path: string): string {
+  if (!path.startsWith('"') || !path.endsWith('"') || path.length < 2) return path;
+  const body = path.slice(1, -1);
+  const bytes: number[] = [];
+  const encoder = new TextEncoder();
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (ch === "\\" && i + 1 < body.length) {
+      const octal = body.slice(i + 1, i + 4);
+      if (/^[0-7]{3}$/.test(octal)) {
+        bytes.push(parseInt(octal, 8));
+        i += 3;
+        continue;
+      }
+      const simple: Record<string, string> = {
+        "\\": "\\",
+        '"': '"',
+        n: "\n",
+        t: "\t",
+        r: "\r",
+        b: "\b",
+        f: "\f",
+        v: "\v",
+      };
+      const mapped = simple[body[i + 1]];
+      if (mapped !== undefined) {
+        bytes.push(...encoder.encode(mapped));
+        i += 1;
+        continue;
+      }
+    }
+    bytes.push(...encoder.encode(ch));
+  }
+  return new TextDecoder().decode(new Uint8Array(bytes));
+}
+
+/** Normalize a path exactly as git printed it: C-unquote, then strip a//b/. */
+function normalizeGitPath(path: string): string {
+  return stripGitPrefix(decodeGitCQuote(path));
+}
+
+/**
+ * Extract the b-side path from a `diff --git` line. Git does NOT quote plain
+ * spaces in this line, so a \S+ regex truncates `foo bar.sh` — split on the
+ * LAST ` b/` (or `"b/` for C-quoted paths) instead.
+ */
+function diffGitBSide(line: string): string | null {
+  const plain = line.lastIndexOf(" b/");
+  const quoted = line.lastIndexOf(' "b/');
+  const marker = Math.max(plain, quoted);
+  if (marker < 0) return null;
+  return line.slice(marker + 1).trim();
+}
+
 export function parseWorkspaceSnapshot(content: string): ParsedSnapshot | null {
   try {
     const lines = content.split("\n");
@@ -99,10 +158,9 @@ export function parseWorkspaceSnapshot(content: string): ParsedSnapshot | null {
     for (const line of diffLines) {
       if (line.startsWith("diff --git ")) {
         finishFile();
-        const match = /^diff --git (\S+) (\S+)/.exec(line);
-        const bSide = match?.[2];
+        const bSide = diffGitBSide(line);
         current = {
-          path: bSide !== undefined ? stripGitPrefix(bSide) : "(unknown)",
+          path: bSide !== null ? normalizeGitPath(bSide) : "(unknown)",
           additions: 0,
           deletions: 0,
           lines: [{ kind: "meta", text: line }],
@@ -116,11 +174,11 @@ export function parseWorkspaceSnapshot(content: string): ParsedSnapshot | null {
       }
       if (line.startsWith("--- ")) {
         const path = line.slice(4).trim();
-        oldPath = path === "/dev/null" ? null : stripGitPrefix(path);
+        oldPath = path === "/dev/null" ? null : normalizeGitPath(path);
         current.lines.push({ kind: "meta", text: line });
       } else if (line.startsWith("+++ ")) {
         const path = line.slice(4).trim();
-        newPath = path === "/dev/null" ? null : stripGitPrefix(path);
+        newPath = path === "/dev/null" ? null : normalizeGitPath(path);
         current.lines.push({ kind: "meta", text: line });
       } else if (line.startsWith("@@")) {
         current.lines.push({ kind: "hunk", text: line });
