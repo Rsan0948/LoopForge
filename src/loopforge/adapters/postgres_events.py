@@ -78,9 +78,15 @@ _MIGRATIONS: tuple[tuple[int, tuple[LiteralString, ...]], ...] = (
             $func$
             """,
             """
+            DROP TRIGGER IF EXISTS events_append_only_update ON events
+            """,
+            """
             CREATE TRIGGER events_append_only_update
             BEFORE UPDATE ON events
             FOR EACH ROW EXECUTE FUNCTION events_are_append_only()
+            """,
+            """
+            DROP TRIGGER IF EXISTS events_append_only_delete ON events
             """,
             """
             CREATE TRIGGER events_append_only_delete
@@ -112,6 +118,10 @@ class PostgresEventStore:
 
     def _initialize(self) -> None:
         with self._connect() as connection:
+            # Serialize concurrent first-initializations across processes:
+            # without a lock, two openers of a fresh database both run the
+            # migration and the loser crashes on duplicate trigger creation.
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext('loopforge-store-init'))")
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS event_store_migrations (
@@ -154,6 +164,12 @@ class PostgresEventStore:
             ).fetchall()
         ]
         for run_id in run_ids:
+            # Take the same per-run advisory transaction lock append() holds:
+            # a concurrent appender then either commits before the fold (and
+            # is included in it) or waits and overwrites the backfilled row
+            # with its own transactional upsert — the index can never revert
+            # to a pre-append snapshot.
+            connection.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (run_id,))
             rows = connection.execute(
                 "SELECT payload FROM events WHERE run_id = %s ORDER BY sequence ASC",
                 (run_id,),

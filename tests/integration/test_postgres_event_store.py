@@ -272,3 +272,57 @@ def test_runs_index_backfills_when_index_rows_are_lost(store: PostgresEventStore
     assert record.run_id == RUN
     assert record.status is RunStatus.PLANNING
     assert record.objective == "repair"
+
+
+def test_concurrent_first_initialization_both_succeed(store: PostgresEventStore) -> None:
+    """Racing first-openers of a fresh database must all succeed (advisory lock)."""
+    del store
+    with psycopg.connect(DSN, autocommit=True) as connection:
+        connection.execute("DROP SCHEMA public CASCADE")
+        connection.execute("CREATE SCHEMA public")
+
+    def open_store(_index: int) -> str:
+        try:
+            PostgresEventStore(DSN, codec=JsonEventCodec())
+        except Exception:
+            return "failed"
+        return "opened"
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        outcomes = list(executor.map(open_store, range(4)))
+
+    assert outcomes == ["opened"] * 4
+
+
+def test_backfill_then_append_keeps_the_index_equal_to_replay(
+    store: PostgresEventStore,
+) -> None:
+    """A backfill must never revert the index to a pre-append snapshot.
+
+    The rebuild takes the same per-run advisory lock append() holds, so a
+    concurrent appender either lands inside the fold or commits after it and
+    overwrites the backfilled row with its own transactional upsert — the
+    terminal event can never be lost from the index.
+    """
+    store.append(_started(), expected_version=0)
+    with psycopg.connect(DSN) as connection:
+        connection.execute("TRUNCATE runs")
+
+    backfilled = PostgresEventStore(DSN, codec=JsonEventCodec())
+    appender = PostgresEventStore(DSN, codec=JsonEventCodec())
+    appender.append(
+        RunStopped(
+            event_id=EventId("stop"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=2,
+            reason=StopReason.CANCELLED,
+            summary="operator stop",
+        ),
+        expected_version=1,
+    )
+
+    (record,) = backfilled.list_runs()
+
+    assert record.status is RunStatus.CANCELLED
+    assert record == summarize_run(RUN, backfilled.events_for(RUN))

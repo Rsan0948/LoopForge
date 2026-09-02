@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections import defaultdict
 
 from loopforge.domain.events import Event
@@ -9,32 +10,38 @@ from loopforge.ports.state_store import DuplicateEventError, StreamVersionConfli
 
 
 class InMemoryEventStore:
-    """Reference in-memory event store with the same CAS contract as SQLite."""
+    """Reference in-memory event store with the same CAS contract as SQLite.
+
+    The version check and the append are one critical section: two threads
+    must never both pass the check and double-append the same sequence.
+    """
 
     def __init__(self) -> None:
         self._events: dict[RunId, list[Event]] = defaultdict(list)
         self._event_ids: set[EventId] = set()
+        self._lock = threading.Lock()
 
     def append(self, event: Event, *, expected_version: int) -> int:
-        actual = len(self._events[event.run_id])
-        if actual != expected_version:
-            raise StreamVersionConflictError(
-                event.run_id,
-                expected=expected_version,
-                actual=actual,
-            )
-        if event.sequence != expected_version + 1:
-            msg = (
-                f"event sequence {event.sequence} does not match "
-                f"expected next sequence {expected_version + 1}"
-            )
-            raise ValueError(msg)
-        if event.event_id in self._event_ids:
-            msg_2 = f"duplicate event id: {event.event_id}"
-            raise DuplicateEventError(msg_2)
-        self._events[event.run_id].append(event)
-        self._event_ids.add(event.event_id)
-        return expected_version + 1
+        with self._lock:
+            actual = len(self._events[event.run_id])
+            if actual != expected_version:
+                raise StreamVersionConflictError(
+                    event.run_id,
+                    expected=expected_version,
+                    actual=actual,
+                )
+            if event.sequence != expected_version + 1:
+                msg = (
+                    f"event sequence {event.sequence} does not match "
+                    f"expected next sequence {expected_version + 1}"
+                )
+                raise ValueError(msg)
+            if event.event_id in self._event_ids:
+                msg_2 = f"duplicate event id: {event.event_id}"
+                raise DuplicateEventError(msg_2)
+            self._events[event.run_id].append(event)
+            self._event_ids.add(event.event_id)
+            return expected_version + 1
 
     def events_for(self, run_id: RunId) -> tuple[Event, ...]:
         return tuple(self._events[run_id])

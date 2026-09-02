@@ -179,6 +179,38 @@ def test_folded_index_tracks_status_through_an_open_stream() -> None:
     assert row.cost_usd == 0.0
 
 
+def test_folded_index_tracks_an_amended_objective() -> None:
+    """An amending OperatorInstruction updates the index objective (replay parity)."""
+    started = _started(1, objective="original")
+    planned = PlanCreated(
+        event_id=EventId("e2"), run_id=RUN, occurred_at=NOW, sequence=2, plan="inspect"
+    )
+    amended = OperatorInstruction(
+        event_id=EventId("e3"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=3,
+        instruction="amended objective",
+        amends_objective=True,
+    )
+    steered = OperatorInstruction(
+        event_id=EventId("e4"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=4,
+        instruction="non-amending steer",
+    )
+    events = (started, planned, amended, steered)
+    row: _RunIndexRow | None = None
+    for event in events:
+        row = fold_run_index_row(row, event)
+    assert row is not None
+
+    replayed = summarize_run(RUN, events)
+
+    assert row.objective == replayed.objective == "amended objective"
+
+
 def test_summarize_run_rejects_an_empty_stream() -> None:
     with pytest.raises(ValueError, match="missing lifecycle timestamps"):
         summarize_run(RUN, ())

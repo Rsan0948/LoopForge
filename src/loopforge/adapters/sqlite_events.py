@@ -7,7 +7,13 @@ from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
-from loopforge.domain.events import BudgetDebited, Event, RunStarted, RunStopped
+from loopforge.domain.events import (
+    BudgetDebited,
+    Event,
+    OperatorInstruction,
+    RunStarted,
+    RunStopped,
+)
 from loopforge.domain.state import RunRecord, status_after_event
 from loopforge.domain.types import RunId, RunStatus, StopReason
 from loopforge.ports.event_codec import EventCodecPort
@@ -110,6 +116,11 @@ def fold_run_index_row(row: _RunIndexRow | None, event: Event) -> _RunIndexRow:
         updated = replace(updated, cost_usd=updated.cost_usd + event.usage.cost_usd)
     if isinstance(event, RunStopped):
         updated = replace(updated, stop_reason=event.reason.value)
+    if isinstance(event, OperatorInstruction) and event.amends_objective:
+        # Mirror the reducer's OperatorInstruction arm: an amending
+        # instruction replaces the objective, and the index is pinned equal
+        # to full replay by the conformance suite.
+        updated = replace(updated, objective=event.instruction)
     return updated
 
 
@@ -195,6 +206,13 @@ class SQLiteEventStore:
             return
         connection.execute("BEGIN IMMEDIATE")
         try:
+            # Re-check inside the write transaction: a concurrent opener may
+            # have completed the backfill while this opener waited on the
+            # database lock (the fold+decode can outlive the busy timeout).
+            indexed = connection.execute("SELECT COUNT(*) FROM runs").fetchone()
+            if (int(indexed[0]) if indexed is not None else 0) >= stream_count:
+                connection.execute("COMMIT")
+                return
             run_ids = [
                 str(row[0])
                 for row in connection.execute(
