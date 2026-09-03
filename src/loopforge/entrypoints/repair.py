@@ -59,6 +59,7 @@ from loopforge.ports.workspace import WorkspacePort
 from loopforge.workloads.repair import (
     REPAIR_MODEL_REQUIREMENTS,
     UNTRUSTED_REPAIR_REQUIREMENTS,
+    RepairCheck,
     RepairCommand,
     RepairContextBuilder,
     RepairTask,
@@ -165,12 +166,15 @@ def build_trusted_repair_runtime(
     *,
     workspaces_dir: str | Path,
     deps: RepairRuntimeDeps,
+    checks: tuple[RepairCheck, ...] = (),
 ) -> RepairRuntimeBundle:
     """Wire the deterministic repair stack on the trusted local sandbox.
 
     This path executes code-defined fixtures through the full runtime with a
     scripted model; it does not claim hostile-code isolation. Untrusted
     fixture execution must use :func:`build_container_repair_runtime`.
+    ``checks`` are code-owned acceptance hooks (e.g. the benchmark
+    ambiguous-success edge probe), never repository or model content.
     """
     workspace = _materialize_workspace(task, workspaces_dir=workspaces_dir)
     sandbox: SandboxPort = ConstrainedLocalSandbox(
@@ -184,6 +188,7 @@ def build_trusted_repair_runtime(
         sandbox=sandbox,
         requirements=SandboxRequirements(),
         deps=deps,
+        checks=checks,
     )
 
 
@@ -243,6 +248,7 @@ def build_container_repair_runtime(
     image: str,
     workspaces_dir: str | Path,
     deps: RepairRuntimeDeps,
+    checks: tuple[RepairCheck, ...] = (),
 ) -> RepairRuntimeBundle:
     """Wire the repair stack for untrusted fixture execution (PACS-009 boundary).
 
@@ -266,6 +272,7 @@ def build_container_repair_runtime(
         sandbox=sandbox,
         requirements=UNTRUSTED_REPAIR_REQUIREMENTS,
         deps=deps,
+        checks=checks,
     )
 
 
@@ -282,6 +289,7 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
     requirements: SandboxRequirements,
     deps: RepairRuntimeDeps,
     approval_required_for: frozenset[str] = frozenset(),
+    checks: tuple[RepairCheck, ...] = (),
 ) -> RepairRuntimeBundle:
     tools: NamedToolExecutor = CompositeToolExecutor(
         (
@@ -316,7 +324,7 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
         model=model,
         router=router,
         tools=tools,
-        verifier=RepairVerifier(sandbox, workspace, task.acceptance),
+        verifier=RepairVerifier(sandbox, workspace, task.acceptance, hooks=checks),
         store=deps.store,
         control=ControlPolicy(
             deps.budget or BudgetLimit(max_cost_usd=1.0, max_iterations=8),
