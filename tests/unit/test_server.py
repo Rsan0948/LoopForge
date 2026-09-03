@@ -1253,3 +1253,113 @@ def test_force_release_denies_a_terminal_run_over_http(tmp_path: Path) -> None:
 
         assert response.status_code == 409, response.text
         assert "already terminal" in response.json()["detail"]
+
+
+# --- provenance / explain / lineage (PACS-015) ----------------------------------
+
+
+def _driven_run(client: TestClient, repo: Path) -> str:
+    run_id = _create(client, repo)
+    client.post(f"/api/sessions/{run_id}/start")
+    _wait_for_status(client, run_id, "succeeded")
+    return run_id
+
+
+def test_provenance_route_serves_the_derived_graph_deterministically(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _driven_run(client, repo)
+
+        first = client.get(f"/api/sessions/{run_id}/provenance")
+        assert first.status_code == 200, first.text
+        graph = first.json()
+        assert graph["run_id"] == run_id
+        node_ids = [node["node_id"] for node in graph["nodes"]]
+        assert len(node_ids) == len(set(node_ids))
+        # One node per durable event, in stream order.
+        events = client.get(f"/api/sessions/{run_id}/events").json()["events"]
+        assert len(graph["nodes"]) == len(events)
+        assert [node["sequence"] for node in graph["nodes"]] == [
+            event["event"]["sequence"] for event in events
+        ]
+        kinds = {node["kind"] for node in graph["nodes"]}
+        assert {"requirement", "model_turn", "action", "verification"} <= kinds
+        known = set(node_ids)
+        for edge in graph["edges"]:
+            assert edge["source_id"] in known
+            assert edge["target_id"] in known
+        # Pure projection: the same stream always yields the identical graph.
+        second = client.get(f"/api/sessions/{run_id}/provenance")
+        assert second.json() == graph
+
+
+def test_provenance_route_denies_an_unknown_run(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/sessions/run_ghost/provenance")
+        assert response.status_code == 404, response.text
+
+
+def test_explain_route_answers_why_a_node_happened(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _driven_run(client, repo)
+        graph = client.get(f"/api/sessions/{run_id}/provenance").json()
+        action = next(node for node in graph["nodes"] if node["kind"] == "action")
+
+        response = client.get(f"/api/sessions/{run_id}/explain", params={"node": action["node_id"]})
+
+        assert response.status_code == 200, response.text
+        explanation = response.json()
+        assert explanation["run_id"] == run_id
+        assert explanation["node"]["node_id"] == action["node_id"]
+        # The causal spine reaches back to the requirement, oldest first.
+        assert explanation["chain"][-1]["sequence"] < explanation["node"]["sequence"]
+        assert explanation["chain"][0]["kind"] == "requirement"
+        sequences = [item["sequence"] for item in explanation["chain"]]
+        assert sequences == sorted(sequences)
+
+
+def test_explain_route_denies_unknown_nodes_and_missing_params(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _driven_run(client, repo)
+
+        unknown = client.get(f"/api/sessions/{run_id}/explain", params={"node": "action:999"})
+        assert unknown.status_code == 404, unknown.text
+        assert "unknown provenance node" in unknown.json()["detail"]
+
+        missing = client.get(f"/api/sessions/{run_id}/explain")
+        assert missing.status_code == 422, missing.text
+
+
+def test_lineage_route_links_follow_up_runs_in_both_directions(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        root = _driven_run(client, repo)
+        follow = client.post(f"/api/sessions/{root}/follow-up")
+        assert follow.status_code == 201, follow.text
+        child = follow.json()["run_id"]
+
+        child_lineage = client.get(f"/api/sessions/{child}/lineage")
+        assert child_lineage.status_code == 200, child_lineage.text
+        assert child_lineage.json() == {
+            "run_id": child,
+            "parent_run_id": root,
+            "ancestors": [root],
+            "children": [],
+        }
+
+        root_lineage = client.get(f"/api/sessions/{root}/lineage")
+        assert root_lineage.status_code == 200, root_lineage.text
+        assert root_lineage.json() == {
+            "run_id": root,
+            "parent_run_id": None,
+            "ancestors": [],
+            "children": [child],
+        }
+
+
+def test_lineage_route_denies_an_unknown_run(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/sessions/run_ghost/lineage")
+        assert response.status_code == 404, response.text

@@ -31,8 +31,10 @@ from loopforge.adapters.fanout_store import FanOutEventStore
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.postgres_events import PostgresEventStore
 from loopforge.adapters.sqlite_events import SQLiteEventStore
+from loopforge.application.provenance import build_provenance_graph, explain_provenance
 from loopforge.application.runtime import UnknownRunError
 from loopforge.domain.events import ApprovalRequested, ArtifactRecorded, Event
+from loopforge.domain.provenance import ProvenanceNode, UnknownProvenanceNodeError
 from loopforge.domain.state import InvalidTransitionError
 from loopforge.domain.types import RunId, RunStatus
 from loopforge.entrypoints.profile import ProfileError
@@ -320,6 +322,9 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
         return JSONResponse(status_code=500, content={"detail": str(exc)})
 
     app.add_exception_handler(UnknownRunError, unknown_run_handler)
+    # An explain query naming a node the graph does not contain: the run
+    # exists, the addressed sub-resource does not.
+    app.add_exception_handler(UnknownProvenanceNodeError, unknown_run_handler)
     app.add_exception_handler(UnmanagedRunError, conflict_handler)
     app.add_exception_handler(InvalidTransitionError, conflict_handler)
     app.add_exception_handler(SessionStateError, conflict_handler)
@@ -437,6 +442,51 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
             ]
         }
 
+    def _node_json(node: ProvenanceNode) -> dict[str, object]:
+        return {
+            "node_id": node.node_id,
+            "kind": node.kind.value,
+            "event_type": node.event_type,
+            "sequence": node.sequence,
+            "occurred_at": node.occurred_at,
+            "summary": node.summary,
+            "attributes": dict(node.attributes),
+        }
+
+    def session_provenance_route(run_id: str) -> dict[str, object]:
+        """The derived provenance DAG (PACS-015): pure projection, on demand."""
+        graph = build_provenance_graph(manager.events(run_id))
+        return {
+            "run_id": run_id,
+            "nodes": [_node_json(node) for node in graph.nodes],
+            "edges": [
+                {"source_id": edge.source_id, "target_id": edge.target_id, "kind": edge.kind.value}
+                for edge in graph.edges
+            ],
+        }
+
+    def session_explain_route(run_id: str, node: str = Query(min_length=1)) -> dict[str, object]:
+        """The evidence chain answering \"why did this node happen?\"."""
+        graph = build_provenance_graph(manager.events(run_id))
+        explanation = explain_provenance(graph, node)
+        return {
+            "run_id": run_id,
+            "node": _node_json(explanation.node),
+            "chain": [_node_json(item) for item in explanation.chain],
+            "supporting": [_node_json(item) for item in explanation.supporting],
+            "outcomes": [_node_json(item) for item in explanation.outcomes],
+        }
+
+    def session_lineage_route(run_id: str) -> dict[str, object]:
+        """The run's follow-up lineage (PACS-015): parent, ancestors, children."""
+        lineage = manager.lineage(run_id)
+        return {
+            "run_id": lineage.run_id,
+            "parent_run_id": lineage.parent_run_id,
+            "ancestors": list(lineage.ancestors),
+            "children": list(lineage.children),
+        }
+
     def _status_response(run_id: str) -> dict[str, str]:
         return {"run_id": run_id, "status": manager.state(run_id).status.value}
 
@@ -499,6 +549,11 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_route("/api/sessions/{run_id}", session_detail_route, methods=["GET"])
     app.add_api_route("/api/sessions/{run_id}/events", session_events_route, methods=["GET"])
     app.add_api_route("/api/sessions/{run_id}/artifacts", session_artifacts_route, methods=["GET"])
+    app.add_api_route(
+        "/api/sessions/{run_id}/provenance", session_provenance_route, methods=["GET"]
+    )
+    app.add_api_route("/api/sessions/{run_id}/explain", session_explain_route, methods=["GET"])
+    app.add_api_route("/api/sessions/{run_id}/lineage", session_lineage_route, methods=["GET"])
     app.add_api_route("/api/sessions/{run_id}/start", start_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/pause", pause_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/resume", resume_route, methods=["POST"])
