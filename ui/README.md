@@ -10,12 +10,16 @@ event stream (D6) — the console never writes run state directly.
 - `src/api.ts` — typed client for every REST endpoint + WS URL derivation
   (relative URLs; the SPA works under the backend's static mount with no config)
 - `src/events.ts` — typed mirror of the `JsonEventCodec` wire envelope
-  (24 event types, schema v1) + human-readable stream labels
+  (25 event types, schema v1) + human-readable stream labels
 - `src/views/SessionsView.tsx` — sessions list, new-session panel
   (profile picker or validated inline profile, incl. the approval gate)
 - `src/views/SessionView.tsx` — session detail: WS-driven live event stream
   (sequence dedupe, reconnect backoff, REST reconciliation), approval banner,
-  start/pause/resume/stop/instruct controls, objective amendment, artifacts
+  start/pause/resume/stop/instruct controls, objective amendment, artifacts,
+  provenance panel (PACS-015: the derived DAG with inline explain chains —
+  fetched on demand, refreshed with the stream only while open), lineage
+  links (parent/children navigation), and a force-release control whose
+  confirm is gated on an explicit "bypass replay checks" checkbox
 - `src/DiffViewer.tsx` — `workspace_snapshot` artifact renderer with
   selective/full rollback controls
 - Hash routing (`#/sessions`, `#/sessions/:runId`) so the static mount needs

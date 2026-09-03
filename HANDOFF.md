@@ -37,7 +37,34 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-014.
+Completed: PACS-001 through PACS-015.
+
+PACS-015 (execution provenance graph and trajectory debugger, 2026-09-03)
+gives the operator a replayable answer to "why did the system take this
+action?" without any new authority or persistence: a provenance DAG derived
+purely on demand from the authoritative event stream (closed node/edge
+vocabulary — no thought/CoT kinds, ADR-0011), an explain surface whose
+causal spine walks only forward edge kinds, and per-turn model identity as
+durable evidence-only `ModelTurnRecorded` events (catalog 24→25,
+operator-signed-off; schema stays v1). Follow-up runs are linked by an
+optional `RunStarted.parent_run_id` payload field (pre-015 streams replay
+byte-identical), resolvable both directions via `/lineage`. Force-release
+closes the zombie-claim gap: a replay-free compare-and-appended
+`RunStopped(CANCELLED)` that works on corrupted streams, denies the
+mechanically checkable cases (driving/terminal/unknown/missing literal
+`confirm: true`), and honestly documents that the operator is the liveness
+check (no cross-process liveness marker exists). The console exposes all of
+it: a provenance panel with inline explain chains, lineage links, and a
+checkbox-gated force-release control. A dedicated adversarial pass found
+two fabricated-causality bugs (stale trigger attribution; unconditional
+stop attribution — both confirmed live before/after on the same durable
+stream) and two error-handling gaps (decode failures misreported as
+422/bare-500; transient store errors swallowed by force-release) — all
+fixed and pinned in `d945bdd`. Live validation: real PG + Ollama +
+container run, lineage both directions, zombie drill (kill mid-drive →
+409 claim → force-release → 201), and the PG suite regression-checked
+against an untouched production DB. Cycle commits `f2d6bf3`..`d945bdd`;
+see `docs/process/cycles/PACS-015-execution-provenance-graph.md`.
 
 PACS-014 (operator command center, 2026-09-02) gave the operator a durable
 authority channel and a live console without ceding any runtime authority.
