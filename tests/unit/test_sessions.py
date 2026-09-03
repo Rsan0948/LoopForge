@@ -1252,3 +1252,38 @@ def test_force_release_succeeds_where_stop_fails_on_a_corrupted_stream(tmp_path:
     assert isinstance(stop, RunStopped)
     assert stop.reason is StopReason.CANCELLED
     assert stop.summary == "corrupted stream release"
+
+
+class _FlakyStore(InMemoryEventStore):
+    """Simulates a transient store read failure (e.g. sqlite 'database is locked')."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.reads_locked = False
+
+    def events_for(self, run_id: RunId) -> tuple[Event, ...]:
+        if self.reads_locked:
+            msg = "database is locked"
+            raise RuntimeError(msg)
+        return super().events_for(run_id)
+
+
+def test_force_release_propagates_transient_store_errors_without_appending(
+    tmp_path: Path,
+) -> None:
+    # A transient read failure says nothing about the run's terminality: it
+    # must NOT be swallowed into the corrupted-stream fallback (which would
+    # skip the deny-checks and append anyway). It propagates, and nothing is
+    # appended.
+    backing = _FlakyStore()
+    store = FanOutEventStore(backing)
+    manager = _manager(tmp_path, _plain_factory(), store=store)
+    run_id = manager.create_session(_wiring())
+    rid = RunId(run_id)
+    version = store.current_version(rid)
+    backing.reads_locked = True
+
+    with pytest.raises(RuntimeError, match="database is locked"):
+        manager.force_release(run_id)
+
+    assert store.current_version(rid) == version

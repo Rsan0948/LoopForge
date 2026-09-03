@@ -28,7 +28,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from loopforge.adapters.fanout_store import FanOutEventStore
-from loopforge.adapters.json_events import JsonEventCodec
+from loopforge.adapters.json_events import (
+    JsonEventCodec,
+    UnknownEventTypeError,
+    UnsupportedEventSchemaError,
+)
 from loopforge.adapters.postgres_events import PostgresEventStore
 from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.application.provenance import build_provenance_graph, explain_provenance
@@ -330,6 +334,14 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_exception_handler(SessionStateError, conflict_handler)
     # A cross-process compare-and-append race (two servers on one store).
     app.add_exception_handler(StreamVersionConflictError, conflict_handler)
+    # Stream decode failures are server-side corruption, never client
+    # errors: they land in the 500 {"detail"} family (registered before the
+    # generic ValueError handler so specificity wins), and the TypeError
+    # family (malformed envelopes, field drift) never becomes a bare
+    # plain-text 500.
+    app.add_exception_handler(UnsupportedEventSchemaError, registry_error_handler)
+    app.add_exception_handler(UnknownEventTypeError, registry_error_handler)
+    app.add_exception_handler(TypeError, registry_error_handler)
     app.add_exception_handler(ProfileError, unprocessable_handler)
     # Workspace checkout/reset failures (empty or unrevertible paths).
     app.add_exception_handler(WorkspaceError, unprocessable_handler)

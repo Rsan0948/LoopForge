@@ -48,7 +48,7 @@ from loopforge.adapters.telemetry import InMemoryTelemetry
 from loopforge.application.maintenance import force_stop_run
 from loopforge.application.runtime import UnknownRunError
 from loopforge.domain.events import Event, RunStarted
-from loopforge.domain.state import RunState, replay
+from loopforge.domain.state import InvalidTransitionError, RunState, replay
 from loopforge.domain.types import ActionId, RunId, RunStatus
 from loopforge.entrypoints.cli import build_deepseek_model, build_ollama_model
 from loopforge.entrypoints.followup import consolidate_follow_up_report
@@ -495,9 +495,12 @@ class SessionManager:
             state = self.state(rid)
         except UnknownRunError:
             raise
-        except Exception:
-            # The stream no longer replays: precisely the case this command
-            # exists for. Fall through to the replay-free stop.
+        except (InvalidTransitionError, TypeError, ValueError):
+            # The stream no longer replays or decodes: precisely the case
+            # this command exists for. Fall through to the replay-free stop.
+            # Transient store errors (I/O, locking) are NOT in this list —
+            # they say nothing about the run's terminality, must not bypass
+            # the deny-checks, and propagate to the 500 mapping instead.
             state = None
         if state is not None and state.status.is_terminal:
             msg_2 = f"run {rid} is already terminal ({state.status.value}); nothing to release"

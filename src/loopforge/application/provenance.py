@@ -54,6 +54,7 @@ from loopforge.domain.provenance import (
     ProvenanceNode,
     ProvenanceNodeKind,
 )
+from loopforge.domain.types import StopReason
 
 _MAX_SUMMARY = 120
 
@@ -257,8 +258,14 @@ def build_provenance_graph(events: tuple[Event, ...]) -> ProvenanceGraph:  # noq
     requirement_id: str | None = None
     last_context_id: str | None = None
     last_model_turn: tuple[str, str] | None = None  # (node id, action id)
+    # Sticky pointer for evidence edges (reflection/artifact/stop attribution).
     last_verification_id: str | None = None
-    last_reflection_id: str | None = None
+    # Consumable trigger attribution: a verification or reflection triggers
+    # exactly the NEXT model turn and is then spent — re-attributing it to a
+    # later turn (after an approval rejection, an operator instruction, or a
+    # mid-loop tool result) would fabricate a causal claim the stream
+    # contradicts. Spent turns fall back to the requirement (weak but honest).
+    pending_trigger_id: str | None = None
     last_tool_result_id: str | None = None
     proposed_of: dict[str, str] = {}
     authorized_of: dict[str, str] = {}
@@ -288,10 +295,11 @@ def build_provenance_graph(events: tuple[Event, ...]) -> ProvenanceGraph:  # noq
                 last_context_id = node.node_id
             case ModelTurnRecorded(action_id=action_id):
                 link(last_context_id, node.node_id, ProvenanceEdgeKind.INFORMED_BY)
-                # The turn was triggered by the most recent durable signal:
-                # a reflection, a verification, or the original requirement.
-                trigger = last_reflection_id or last_verification_id or requirement_id
+                # The turn was triggered by the most recent unconsumed durable
+                # signal: a reflection, a verification, or the requirement.
+                trigger = pending_trigger_id or requirement_id
                 link(trigger, node.node_id, ProvenanceEdgeKind.TRIGGERED)
+                pending_trigger_id = None
                 last_model_turn = (node.node_id, str(action_id))
             case ActionProposed(proposal=proposal):
                 if last_model_turn is not None and last_model_turn[1] == str(proposal.action_id):
@@ -333,9 +341,10 @@ def build_provenance_graph(events: tuple[Event, ...]) -> ProvenanceGraph:  # noq
                 link(last_tool_result_id, node.node_id, ProvenanceEdgeKind.VERIFIED_BY)
                 last_tool_result_id = None
                 last_verification_id = node.node_id
+                pending_trigger_id = node.node_id
             case ReflectionRecorded():
                 link(last_verification_id, node.node_id, ProvenanceEdgeKind.TRIGGERED)
-                last_reflection_id = node.node_id
+                pending_trigger_id = node.node_id
             case ArtifactRecorded():
                 link(last_verification_id, node.node_id, ProvenanceEdgeKind.RECORDED)
             case (
@@ -347,8 +356,13 @@ def build_provenance_graph(events: tuple[Event, ...]) -> ProvenanceGraph:  # noq
             case OperatorInstruction(amends_objective=amends):
                 if amends:
                     link(node.node_id, requirement_id, ProvenanceEdgeKind.AMENDS)
-            case RunStopped():
-                link(last_verification_id, node.node_id, ProvenanceEdgeKind.RESULTED_IN)
+            case RunStopped(reason=reason):
+                # Only a verified-success stop actually RESULTED from a
+                # verification; cancelled/budget/failure stops have their
+                # proximate cause in the reason payload, not in the last
+                # verification (an edge there would be fabricated).
+                if reason is StopReason.SUCCESS_VERIFIED:
+                    link(last_verification_id, node.node_id, ProvenanceEdgeKind.RESULTED_IN)
             case WorkerSpawned(worker_id=worker_id):
                 last_worker_node_of[str(worker_id)] = node.node_id
             case WorkerStopped(worker_id=worker_id) | WorkerMerged(worker_id=worker_id):

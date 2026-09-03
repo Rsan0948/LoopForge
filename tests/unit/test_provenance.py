@@ -21,6 +21,7 @@ from loopforge.domain.events import (
     ActionAuthorized,
     ActionProposed,
     ApprovalGranted,
+    ApprovalRejected,
     ApprovalRequested,
     ArtifactRecorded,
     BudgetDebited,
@@ -706,3 +707,220 @@ def test_node_summaries_are_truncated_and_flattened() -> None:
 
     assert len(result.summary) <= 120
     assert "\n" not in result.summary
+
+
+# --- Trigger attribution honesty (consumed signals, gated stop edges) ------------
+
+
+def _turn_stream_with_approval_rejection() -> tuple[Event, ...]:
+    """A verification triggers exactly one turn; an approval rejection starts another."""
+    return (
+        RunStarted(
+            event_id=_event_id(1), run_id=RUN, occurred_at=NOW, sequence=1, objective="repair"
+        ),
+        ContextAssembled(
+            event_id=_event_id(2), run_id=RUN, occurred_at=NOW, sequence=2, context_items=()
+        ),
+        ModelTurnRecorded(
+            event_id=_event_id(3),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=3,
+            provider="ollama",
+            model="devstral-small-2:latest",
+            action_id=ActionId("a1"),
+        ),
+        ActionProposed(
+            event_id=_event_id(4),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=4,
+            proposal=_proposal("a1", "run_tests"),
+        ),
+        ActionAuthorized(
+            event_id=_event_id(5),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=5,
+            proposal=_proposal("a1", "run_tests"),
+            tool_metadata=_metadata("run_tests"),
+        ),
+        ToolExecutionStarted(
+            event_id=_event_id(6),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=6,
+            action_id=ActionId("a1"),
+            attempt=1,
+            idempotency_key=None,
+        ),
+        ToolFailed(
+            event_id=_event_id(7),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=7,
+            action_id=ActionId("a1"),
+            error_code="CHECK_FAILED",
+            error_message="tests failed",
+            failure_class=ToolFailureClass.PERMANENT,
+            attempt=1,
+        ),
+        VerificationFailed(
+            event_id=_event_id(8),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=8,
+            summary="command:run_tests: failed (exit_code=1)",
+            score=0.0,
+        ),
+        ContextAssembled(
+            event_id=_event_id(9), run_id=RUN, occurred_at=NOW, sequence=9, context_items=()
+        ),
+        ModelTurnRecorded(
+            event_id=_event_id(10),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=10,
+            provider="ollama",
+            model="devstral-small-2:latest",
+            action_id=ActionId("a2"),
+        ),
+        ActionProposed(
+            event_id=_event_id(11),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=11,
+            proposal=_proposal("a2", "edit_file"),
+        ),
+        ApprovalRequested(
+            event_id=_event_id(12),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=12,
+            action_id=ActionId("a2"),
+            reason="approval-gated write",
+        ),
+        ApprovalRejected(
+            event_id=_event_id(13),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=13,
+            action_id=ActionId("a2"),
+            reason="too broad",
+        ),
+        ContextAssembled(
+            event_id=_event_id(14), run_id=RUN, occurred_at=NOW, sequence=14, context_items=()
+        ),
+        ModelTurnRecorded(
+            event_id=_event_id(15),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=15,
+            provider="ollama",
+            model="devstral-small-2:latest",
+            action_id=ActionId("a3"),
+        ),
+    )
+
+
+def test_a_verification_triggers_exactly_one_turn_then_is_spent() -> None:
+    graph = build_provenance_graph(_turn_stream_with_approval_rejection())
+    edge_set = {(edge.source_id, edge.target_id, edge.kind) for edge in graph.edges}
+
+    # The verification triggered the turn that followed it...
+    assert ("verification:8", "model_turn:10", ProvenanceEdgeKind.TRIGGERED) in edge_set
+    # ...but after an approval rejection the next turn is NOT re-attributed to
+    # the same (spent) verification — that would fabricate a causal claim the
+    # stream contradicts. It falls back to the requirement (weak but honest).
+    assert ("verification:8", "model_turn:15", ProvenanceEdgeKind.TRIGGERED) not in edge_set
+    assert ("requirement:1", "model_turn:15", ProvenanceEdgeKind.TRIGGERED) in edge_set
+
+
+def _stop_stream(reason: StopReason) -> tuple[Event, ...]:
+    return (
+        RunStarted(
+            event_id=_event_id(1), run_id=RUN, occurred_at=NOW, sequence=1, objective="repair"
+        ),
+        ContextAssembled(
+            event_id=_event_id(2), run_id=RUN, occurred_at=NOW, sequence=2, context_items=()
+        ),
+        ModelTurnRecorded(
+            event_id=_event_id(3),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=3,
+            provider="ollama",
+            model="devstral-small-2:latest",
+            action_id=ActionId("a1"),
+        ),
+        ActionProposed(
+            event_id=_event_id(4),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=4,
+            proposal=_proposal("a1", "run_tests"),
+        ),
+        ActionAuthorized(
+            event_id=_event_id(5),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=5,
+            proposal=_proposal("a1", "run_tests"),
+            tool_metadata=_metadata("run_tests"),
+        ),
+        ToolExecutionStarted(
+            event_id=_event_id(6),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=6,
+            action_id=ActionId("a1"),
+            attempt=1,
+            idempotency_key=None,
+        ),
+        ToolSucceeded(
+            event_id=_event_id(7),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=7,
+            action_id=ActionId("a1"),
+            observation="all tests pass",
+            attempt=1,
+        ),
+        VerificationPassed(
+            event_id=_event_id(8),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=8,
+            summary="command:run_tests: passed",
+        ),
+        RunStopped(
+            event_id=_event_id(9),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=9,
+            reason=reason,
+            summary="stop",
+        ),
+    )
+
+
+def test_a_verified_success_stop_results_from_the_verification() -> None:
+    graph = build_provenance_graph(_stop_stream(StopReason.SUCCESS_VERIFIED))
+    edge_set = {(edge.source_id, edge.target_id, edge.kind) for edge in graph.edges}
+
+    assert ("verification:8", "stop:9", ProvenanceEdgeKind.RESULTED_IN) in edge_set
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [StopReason.CANCELLED, StopReason.BUDGET_EXHAUSTED, StopReason.FAILURE, StopReason.STALLED],
+)
+def test_non_verification_stops_claim_no_verification_cause(reason: StopReason) -> None:
+    # A cancelled (operator stop, force-release), budget, or failure stop has
+    # its proximate cause in the reason payload — never in the last
+    # verification. The graph records the absence honestly.
+    graph = build_provenance_graph(_stop_stream(reason))
+
+    inbound = graph.inbound("stop:9")
+
+    assert [edge for edge in inbound if edge.kind is ProvenanceEdgeKind.RESULTED_IN] == []

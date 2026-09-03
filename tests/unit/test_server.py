@@ -9,6 +9,7 @@ stream live events over the WebSocket fan-out.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import threading
 import time
@@ -1363,3 +1364,68 @@ def test_lineage_route_denies_an_unknown_run(tmp_path: Path) -> None:
     with _client(tmp_path, _plain_factory()) as client:
         response = client.get("/api/sessions/run_ghost/lineage")
         assert response.status_code == 404, response.text
+
+
+def _corrupt_payload(
+    sqlite_path: Path, event_type: str, mutate: Callable[[dict[str, Any]], None]
+) -> None:
+    # Corruption is exactly what the append-only trigger exists to prevent,
+    # so simulating bit-rot has to drop it first (restored afterwards).
+    connection = sqlite3.connect(sqlite_path)
+    try:
+        row = connection.execute(
+            "SELECT payload FROM events WHERE event_type = ? LIMIT 1", (event_type,)
+        ).fetchone()
+        assert row is not None
+        payload = json.loads(row[0])
+        mutate(payload)
+        connection.execute("DROP TRIGGER events_are_append_only_update")
+        connection.execute(
+            "UPDATE events SET payload = ? WHERE event_type = ?",
+            (json.dumps(payload), event_type),
+        )
+        connection.execute(
+            """
+            CREATE TRIGGER events_are_append_only_update
+            BEFORE UPDATE ON events
+            BEGIN
+                SELECT RAISE(ABORT, 'events are append-only');
+            END
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_provenance_route_fails_closed_with_detail_shape_on_a_corrupted_stream(
+    tmp_path: Path,
+) -> None:
+    # A mistyped stored field is server-side corruption: the read route fails
+    # closed with the consistent {"detail": ...} 500 shape — never a bare
+    # plain-text 500, and never a 422 blaming a parameterless GET.
+    repo = _repo(tmp_path / "repo")
+    sqlite_path = tmp_path / "events.db"
+    with _client(tmp_path, _plain_factory(), sqlite_path=sqlite_path) as client:
+        run_id = _driven_run(client, repo)
+        _corrupt_payload(sqlite_path, "RunStarted", lambda p: p["event"].update(objective=42))
+
+        response = client.get(f"/api/sessions/{run_id}/provenance")
+
+        assert response.status_code == 500, response.text
+        assert "detail" in response.json()
+
+
+def test_provenance_route_maps_unknown_event_types_to_500_not_422(tmp_path: Path) -> None:
+    # UnknownEventTypeError is a ValueError subclass: the explicit 500
+    # registration must win over the generic ValueError -> 422 mapping.
+    repo = _repo(tmp_path / "repo")
+    sqlite_path = tmp_path / "events.db"
+    with _client(tmp_path, _plain_factory(), sqlite_path=sqlite_path) as client:
+        run_id = _driven_run(client, repo)
+        _corrupt_payload(sqlite_path, "PlanCreated", lambda p: p.update(event_type="Ghost"))
+
+        response = client.get(f"/api/sessions/{run_id}/provenance")
+
+        assert response.status_code == 500, response.text
+        assert "unknown event type" in response.json()["detail"]
