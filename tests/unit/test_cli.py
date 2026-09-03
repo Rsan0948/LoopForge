@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import runpy
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -34,6 +35,10 @@ _REQUIRES_RLIMIT_AS = pytest.mark.skipif(
         "platform rejects setrlimit(RLIMIT_AS); local sandbox launcher cannot apply "
         "resource limits, so the trusted repair demo fails closed"
     ),
+)
+_REQUIRES_GIT = pytest.mark.skipif(
+    shutil.which("git") is None,
+    reason="git executable unavailable; eval trials materialize fixtures with the Git CLI",
 )
 
 DEMO_LINE = re.compile(r"run=run_[0-9a-f]{12} status=succeeded iterations=2 cost=\$0\.02")
@@ -482,3 +487,187 @@ def test_loop_dry_run_prints_resolved_profile_without_running(
     assert "acceptance required=['unit_tests']" in out
     assert "model provider=scripted" in out
     assert "budget max_cost=$5.00 max_iterations=30" in out
+
+
+# --- PACS-016 (M6): eval command pins ---
+
+
+def test_eval_list_reports_empty_results_dir(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "eval", "--list", "--results-dir", str(tmp_path))
+
+    assert main() == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    assert f"no eval reports in {tmp_path}" in captured.out
+
+
+def test_eval_show_unknown_report_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "eval", "--show", "eval-missing", "--results-dir", str(tmp_path))
+
+    assert main() == 1
+
+    captured = capsys.readouterr()
+    assert "unknown eval report 'eval-missing'" in captured.out
+
+
+def test_eval_rejects_unknown_task_id(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "eval", "--tasks", "nope-task", "--results-dir", str(tmp_path))
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "unknown benchmark task_id 'nope-task'" in captured.out
+
+
+def test_eval_rejects_unknown_configuration_preset(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(
+        monkeypatch,
+        "eval",
+        "--tasks",
+        "bench-simple-bug",
+        "--config",
+        "bogus",
+        "--results-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "unknown eval configuration preset 'bogus'" in captured.out
+
+
+def test_eval_rejects_zero_trials(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "eval", "--trials", "0", "--results-dir", str(tmp_path))
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "--trials must be at least 1" in captured.out
+
+
+def test_eval_rejects_non_eval_model_choice(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # argparse accepts deepseek globally; eval supports scripted|ollama only.
+    _argv(monkeypatch, "eval", "--model", "deepseek", "--results-dir", str(tmp_path))
+
+    assert main() == 2
+
+    captured = capsys.readouterr()
+    assert "eval supports --model scripted|ollama" in captured.out
+
+
+def test_eval_container_task_without_image_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # CONTAINER-mode tasks never fall back to the trusted path (rule 13): the
+    # eval aborts loudly instead of running an unsandboxed trial.
+    _argv(
+        monkeypatch,
+        "eval",
+        "--tasks",
+        "bench-simple-bug",
+        "--trials",
+        "1",
+        "--results-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 1
+
+    captured = capsys.readouterr()
+    assert "eval trial failed" in captured.out
+    assert "no container image was wired" in captured.out
+    assert list(tmp_path.glob("*.json")) == []
+
+
+@_REQUIRES_GIT
+@_REQUIRES_RLIMIT_AS
+def test_eval_scripted_trial_runs_saves_lists_and_shows(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(
+        monkeypatch,
+        "eval",
+        "--tasks",
+        "bench-transient-api",
+        "--trials",
+        "1",
+        "--config",
+        "baseline",
+        "--results-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 0
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+    out = captured.out
+    assert "eval report=eval-" in out
+    assert "bench-transient-api" in out
+    assert "100.0%" in out
+    assert "pareto frontier: baseline" in out
+    saved_line = next(line for line in out.splitlines() if line.startswith("report saved: "))
+    report_path = Path(saved_line.removeprefix("report saved: "))
+    assert report_path.is_file()
+    report_id = report_path.stem
+
+    _argv(monkeypatch, "eval", "--list", "--results-dir", str(tmp_path))
+
+    assert main() == 0
+
+    listed = capsys.readouterr().out
+    assert report_id in listed
+    assert "configs=baseline" in listed
+    assert "tasks=1" in listed
+
+    _argv(monkeypatch, "eval", "--show", report_id, "--results-dir", str(tmp_path))
+
+    assert main() == 0
+
+    shown = capsys.readouterr().out
+    assert f"eval report={report_id}" in shown
+    assert "bench-transient-api" in shown
+    assert "pareto frontier: baseline" in shown
+
+
+@pytest.mark.skipif(
+    _rlimit_as_supported(),
+    reason="trusted-sandbox platform preflight only fires where the host rejects RLIMIT_AS",
+)
+def test_eval_trusted_task_names_the_platform_cause_on_unsupported_hosts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # Regression: an unsupported host must fail fast with the true cause
+    # (RLIMIT_AS rejected), never the downstream "scripted model exhausted"
+    # ghost that sandbox-rejected commands used to surface.
+    _argv(
+        monkeypatch,
+        "eval",
+        "--tasks",
+        "bench-transient-api",
+        "--trials",
+        "1",
+        "--results-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 1
+
+    captured = capsys.readouterr()
+    assert "rejects setrlimit(RLIMIT_AS)" in captured.out
+    assert "scripted model exhausted" not in captured.out
+    assert list(tmp_path.glob("*.json")) == []

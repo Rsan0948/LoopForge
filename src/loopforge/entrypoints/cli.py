@@ -4,6 +4,8 @@ import argparse
 import os
 import sys
 import tempfile
+from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 
 from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
@@ -13,8 +15,14 @@ from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.adapters.telemetry import InMemoryTelemetry
+from loopforge.application.eval_runner import run_trials
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.benchmarks import (
+    BenchmarkReport,
+    BenchmarkSuite,
+    BenchmarkTaskSpec,
+)
 from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.events import ArtifactRecorded, RunStopped
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
@@ -37,6 +45,13 @@ from loopforge.domain.workspace import (
     FixtureSpec,
     PatchConstraints,
 )
+from loopforge.entrypoints.eval import (
+    EvalReportStore,
+    EvalReportStoreError,
+    EvalTrialDriver,
+    EvalTrialError,
+    resolve_configurations,
+)
 from loopforge.entrypoints.orchestrated import build_orchestrated_repair_runtime
 from loopforge.entrypoints.profile import LoopProfile, ProfileError, load_profile
 from loopforge.entrypoints.repair import (
@@ -47,8 +62,13 @@ from loopforge.entrypoints.repair import (
 )
 from loopforge.ports.model import ModelPort
 from loopforge.ports.tools import ToolResult
+from loopforge.workloads.benchmarks import (
+    benchmark_suite,
+    build_benchmark_binding,
+)
 from loopforge.workloads.fixtures import adder_repair_task, calculator_repair_task
 from loopforge.workloads.repair import (
+    OrchestratedRepairTask,
     RepairCommand,
     RepairCommandKind,
     RepairTask,
@@ -599,6 +619,145 @@ def _profile_loop(
     return 0 if state.status is RunStatus.SUCCEEDED else 1
 
 
+def _eval_specs(tasks_arg: str) -> tuple[tuple[BenchmarkTaskSpec, ...], BenchmarkSuite]:
+    """Resolve --tasks against the locked suite; unknown ids fail closed."""
+    suite = benchmark_suite()
+    if tasks_arg.strip().lower() == "all":
+        return suite.tasks, suite
+    names = [name.strip() for name in tasks_arg.split(",") if name.strip()]
+    if not names:
+        msg = "--tasks must be 'all' or a comma-separated list of benchmark task ids"
+        raise ValueError(msg)
+    if len(set(names)) != len(names):
+        msg_2 = "--tasks entries must be unique"
+        raise ValueError(msg_2)
+    return tuple(build_benchmark_binding(name).spec for name in names), suite
+
+
+def _eval_model_factory(
+    args: argparse.Namespace,
+) -> Callable[[RepairTask | OrchestratedRepairTask], ModelPort]:
+    """Build the live Ollama adapter per trial; credentials from the environment only.
+
+    For the orchestrated binding the tool catalog comes from the first worker
+    assignment: the repair tool set is identical across workers, and the
+    builder registers the shared adapter per worker exactly like the
+    orchestrated entrypoint precedent.
+    """
+
+    def factory(task: RepairTask | OrchestratedRepairTask) -> ModelPort:
+        spec_task = task if isinstance(task, RepairTask) else task.assignments[0].task
+        return build_ollama_model(
+            spec_task,
+            model_name=args.ollama_model,
+            base_url=args.ollama_url,
+            context_window_tokens=args.ollama_context_window,
+        )
+
+    return factory
+
+
+def _print_eval_report(report: BenchmarkReport, *, saved_path: Path | None = None) -> None:
+    print(
+        f"eval report={report.report_id} suite={report.suite_version} lock={report.lock_hash[:12]}"
+    )
+    print(
+        f"{'config':<14} {'task':<26} {'trials':>6} {'success':>8} "
+        f"{'false-succ':>10} {'cost':>9} {'latency':>9} {'interv':>7}"
+    )
+    for entry in report.config_reports:
+        print(
+            f"{entry.config_id:<14} {entry.task_id:<26} {entry.trials:>6} "
+            f"{entry.success_rate:>8.1%} {entry.false_success_rate:>10.1%} "
+            f"${entry.mean_cost_usd:>8.4f} {entry.mean_latency_seconds:>8.2f}s "
+            f"{entry.mean_human_interventions:>7.2f}"
+        )
+    print(f"pareto frontier: {', '.join(report.pareto_config_ids)}")
+    if saved_path is not None:
+        print(f"report saved: {saved_path}")
+
+
+def _eval(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps one return per outcome
+    """Run the locked benchmark suite through the M5 multi-trial eval runner.
+
+    Default is fully deterministic: scripted model, no credentials, no
+    network. ``--model ollama`` is the operator's explicit live-trial choice
+    (and defaults the container image for CONTAINER-mode tasks). Reports are
+    operator-owned JSON artifacts under --results-dir.
+    """
+    store = EvalReportStore(Path(args.results_dir))
+    if args.list:
+        try:
+            summaries = store.list()
+        except EvalReportStoreError as exc:
+            print(f"error: {exc}")
+            return 1
+        if not summaries:
+            print(f"no eval reports in {args.results_dir}")
+            return 0
+        for summary in summaries:
+            print(
+                f"{summary.report_id} suite={summary.suite_version} "
+                f"lock={summary.lock_hash[:12]} created={summary.created_at} "
+                f"configs={','.join(summary.config_ids)} tasks={len(summary.task_ids)}"
+            )
+        return 0
+    if args.show is not None:
+        try:
+            report = store.load(args.show)
+        except EvalReportStoreError as exc:
+            print(f"error: {exc}")
+            return 1
+        _print_eval_report(report)
+        return 0
+    if args.model not in {"scripted", "ollama"}:
+        print(f"error: eval supports --model scripted|ollama, not {args.model!r}")
+        return 2
+    if args.trials < 1:
+        print("error: --trials must be at least 1")
+        return 2
+    try:
+        specs, suite = _eval_specs(args.tasks)
+        configs = resolve_configurations(tuple(args.config or ["baseline"]))
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 2
+    container = args.container
+    if args.model == "ollama" and container is None:
+        # Live trials of CONTAINER-mode tasks need the hardened sandbox; the
+        # default image is the operator-overridable house reference.
+        container = "python:3.12-alpine"
+    model_factory = None if args.model == "scripted" else _eval_model_factory(args)
+    report_id = f"eval-{datetime.now(UTC):%Y%m%dT%H%M%S.%fZ}-{suite.lock_hash[:8]}"
+    with tempfile.TemporaryDirectory(prefix="loopforge-eval-") as directory:
+        driver = EvalTrialDriver(
+            workspaces_root=Path(directory),
+            model_factory=model_factory,
+            model_tier=ModelTier.ECONOMY if args.model == "scripted" else ModelTier.STANDARD,
+            container_image=container,
+        )
+        try:
+            report = run_trials(
+                specs,
+                configs,
+                args.trials,
+                driver,
+                report_id=report_id,
+                suite_version=suite.version,
+                lock_hash=suite.lock_hash,
+            )
+        except EvalTrialError as exc:
+            print(f"error: eval trial failed: {exc}")
+            return 1
+    try:
+        saved_path = store.save(report)
+    except EvalReportStoreError as exc:
+        print(f"error: {exc}")
+        return 1
+    _print_eval_report(report, saved_path=saved_path)
+    return 0
+
+
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 
 
@@ -658,6 +817,7 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
             "civicml-loop",
             "loop",
             "serve",
+            "eval",
         ],
     )
     parser.add_argument(
@@ -710,6 +870,43 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         default=131_072,
         help="honest context window of the deployed Ollama model, registered as "
         "routing capability metadata (default: 131072)",
+    )
+    parser.add_argument(
+        "--tasks",
+        metavar="LIST",
+        default="all",
+        help="eval only: 'all' or a comma-separated list of benchmark task ids (default: all)",
+    )
+    parser.add_argument(
+        "--trials",
+        metavar="N",
+        type=int,
+        default=3,
+        help="eval only: trials per (config, task) pair (default: 3)",
+    )
+    parser.add_argument(
+        "--config",
+        metavar="NAME",
+        action="append",
+        default=None,
+        help="eval only: configuration preset (repeatable; default: baseline)",
+    )
+    parser.add_argument(
+        "--results-dir",
+        metavar="DIR",
+        default=".loopforge/evals",
+        help="eval only: operator-owned eval report store directory",
+    )
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="eval only: list stored eval reports in --results-dir and exit",
+    )
+    parser.add_argument(
+        "--show",
+        metavar="REPORT_ID",
+        default=None,
+        help="eval only: reprint the stored eval report REPORT_ID and exit",
     )
     parser.add_argument(
         "--host",
@@ -778,6 +975,8 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
             ollama_url=args.ollama_url,
             ollama_context_window=args.ollama_context_window,
         )
+    if args.command == "eval":
+        return _eval(args)
     if args.command == "serve":
         return _serve(
             host=args.host,

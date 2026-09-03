@@ -167,6 +167,7 @@ def build_trusted_repair_runtime(
     workspaces_dir: str | Path,
     deps: RepairRuntimeDeps,
     checks: tuple[RepairCheck, ...] = (),
+    approval_required_for: frozenset[str] | None = None,
 ) -> RepairRuntimeBundle:
     """Wire the deterministic repair stack on the trusted local sandbox.
 
@@ -175,6 +176,8 @@ def build_trusted_repair_runtime(
     fixture execution must use :func:`build_container_repair_runtime`.
     ``checks`` are code-owned acceptance hooks (e.g. the benchmark
     ambiguous-success edge probe), never repository or model content.
+    ``approval_required_for`` operator-tightens authority by gating the named
+    tools behind human approval (PACS-016 benchmark HITL binding).
     """
     workspace = _materialize_workspace(task, workspaces_dir=workspaces_dir)
     sandbox: SandboxPort = ConstrainedLocalSandbox(
@@ -188,6 +191,7 @@ def build_trusted_repair_runtime(
         sandbox=sandbox,
         requirements=SandboxRequirements(),
         deps=deps,
+        approval_required_for=approval_required_for or frozenset(),
         checks=checks,
     )
 
@@ -242,13 +246,14 @@ def build_adopted_repair_runtime(  # noqa: PLR0913 - composition roots keep auth
     )
 
 
-def build_container_repair_runtime(
+def build_container_repair_runtime(  # noqa: PLR0913 - composition roots keep authority explicit
     task: RepairTask,
     *,
     image: str,
     workspaces_dir: str | Path,
     deps: RepairRuntimeDeps,
     checks: tuple[RepairCheck, ...] = (),
+    approval_required_for: frozenset[str] | None = None,
 ) -> RepairRuntimeBundle:
     """Wire the repair stack for untrusted fixture execution (PACS-009 boundary).
 
@@ -256,6 +261,8 @@ def build_container_repair_runtime(
     closed anywhere container-grade isolation is unavailable. The task's
     command argv must address the in-container interpreter (for example
     ``/usr/local/bin/python``); image trust is operator-owned.
+    ``approval_required_for`` operator-tightens authority by gating the named
+    tools behind human approval (PACS-016 benchmark HITL binding).
     """
     workspace = _materialize_workspace(task, workspaces_dir=workspaces_dir)
     sandbox: SandboxPort = ContainerSandbox(
@@ -272,6 +279,7 @@ def build_container_repair_runtime(
         sandbox=sandbox,
         requirements=UNTRUSTED_REPAIR_REQUIREMENTS,
         deps=deps,
+        approval_required_for=approval_required_for or frozenset(),
         checks=checks,
     )
 
