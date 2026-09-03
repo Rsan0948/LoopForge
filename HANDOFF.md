@@ -37,7 +37,42 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-015.
+Completed: PACS-001 through PACS-016.
+
+PACS-016 (locked benchmark and multi-trial evaluation laboratory,
+2026-09-03) replaced demo-judgment with scientific evaluation of runtime
+policy — without ceding any authority over the measuring stick
+(ADR-0012). A locked, versioned 12-category benchmark fixture set
+(simple bug, multi-file, misleading failure, transient API, ambiguous
+success, context pollution, stale state, stall, prompt injection, HITL,
+parallel work, provider outage) is code-owned and content-hashed down to
+fixture bytes and acceptance-hook SOURCE (pinned literal; any drift
+fails loudly); deterministic graders (verified-success, scope,
+ground-truth, recovery) make FALSE_SUCCESS a first-class verdict with a
+pinned trial algebra; trajectory metrics (repetition, expensive-model
+use, scope discipline, permission requests, context efficiency,
+recovery) project honestly from the event stream; a layer-clean
+multi-trial runner aggregates per-(config, task) reports with a Pareto
+frontier across success/cost/latency/human-intervention over runtime
+configurations, never model brands; fault injection is deterministic
+code-owned ModelPort decorators; reports are operator-owned artifacts
+(domain-revalidated on load) exposed read-only over REST and in the
+console (Pareto tables, red false-success cells, stale-lock badges).
+Live-model evals stay in tests/live behind skip probes. The
+operator-approved fold-in of the PACS-015 deferred exploration tuning
+(M8, ADR-0013) skips verification after successful READ-only turns —
+exploration no longer accrues stall strikes — landed with laboratory
+A/B evidence (legacy cadence stalls every exploring trial, tuned solves
+them) and full replay compatibility (one additive reducer transition;
+schema v1, 25 events). A dedicated two-reviewer adversarial pass fixed
+and pinned 16 findings, most severely a content lock that pinned hook
+identity but not hook code, hook-marker forgery via crafted filenames,
+and unguarded evidence reads. Live validation (12 Ollama+Docker
+trials, 3 tasks × 2 configs × 2 trials) produced the laboratory's first
+real configuration finding — tight-budget's no_progress_limit=2 fails
+the misleading-failure task baseline solves — with zero false successes
+and a two-config Pareto frontier. Cycle commits `8be4219`..`33165ff`;
+see `docs/process/cycles/PACS-016-locked-benchmark-evaluation-laboratory.md`.
 
 PACS-015 (execution provenance graph and trajectory debugger, 2026-09-03)
 gives the operator a replayable answer to "why did the system take this
@@ -266,27 +301,30 @@ Recent commits, newest first:
 - `1929cb5` docs: add master product map and manual PACS process
 - `528ff05` feat: establish deterministic LoopForge runtime kernel
 
-Current checked evidence (PACS-013, 2026-08-30, Ollama 0.32.15 with
+Current checked evidence (PACS-016, 2026-09-03, Ollama with
 `devstral-small-2:latest`, Docker Desktop live):
-- 1449 tests passing, 18 platform-gated skips (the pre-existing macOS `RLIMIT_AS` +
-  non-UTF-8 gates plus 3 new trusted-local orchestrated E2E/CLI gates on the same
-  platform restriction; the live Ollama+Docker repair E2E and the live container
-  orchestrated two-worker E2E both executed and passed; zero credential-gated
-  skips — deterministic CI runs with zero provider credentials, 1448 passing with
-  `--ignore=tests/live`)
-- 94.34% branch-aware coverage (new orchestration modules at 92–98%)
-- ruff format/check, pyright strict, and import-linter all executed and green
-- live CLI evidence: `orchestrated-repair-demo --container python:3.12-alpine` →
-  `status=succeeded stop_reason=success_verified`, both workers
-  `outcome=succeeded merge=merged`, integration verifier `command:run_tests:
-  passed (exit_code=0)`, merged evidence artifact recorded, orchestrator stream
-  replaying to the exact terminal state
-- cycle discoveries fixed and pinned: integration `require_change` was
-  incompatible with committed merges (worker patches land as merge commits, so
-  status-based change detection sees a clean tree) — integration acceptance now
-  gates on the full merged suite while per-worker acceptance enforces
-  `require_change` pre-merge; container runs must wire the in-container
-  interpreter (`/usr/local/bin/python`)
+- 2074 tests passing, 56 platform-gated skips (pre-existing macOS `RLIMIT_AS` +
+  non-UTF-8 gates; both live tests executed — the PACS-011 repair E2E and the
+  12-trial benchmark eval matrix; zero credential-gated skips — deterministic
+  CI runs with zero provider credentials, 2072 passing with
+  `--ignore=tests/live`); Linux container full suite: 2069 passing / 35
+  environmental skips (all RLIMIT/git-gated pins executed)
+- ~94% branch-aware coverage (fail_under=90; new laboratory modules at 94–100%)
+- ruff format/check, pyright strict, import-linter, and UI tsc+vite all
+  executed and green
+- live eval evidence: bench-simple-bug/misleading-failure/stall ×
+  baseline/tight-budget × 2 trials = 12 Ollama+Docker container trials, all
+  terminal and fully graded, zero false successes, both configs on the Pareto
+  frontier; tight-budget (no_progress_limit=2) failed both misleading-failure
+  trials baseline solved — the laboratory's first configuration finding;
+  report persisted and served in the console
+  (`output/playwright/m10-eval-detail-live.png`)
+- M8 A/B evidence: scripted exploring model on bench-simple-bug/bench-stall —
+  baseline (tuned cadence) 2/2 success on both, legacy-progress 0/2 (every
+  trial STALLED before the fix landed); flailing guards pinned unharmed in
+  both modes
+- benchmark locks pinned: suite lock `e97e6454…` (spec fields), content lock
+  `9bc7fe19…` (fixture bytes + hook source, post-M9)
 
 Historical evidence (PACS-012 post-hardening, 2026-08-28, Ollama 0.32.15 with
 `devstral-small-2:latest`, Docker Desktop 29.2.1 live):
@@ -377,7 +415,7 @@ Read before modifying architecture:
 - `BUILD_STATUS.md`
 
 Read the preceding cycle record before starting the next one:
-- `docs/process/cycles/PACS-014-operator-command-center.md`
+- `docs/process/cycles/PACS-016-locked-benchmark-evaluation-laboratory.md`
 
 ## Next authorized work
 
@@ -388,13 +426,21 @@ mode (the macOS-viable path), terminal runs offer a manual report-seeded
 follow-up, and a live container run drove the blackjack demo to
 STOP_SUCCESS_VERIFIED.
 
-PACS-015 through PACS-017 remain PLANNED, not active; the evaluator +
-evidence-grounded Reflexion remainder of the original PACS-014 scope is also
-available as an explicitly named follow-on. PACS-014b follow-ons worth
-considering for PACS-015 planning: a dedicated PG test database (the suite's
-schema drop annihilates live sessions on the default DSN), a repository-claim
-force-release/expiry path for zombie runs, and a progress model that
-distinguishes exploration from no-progress.
+PACS-016 (locked benchmark + multi-trial evaluation laboratory) closed
+2026-09-03 at 2074 tests passing (56 platform-gated skips, both live
+tests executed; 2072 with `--ignore=tests/live`, zero credentials),
+~94% branch coverage, all
+lint/type/import gates green, UI tsc+vite green, and the live 12-trial
+Ollama+Docker eval matrix complete with zero false successes. Both
+remaining PACS-014b-era follow-ons are now closed: the dedicated PG
+test database (PACS-015 M1) and exploration-vs-no-progress (PACS-016
+M8, ADR-0013). PACS-017 (adaptive context + shadow policies / v1.0)
+remains PLANNED, not active; the evaluator + evidence-grounded
+Reflexion remainder of the original PACS-014 scope is also available as
+an explicitly named follow-on. PACS-017 planning inputs now available:
+the locked benchmark suite, the eval runner + Pareto reports
+(configuration comparison axis), and the shadow-policy UI gate
+precedent. The operator may manually initiate the next cycle.
 
 PACS-014 (operator command center) closed 2026-09-02 at 1592 tests passing
 (18 platform-gated skips), 95% branch coverage, all lint/type/import gates
