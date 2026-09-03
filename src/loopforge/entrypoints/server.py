@@ -25,7 +25,7 @@ from pathlib import Path
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from loopforge.adapters.fanout_store import FanOutEventStore
 from loopforge.adapters.json_events import JsonEventCodec
@@ -185,6 +185,21 @@ class StopRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     summary: str = "cancelled by operator"
+
+
+class ForceReleaseRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = "force-released by operator"
+    # StrictBool: only a literal JSON true confirms — never 1, "true", "yes".
+    confirm: StrictBool = False
+
+    @model_validator(mode="after")
+    def _require_explicit_confirmation(self) -> ForceReleaseRequest:
+        if not self.confirm:
+            msg = "force-release stops the run WITHOUT replay checks; pass confirm=true"
+            raise ValueError(msg)
+        return self
 
 
 class ApproveRequest(BaseModel):
@@ -442,6 +457,12 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
         manager.stop(run_id, summary=summary)
         return _status_response(run_id)
 
+    def force_release_route(run_id: str, request: ForceReleaseRequest) -> dict[str, str]:
+        manager.force_release(run_id, summary=request.summary)
+        # state() is not consulted for the response: the whole point of the
+        # command is that the stream may no longer replay.
+        return {"run_id": run_id, "status": "force-released"}
+
     def approve_route(run_id: str, request: ApproveRequest) -> dict[str, str]:
         manager.approve(run_id, request.action_id)
         return _status_response(run_id)
@@ -482,6 +503,7 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_route("/api/sessions/{run_id}/pause", pause_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/resume", resume_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/stop", stop_route, methods=["POST"])
+    app.add_api_route("/api/sessions/{run_id}/force-release", force_release_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/approve", approve_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/reject", reject_route, methods=["POST"])
     app.add_api_route("/api/sessions/{run_id}/instructions", instructions_route, methods=["POST"])

@@ -40,7 +40,7 @@ from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import SandboxCapabilities
-from loopforge.domain.state import RunRecord
+from loopforge.domain.state import InvalidTransitionError, RunRecord
 from loopforge.domain.tooling import (
     ApprovalClass,
     IdempotencyClass,
@@ -51,6 +51,7 @@ from loopforge.domain.tooling import (
 from loopforge.domain.types import (
     ActionId,
     BudgetLimit,
+    EventId,
     Permission,
     RiskLevel,
     RunId,
@@ -1163,3 +1164,91 @@ def test_ensure_session_rebuild_race_keeps_one_session_and_closes_the_loser(
     assert len(factory.bundles) == 3
     assert [sandbox.destroyed for sandbox in factory.sandboxes[1:]].count(True) == 1
     manager.shutdown()
+
+
+# --- force-release (PACS-015) -------------------------------------------------
+
+
+def test_force_release_frees_the_repository_claim_end_to_end(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+    zombie = manager.create_session(_wiring())
+    with pytest.raises(SessionStateError, match="already has an active session"):
+        manager.create_session(_wiring())
+
+    manager.force_release(zombie, summary="server died mid-drive")
+
+    assert manager.state(zombie).status is RunStatus.CANCELLED
+    successor = manager.create_session(_wiring())
+    assert successor != zombie
+
+
+def test_force_release_denies_a_driving_run(tmp_path: Path) -> None:
+    tools = BlockingTools([_metadata("probe", ApprovalClass.NONE)])
+    factory = FakeBundleFactory(
+        actions=[_proposal("a1", "probe")],
+        tool_metadata=[_metadata("probe", ApprovalClass.NONE)],
+        tools_override=tools,
+    )
+    manager = _manager(tmp_path, factory)
+    run_id = manager.create_session(_wiring())
+    manager.start_driving(run_id)
+    assert tools.entered.wait(timeout=5)
+
+    with pytest.raises(SessionStateError, match="driving"):
+        manager.force_release(run_id)
+
+    tools.release.set()
+    _wait_for(lambda: manager.state(run_id).status is RunStatus.SUCCEEDED)
+    manager.shutdown()
+
+
+def test_force_release_denies_a_terminal_run(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+    run_id = manager.create_session(_wiring())
+    manager.stop(run_id)
+
+    with pytest.raises(SessionStateError, match="already terminal"):
+        manager.force_release(run_id)
+
+    # The denial is read-only: no second stop record was appended.
+    stops = [e for e in manager.events(run_id) if isinstance(e, RunStopped)]
+    assert len(stops) == 1
+
+
+def test_force_release_denies_an_unknown_run(tmp_path: Path) -> None:
+    manager = _manager(tmp_path, _plain_factory())
+
+    with pytest.raises(UnknownRunError, match="no persisted run"):
+        manager.force_release(RunId("run_ghost"))
+
+
+def test_force_release_succeeds_where_stop_fails_on_a_corrupted_stream(tmp_path: Path) -> None:
+    store = FanOutEventStore(InMemoryEventStore())
+    manager = _manager(tmp_path, _plain_factory(), store=store)
+    run_id = manager.create_session(_wiring())
+    rid = RunId(run_id)
+    # Corrupt the stream: a second RunStarted is never a legal transition, so
+    # every replay-based command fails from here on.
+    version = store.current_version(rid)
+    store.append(
+        RunStarted(
+            event_id=EventId("evt_corruption"),
+            run_id=rid,
+            occurred_at=NOW,
+            sequence=version + 1,
+            objective="forged restart",
+        ),
+        expected_version=version,
+    )
+
+    with pytest.raises(InvalidTransitionError):
+        manager.stop(run_id)
+
+    manager.force_release(run_id, summary="corrupted stream release")
+
+    events = store.events_for(rid)
+    assert [event.sequence for event in events] == [1, 2, 3, 4]
+    stop = events[-1]
+    assert isinstance(stop, RunStopped)
+    assert stop.reason is StopReason.CANCELLED
+    assert stop.summary == "corrupted stream release"

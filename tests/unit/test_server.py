@@ -1183,3 +1183,73 @@ def test_websocket_resyncs_when_a_live_frame_skips_a_sequence(tmp_path: Path) ->
                 "off-channel",
                 "on-channel",
             ]
+
+
+# --- force-release (PACS-015) ---------------------------------------------------
+
+
+def test_force_release_stops_a_zombie_run_over_http(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+
+        response = client.post(
+            f"/api/sessions/{run_id}/force-release",
+            json={"summary": "operator drill", "confirm": True},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"run_id": run_id, "status": "force-released"}
+        detail = _detail(client, run_id)
+        assert detail["status"] == "cancelled"
+        stop_events = [
+            event
+            for event in client.get(f"/api/sessions/{run_id}/events").json()["events"]
+            if event["event_type"] == "RunStopped"
+        ]
+        assert stop_events[-1]["event"]["summary"] == "operator drill"
+        # The repository claim is released: a fresh session adopts the checkout.
+        successor = client.post("/api/sessions", json=_inline_body(repo))
+        assert successor.status_code == 201, successor.text
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"summary": "no confirmation"},
+        {"confirm": False},
+        {"confirm": "true"},  # string coercion is not a confirmation
+        {"confirm": 1},
+    ],
+)
+def test_force_release_requires_literal_confirmation(
+    tmp_path: Path, body: dict[str, object]
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+
+        response = client.post(f"/api/sessions/{run_id}/force-release", json=body)
+
+        assert response.status_code == 422, response.text
+        assert _detail(client, run_id)["status"] == "ready"
+
+
+def test_force_release_denies_an_unknown_run_over_http(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.post("/api/sessions/run_ghost/force-release", json={"confirm": True})
+
+        assert response.status_code == 404, response.text
+
+
+def test_force_release_denies_a_terminal_run_over_http(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+        client.post(f"/api/sessions/{run_id}/stop")
+
+        response = client.post(f"/api/sessions/{run_id}/force-release", json={"confirm": True})
+
+        assert response.status_code == 409, response.text
+        assert "already terminal" in response.json()["detail"]

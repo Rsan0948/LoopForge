@@ -45,6 +45,7 @@ from typing import Any, Protocol, cast
 from loopforge.adapters.fanout_store import FanOutEventStore
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.adapters.telemetry import InMemoryTelemetry
+from loopforge.application.maintenance import force_stop_run
 from loopforge.application.runtime import UnknownRunError
 from loopforge.domain.events import Event, RunStarted
 from loopforge.domain.state import RunState, replay
@@ -467,6 +468,41 @@ class SessionManager:
         session = self._ensure_session(rid)
         with session.lock:
             return session.bundle.runtime.cancel(rid, summary=summary)
+
+    def force_release(
+        self, run_id: RunId | str, *, summary: str = "force-released by operator"
+    ) -> None:
+        """Durably stop a run whose stream cannot be replayed, releasing its claim.
+
+        The zombie escape hatch (PACS-015): a server that dies mid-drive
+        leaves a non-terminal run holding its repository claim forever, and
+        if the stream is also corrupted, ``stop()`` cannot help — it replays
+        first. This command denies the cases where a normal command is the
+        right tool (a live driver, a terminal run, an unknown run) and
+        otherwise compare-and-appends ``RunStopped(CANCELLED)`` at the
+        current stream version WITHOUT replaying. The operator is the
+        liveness check; the CAS is the mechanical guard against a racing
+        append. A corrupted stream stays broken afterwards — only the claim
+        is released, history is never rewritten.
+        """
+        rid = RunId(str(run_id))
+        with self._lock:
+            session = self._sessions.get(rid)
+            if session is not None and session.driving:
+                msg = f"run {rid} is driving; stop it normally instead of force-releasing"
+                raise SessionStateError(msg)
+        try:
+            state = self.state(rid)
+        except UnknownRunError:
+            raise
+        except Exception:
+            # The stream no longer replays: precisely the case this command
+            # exists for. Fall through to the replay-free stop.
+            state = None
+        if state is not None and state.status.is_terminal:
+            msg_2 = f"run {rid} is already terminal ({state.status.value}); nothing to release"
+            raise SessionStateError(msg_2)
+        force_stop_run(self._store, rid, summary=summary, clock=SystemClock())
 
     def instruct(
         self, run_id: RunId | str, instruction: str, *, amend_objective: bool = False
