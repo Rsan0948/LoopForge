@@ -491,6 +491,17 @@ def test_benchmark_report_rejects_non_config_report_entries() -> None:
         _report(config_reports=("not-a-report",))
 
 
+def test_benchmark_report_allows_one_config_across_multiple_tasks() -> None:
+    # M5: uniqueness is per (config_id, task_id) pair — a config evaluated over
+    # several tasks appears once per task in the same report.
+    configs = (
+        _config_report(config_id="config-a", task_id="task-1"),
+        _config_report(config_id="config-a", task_id="task-2"),
+    )
+    report = _report(config_reports=configs)
+    assert [entry.task_id for entry in report.config_reports] == ["task-1", "task-2"]
+
+
 def test_benchmark_report_rejects_duplicate_config_ids() -> None:
     with pytest.raises(ValueError, match="config_ids must be unique"):
         _report(config_reports=(_config_report(), _config_report()))

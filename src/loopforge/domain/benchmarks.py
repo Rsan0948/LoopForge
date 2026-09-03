@@ -360,6 +360,9 @@ class ConfigReport:
 class BenchmarkReport:
     """Immutable multi-config evaluation report against one locked suite.
 
+    ``config_reports`` carries one ``ConfigReport`` per (config, task) pair:
+    a configuration evaluated over several tasks appears once per task, so
+    uniqueness is enforced on the pair, not on ``config_id`` alone (M5).
     ``pareto_config_ids`` must reference only configurations present in
     ``config_reports`` — a report pointing at unknown configurations cannot
     exist.
@@ -385,8 +388,12 @@ class BenchmarkReport:
                 msg_3 = "benchmark report config_reports must be ConfigReport instances"
                 raise TypeError(msg_3)
         config_ids = [report.config_id for report in self.config_reports]
-        if len(set(config_ids)) != len(config_ids):
-            msg_4 = "benchmark report config_ids must be unique"
+        pairs = [(report.config_id, report.task_id) for report in self.config_reports]
+        if len(set(pairs)) != len(pairs):
+            msg_4 = (
+                "benchmark report config_ids must be unique per task "
+                "(one ConfigReport per (config_id, task_id) pair)"
+            )
             raise ValueError(msg_4)
         if len(set(self.pareto_config_ids)) != len(self.pareto_config_ids):
             msg_5 = "pareto_config_ids must be unique"
