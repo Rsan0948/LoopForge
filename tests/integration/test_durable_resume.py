@@ -79,6 +79,9 @@ def _runtime(path: Path, *, action_id: str = "a1") -> Runtime:
         context=BasicContextBuilder(SystemClock()),
         clock=SystemClock(),
         sleeper=SystemSleeper(),
+        # Legacy cadence (PACS-016 M8): success is granted by a READ-class
+        # tool's verification; these pins exercise durable resume, not cadence.
+        verify_read_only_turns=True,
     )
 
 
@@ -255,6 +258,9 @@ def test_budgeted_context_metadata_survives_sqlite_persistence_and_replay(
         ),
         clock=SystemClock(),
         sleeper=SystemSleeper(),
+        # Legacy cadence (PACS-016 M8): success is granted by a READ-class
+        # tool's verification; this pin exercises durable context metadata.
+        verify_read_only_turns=True,
     )
 
     state = runtime.run("repair auth")
@@ -355,6 +361,9 @@ def test_resume_from_verifying_with_failing_verifier_does_not_wedge(tmp_path: Pa
         context=BasicContextBuilder(SystemClock()),
         clock=SystemClock(),
         sleeper=SystemSleeper(),
+        # Legacy cadence (PACS-016 M8): success is granted by a READ-class
+        # tool's verification; this pin exercises resume-from-VERIFYING.
+        verify_read_only_turns=True,
     ).resume(run_id)
 
     assert resumed.status is RunStatus.SUCCEEDED

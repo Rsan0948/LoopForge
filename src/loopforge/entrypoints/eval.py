@@ -272,6 +272,7 @@ class EvalTrialDriver:
             model_tier=self._model_tier,
             budget=_narrow_budget(config, orchestrated=isinstance(task, OrchestratedRepairTask)),
             no_progress_limit=config.no_progress_limit,
+            verify_read_only_turns=config.verify_read_only_turns,
         )
         wiring = _TrialWiring(
             deps=deps,
@@ -515,6 +516,16 @@ _EVAL_PRESETS: Final = {
         max_cost_usd=0.05,
         max_iterations=4,
         no_progress_limit=2,
+    ),
+    # PACS-016 M8 A/B arm: the legacy every-turn verification cadence
+    # (read-only turns verify and accrue no-progress strikes), so the
+    # laboratory compares runtime configurations — tuned default vs legacy
+    # exploration-vs-no-progress behavior — not model brands.
+    "legacy-progress": EvalConfiguration(
+        config_id="legacy-progress",
+        max_cost_usd=1.0,
+        max_iterations=8,
+        verify_read_only_turns=True,
     ),
 }
 

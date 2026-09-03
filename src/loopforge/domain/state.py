@@ -120,7 +120,13 @@ class RunState:
 
 _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
     RunStarted: {RunStatus.CREATED},
-    PlanCreated: {RunStatus.PLANNING, RunStatus.REFLECTING},
+    # VERIFYING (PACS-016 M8): the only producer is the runtime's read-only
+    # verification-cadence skip — a completed READ-only turn cannot have
+    # changed the workspace, so the runtime records no verification event
+    # and re-plans directly out of VERIFYING. The PlanCreated arm already
+    # projects plan + READY unchanged; legacy streams never contain this
+    # position, so pre-PACS-016 replay stays byte-identical.
+    PlanCreated: {RunStatus.PLANNING, RunStatus.REFLECTING, RunStatus.VERIFYING},
     ActionProposed: {RunStatus.READY},
     ActionAuthorized: {RunStatus.READY},
     ActionRejected: {RunStatus.READY},

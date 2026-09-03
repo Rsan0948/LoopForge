@@ -84,7 +84,10 @@ class EvalConfiguration:
     Application-level, data-only descriptive wiring: runtime CONFIGURATIONS,
     not model brands. The M6 entrypoints driver interprets these fields when
     building each trial's runtime: the budget ceilings (``max_cost_usd``,
-    ``max_iterations``), the no-progress stall threshold, whether the routing
+    ``max_iterations``), the no-progress stall threshold, the verification
+    cadence (``verify_read_only_turns`` — False keeps the PACS-016 M8 tuned
+    default where read-only turns skip verification, True restores the
+    legacy every-turn cadence for A/B comparison), whether the routing
     policy is wired, and the expensive-model set the trajectory metric's
     ``expensive_model_turns`` counts against (``(provider, model)`` pairs).
 
@@ -99,6 +102,7 @@ class EvalConfiguration:
     max_iterations: int
     no_progress_limit: int = 3
     router_enabled: bool = False
+    verify_read_only_turns: bool = False
     expensive_models: frozenset[tuple[str, str]] = frozenset()
 
     def __post_init__(self) -> None:
@@ -114,6 +118,9 @@ class EvalConfiguration:
         if not isinstance(self.router_enabled, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             msg_3 = "router_enabled must be a bool"
             raise TypeError(msg_3)
+        if not isinstance(self.verify_read_only_turns, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_5 = "verify_read_only_turns must be a bool"
+            raise TypeError(msg_5)
         for entry in self.expensive_models:
             if (
                 not isinstance(entry, tuple)  # pyright: ignore[reportUnnecessaryIsInstance]

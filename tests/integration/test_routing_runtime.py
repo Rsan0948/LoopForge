@@ -164,6 +164,13 @@ def _runtime(  # noqa: PLR0913 - keyword-only wiring keeps every runtime depende
         sleeper=sleeper or RecordingSleeper(),
         telemetry=telemetry,
         router=router,
+        # Legacy cadence (PACS-016 M8): these pins exercise routing, not
+        # verification cadence, and their success/stall signals come from a
+        # READ-class tool's verifications — preserved under the selectable
+        # legacy knob. Consequence (b) of the tuned default: stall
+        # escalation on consecutive_no_progress triggers later for
+        # exploration-heavy runs.
+        verify_read_only_turns=True,
     )
 
 

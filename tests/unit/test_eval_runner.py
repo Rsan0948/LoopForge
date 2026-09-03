@@ -239,6 +239,7 @@ def test_eval_configuration_defaults_are_valid() -> None:
     config = _config("cfg-a")
     assert config.no_progress_limit == 3
     assert config.router_enabled is False
+    assert config.verify_read_only_turns is False
     assert config.expensive_models == frozenset()
 
 
@@ -269,6 +270,11 @@ def test_eval_configuration_rejects_bad_no_progress_limit(bad: object) -> None:
 def test_eval_configuration_rejects_non_bool_router_flag() -> None:
     with pytest.raises(TypeError, match="router_enabled must be a bool"):
         _config("cfg-a", router_enabled="yes")
+
+
+def test_eval_configuration_rejects_non_bool_verify_read_only_turns() -> None:
+    with pytest.raises(TypeError, match="verify_read_only_turns must be a bool"):
+        _config("cfg-a", verify_read_only_turns="yes")  # pyright: ignore[reportArgumentType]
 
 
 @pytest.mark.parametrize(

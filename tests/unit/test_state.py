@@ -478,6 +478,16 @@ def test_plan_created_records_plan_and_enters_ready() -> None:
     assert state.plan == "patch auth"
 
 
+def test_plan_created_is_legal_from_verifying_for_the_read_only_cadence_skip() -> None:
+    # PACS-016 M8: the only producer of PlanCreated in VERIFYING is the
+    # runtime's read-only verification-cadence skip, which re-plans directly
+    # instead of recording a verification event for an unchanged workspace.
+    # The arm is the same projection as from PLANNING/REFLECTING.
+    state = reduce_event(_state_at("verifying"), _planned(7, plan="keep exploring"))
+    assert state.status is RunStatus.READY
+    assert state.plan == "keep exploring"
+
+
 def test_action_proposed_replaces_current_action_context() -> None:
     dirty = replace(
         _state_at("ready"),

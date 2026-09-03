@@ -104,6 +104,10 @@ def _runtime(
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
         artifacts=collector,
+        # Legacy cadence (PACS-016 M8): artifact recording is verification-
+        # driven, and these pins use a READ-class tool — preserved under the
+        # selectable legacy knob.
+        verify_read_only_turns=True,
     )
 
 

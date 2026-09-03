@@ -153,6 +153,23 @@ def test_tight_budget_preset_is_pinned() -> None:
     assert config == _TIGHT
 
 
+def test_legacy_progress_preset_is_pinned() -> None:
+    (config,) = resolve_configurations(("legacy-progress",))
+
+    assert config == EvalConfiguration(
+        config_id="legacy-progress",
+        max_cost_usd=1.0,
+        max_iterations=8,
+        verify_read_only_turns=True,
+    )
+
+
+def test_baseline_preset_keeps_the_tuned_cadence_default() -> None:
+    (config,) = resolve_configurations(("baseline",))
+
+    assert config.verify_read_only_turns is False
+
+
 def test_resolve_preserves_requested_order() -> None:
     configs = resolve_configurations(("tight-budget", "baseline"))
 

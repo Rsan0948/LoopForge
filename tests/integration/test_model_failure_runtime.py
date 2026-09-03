@@ -114,6 +114,9 @@ def _runtime(
         context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=sleeper,
+        # Legacy cadence (PACS-016 M8): these pins exercise model-failure
+        # handling, not cadence; success comes from a READ-class tool.
+        verify_read_only_turns=True,
     )
 
 

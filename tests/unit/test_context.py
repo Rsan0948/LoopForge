@@ -439,6 +439,9 @@ def _runtime(context_builder: object, model: object) -> Runtime:
         context=context_builder,  # pyright: ignore[reportArgumentType]
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
+        # Legacy cadence (PACS-016 M8): success is granted by a READ-class
+        # tool's verification; these pins exercise context building.
+        verify_read_only_turns=True,
     )
 
 

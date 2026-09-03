@@ -176,7 +176,9 @@ def test_repair_demo_repairs_fixture_and_prints_exact_patch_evidence(
     assert lines[0].startswith("run=run_")
     assert "status=succeeded" in lines[0]
     assert "command:run_tests: passed (exit_code=0)" in captured.out
-    assert "evidence artifacts recorded: 2" in captured.out
+    # PACS-016 M8: the demo's read turn skips verification under the tuned
+    # default, so only the workspace-changing write records patch evidence.
+    assert "evidence artifacts recorded: 1" in captured.out
     assert "exact patch evidence:" in captured.out
     assert "-    return left - right" in captured.out
     assert "+    return left + right" in captured.out

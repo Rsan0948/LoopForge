@@ -127,6 +127,10 @@ class RepairRuntimeDeps:
     """Code-owned routing tier for the wired model (scripted default is ECONOMY)."""
     no_progress_limit: int | None = None
     """Operator-tuned stall threshold (PACS-014b); None = ControlPolicy default."""
+    verify_read_only_turns: bool | None = None
+    """Legacy verification cadence opt-in (PACS-016 M8): None/False keeps the
+    tuned default (read-only turns skip verification); True verifies every
+    turn exactly as before."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -352,6 +356,7 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
         sleeper=deps.sleeper,
         telemetry=deps.telemetry,
         artifacts=WorkspaceArtifactCollector(workspace),
+        verify_read_only_turns=bool(deps.verify_read_only_turns),
     )
     return RepairRuntimeBundle(
         runtime=runtime,

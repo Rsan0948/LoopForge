@@ -317,9 +317,19 @@ def test_launcher_rejects_malformed_args() -> None:
     assert _sandbox_exec.main(["x", "2", "3", "4", "--", "/usr/bin/true"]) == 64
 
 
-def test_launcher_rlimit_failure_exits_with_marker(capsys: pytest.CaptureFixture[str]) -> None:
-    # A negative rlimit makes the first setrlimit raise before any limit is
-    # applied to this process, so the failure path is exercised safely.
+def test_launcher_rlimit_failure_exits_with_marker(
+    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The rejection is simulated: a literal negative rlimit is RLIM_INFINITY on
+    # Linux (only macOS raises for it), so a real negative value would let the
+    # call through and then apply the 1024-byte RLIMIT_AS to the pytest
+    # process itself. Patching the rejection exercises the same failure path
+    # safely on every platform.
+    def _rejected(*_args: object) -> None:
+        msg = "resource limits rejected"
+        raise OSError(msg)
+
+    monkeypatch.setattr(_sandbox_exec.resource, "setrlimit", _rejected)
     exit_code = _sandbox_exec.main(["-1", "1024", "128", "1024", "--", "/usr/bin/true"])
     assert exit_code == 97
     assert capsys.readouterr().err.startswith(_sandbox_exec.LAUNCHER_ERROR_MARKER)
@@ -1374,6 +1384,9 @@ def test_pacs012_below_default_tier_registry_never_wedges_the_run() -> None:
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
         router=policy,
+        # Legacy cadence (PACS-016 M8): success is granted by a READ-class
+        # tool's verification; this pin exercises routing-tier compatibility.
+        verify_read_only_turns=True,
     )
     state = runtime.run("objective")
     assert state.status is RunStatus.SUCCEEDED

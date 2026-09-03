@@ -240,6 +240,7 @@ def _worker_runtime(  # noqa: PLR0913 - composition wiring keeps every seam expl
         telemetry=deps.telemetry,
         artifacts=WorkspaceArtifactCollector(worktree),
         worker_id=WorkerId(str(assignment.worker_id)),
+        verify_read_only_turns=bool(deps.verify_read_only_turns),
     )
 
 

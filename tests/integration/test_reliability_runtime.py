@@ -239,6 +239,10 @@ def test_circuit_opens_after_consecutive_failures_and_blocks_same_tool() -> None
         context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
+        # Legacy cadence (PACS-016 M8): this pin exercises circuit breaking,
+        # not verification cadence, and its success is granted by a READ-class
+        # tool's verification — preserved under the selectable legacy knob.
+        verify_read_only_turns=True,
     )
 
     state = runtime.run("recover from dependency outage")
@@ -277,6 +281,10 @@ def test_repeated_non_improving_verification_stops_as_stalled() -> None:
         context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=RecordingSleeper(),
+        # Legacy cadence (PACS-016 M8): repeated non-improving READ turns must
+        # still stall where the old cadence is selected; the tuned-default
+        # counterpart lives in tests/integration/test_exploration_progress.py.
+        verify_read_only_turns=True,
     )
 
     state = runtime.run("detect stall")
@@ -386,6 +394,9 @@ def test_resume_honors_remaining_persisted_retry_backoff(tmp_path: Path) -> None
         context=BasicContextBuilder(FixedClock(NOW)),
         clock=FixedClock(NOW),
         sleeper=sleeper,
+        # Legacy cadence (PACS-016 M8): success is granted by a READ-class
+        # tool's verification, which the tuned default skips after reads.
+        verify_read_only_turns=True,
     ).resume(run_id)
 
     assert resumed.status is RunStatus.SUCCEEDED

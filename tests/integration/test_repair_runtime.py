@@ -239,6 +239,9 @@ def test_false_success_attempt_is_rejected(tmp_path: Path) -> None:
 def test_unrepaired_fixture_cannot_pass_verification(tmp_path: Path) -> None:
     task = adder_repair_task()
     store = InMemoryEventStore()
+    # PACS-016 M8: read-only turns skip verification under the tuned default,
+    # so claimed-success reads neither pass verification nor accrue
+    # no-progress strikes — the run stays bounded by the iteration budget (8).
     bundle = _trusted_bundle(
         tmp_path,
         task,
@@ -251,7 +254,7 @@ def test_unrepaired_fixture_cannot_pass_verification(tmp_path: Path) -> None:
                     {"path": "adder.py"},
                     expected_observation="all tests pass",
                 )
-                for index in range(1, 5)
+                for index in range(1, 9)
             ]
         ),
     )
@@ -259,6 +262,7 @@ def test_unrepaired_fixture_cannot_pass_verification(tmp_path: Path) -> None:
     state = bundle.runtime.run(task.objective)
 
     assert state.status is not RunStatus.SUCCEEDED
+    assert state.stop_reason is StopReason.MAX_ITERATIONS
     assert not [
         event for event in store.events_for(state.run_id) if isinstance(event, VerificationPassed)
     ]

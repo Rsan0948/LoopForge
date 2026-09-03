@@ -49,6 +49,7 @@ from loopforge.domain.tooling import (
 from loopforge.domain.types import (
     ActionId,
     EventId,
+    Permission,
     RunId,
     RunStatus,
     StopReason,
@@ -134,6 +135,23 @@ class Runtime:
     # telemetry record with it through the reserved CorrelationIds slot.
     # Single-runtime construction leaves it unset, byte-identical to before.
     worker_id: WorkerId | None = None
+    # Verification cadence knob (PACS-016 M8, code-owned). False (the
+    # default) skips verification after a turn whose completed action is
+    # READ-only per the action's code-owned authorized ToolMetadata
+    # permission class: no workspace change means nothing new to verify, so
+    # the turn no longer burns a full verification run nor accrues a
+    # no-progress strike (exploration is no longer indistinguishable from
+    # flailing — the PACS-014b finding-2 defect). True restores the legacy
+    # every-turn cadence so the laboratory can A/B old vs new. Cadence is
+    # runtime orchestration: ControlPolicy.evaluate stays a pure state
+    # projection and the reducer's progress semantics are untouched — new
+    # runs simply durably record fewer verification events (honest absence:
+    # the stream's ActionAuthorized metadata shows why). Honest
+    # consequences: pure-read flailing is bounded by the iteration budget
+    # (stops MAX_ITERATIONS instead of STALLED), and routing stall
+    # escalation on consecutive_no_progress triggers later for
+    # exploration-heavy runs.
+    verify_read_only_turns: bool = False
     _telemetry: RuntimeTelemetry = field(init=False, repr=False)
     _drive_states: dict[RunId, _DriveState] = field(init=False, repr=False)
 
@@ -869,6 +887,17 @@ class Runtime:
         state = self.state_for(run_id)
         if state.status is not RunStatus.VERIFYING:
             return
+        if self._skips_read_only_verification(state):
+            # Read-only cadence skip (PACS-016 M8): no verification event is
+            # recorded — honest absence, explicable from the stream's
+            # code-owned ActionAuthorized metadata alone — and the runtime
+            # re-plans straight out of VERIFYING (the reducer admits
+            # PlanCreated there additively; legacy streams never contain the
+            # position). consecutive_no_progress is untouched, so
+            # exploration accrues no stall strikes; pure-read flailing stays
+            # bounded by the iteration budget (MAX_ITERATIONS).
+            self._persist_plan(run_id, _READ_ONLY_SKIP_PLAN)
+            return
         if state.last_tool_failure_class is not None:
             metadata = state.current_tool_metadata
             proposal = state.current_proposal
@@ -932,6 +961,20 @@ class Runtime:
                 return
 
         self._verify_and_record(run_id)
+
+    def _skips_read_only_verification(self, state: RunState) -> bool:
+        """Whether this completed turn skips verification under the cadence knob.
+
+        The authority is the code-owned ``ToolMetadata`` projected from
+        ``ActionAuthorized`` (AGENTS.md rule 4): model output can never
+        define or downgrade the permission class. Only successful turns
+        skip — a failed read-only action verifies exactly as today so
+        retry/circuit bookkeeping and failure evidence are unaffected.
+        """
+        if self.verify_read_only_turns or state.last_tool_failure_class is not None:
+            return False
+        metadata = state.current_tool_metadata
+        return metadata is not None and metadata.required_permission is Permission.READ
 
     def _verify_and_record(self, run_id: RunId) -> None:
         # The verification correlation id derives from the sequence the
@@ -1114,6 +1157,11 @@ class Runtime:
         # it never feeds back into runtime state or decisions.
         self._telemetry.project_event(event)
 
+
+_READ_ONLY_SKIP_PLAN = (
+    "Read-only turn left the workspace unchanged; verification was skipped by "
+    "runtime cadence. Choose the next bounded action."
+)
 
 _STOP_TEXT_BUDGET = 500
 
