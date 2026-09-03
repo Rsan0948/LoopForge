@@ -24,8 +24,11 @@ from loopforge.domain.events import (
     BudgetDebited,
     ContextAssembled,
     Event,
+    PlanCreated,
     ToolExecutionStarted,
     ToolSucceeded,
+    VerificationFailed,
+    VerificationPassed,
 )
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
@@ -57,6 +60,19 @@ def _metadata() -> ToolMetadata:
         risk=RiskLevel.READ_ONLY,
         required_permission=Permission.READ,
         side_effect=SideEffectClass.READ_ONLY,
+        retry=RetryClass.SAFE,
+        idempotency=IdempotencyClass.NATURAL,
+        approval=ApprovalClass.NONE,
+        timeout_seconds=5.0,
+    )
+
+
+def _write_metadata() -> ToolMetadata:
+    return ToolMetadata(
+        name="apply_fix",
+        risk=RiskLevel.LOCAL_WRITE,
+        required_permission=Permission.LOCAL_WRITE,
+        side_effect=SideEffectClass.LOCAL_WRITE,
         retry=RetryClass.SAFE,
         idempotency=IdempotencyClass.NATURAL,
         approval=ApprovalClass.NONE,
@@ -230,6 +246,172 @@ def test_resume_from_verifying_checkpoint_does_not_repeat_tool_side_effect(tmp_p
     assert resumed.status is RunStatus.SUCCEEDED
     assert resumed.iteration == 1
     assert resumed.last_observation == "all tests pass"
+
+
+# --- PACS-016 M9 (W5): crash/resume pin for VERIFYING under the tuned cadence ----
+
+
+def _tuned_runtime(
+    path: Path,
+    *,
+    actions: list[ActionProposal],
+    results: list[ToolResult],
+    metadata: list[ToolMetadata],
+) -> Runtime:
+    """Scripted/no-sandbox runtime under the tuned default cadence (M8)."""
+    return Runtime(
+        model=ScriptedModel(actions),
+        tools=ScriptedTools(results, metadata=metadata),
+        verifier=ObservationContainsVerifier("all tests pass"),
+        store=SQLiteEventStore(path, codec=JsonEventCodec()),
+        control=ControlPolicy(BudgetLimit(5.0, 10)),
+        permissions=PermissionPolicy(frozenset({Permission.READ, Permission.LOCAL_WRITE})),
+        reliability=ReliabilityPolicy(),
+        context=BasicContextBuilder(SystemClock()),
+        clock=SystemClock(),
+        sleeper=SystemSleeper(),
+        # Tuned default (PACS-016 M8): successful READ-class turns skip
+        # verification and re-plan straight out of VERIFYING.
+        verify_read_only_turns=False,
+    )
+
+
+def _after_skip_plan(events: tuple[Event, ...]) -> list[type[Event]]:
+    """Event-type tail from the read turn's skip PlanCreated onward."""
+    plans = [index for index, event in enumerate(events) if isinstance(event, PlanCreated)]
+    # The first PlanCreated is the run's initial plan; the second is the
+    # read-only verification skip's re-plan.
+    return [type(event) for event in events[plans[1] :]]
+
+
+def test_resume_from_verifying_under_tuned_cadence_replays_the_skip_exactly_once(
+    tmp_path: Path,
+) -> None:
+    """Crash between a read's ToolSucceeded and the skip's PlanCreated.
+
+    Rule-10 pin for the M8 cadence knob: drive a READ-class action under the
+    tuned default, stop the driver mid-cycle (the durable stream ends in
+    VERIFYING, before the skip's re-plan is recorded), and resume with a
+    fresh Runtime. The skip must replay EXACTLY once (one skip PlanCreated,
+    no verification event for the read turn), the stream must stay valid,
+    and the run must complete as the uninterrupted equivalent.
+    """
+    read = ActionProposal(ActionId("read-1"), "inspect", {})
+    write = ActionProposal(ActionId("write-1"), "apply_fix", {})
+
+    # The uninterrupted equivalent: same scripted turns, one driver.
+    steady = _tuned_runtime(
+        tmp_path / "steady.db",
+        actions=[read, write],
+        results=[
+            ToolResult(ok=True, observation="still broken"),
+            ToolResult(ok=True, observation="all tests pass"),
+        ],
+        metadata=[_metadata(), _write_metadata()],
+    )
+    steady_state = steady.run("explore then fix")
+    assert steady_state.status is RunStatus.SUCCEEDED
+    steady_events = steady.store.events_for(steady_state.run_id)
+
+    path = tmp_path / "tuned-resume.db"
+    runtime = _tuned_runtime(
+        path,
+        actions=[read],
+        results=[ToolResult(ok=True, observation="still broken")],
+        metadata=[_metadata()],
+    )
+    run_id = runtime.start("explore then fix")
+    store = runtime.store
+
+    def append(factory: Callable[[int], Event]) -> None:
+        version = store.current_version(run_id)
+        store.append(factory(version + 1), expected_version=version)
+
+    # Stop the driver between the read's ToolSucceeded and the skip's
+    # PlanCreated: the durable stream ends mid-cycle in VERIFYING.
+    append(
+        lambda sequence: ActionProposed(
+            event_id=EventId("tuned-proposed"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=sequence,
+            proposal=read,
+        )
+    )
+    append(
+        lambda sequence: ActionAuthorized(
+            event_id=EventId("tuned-authorized"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=sequence,
+            proposal=read,
+            tool_metadata=_metadata(),
+        )
+    )
+    append(
+        lambda sequence: ToolExecutionStarted(
+            event_id=EventId("tuned-started"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=sequence,
+            action_id=read.action_id,
+            attempt=1,
+            idempotency_key=None,
+        )
+    )
+    append(
+        lambda sequence: ToolSucceeded(
+            event_id=EventId("tuned-succeeded"),
+            run_id=run_id,
+            occurred_at=NOW,
+            sequence=sequence,
+            action_id=read.action_id,
+            observation="still broken",
+            attempt=1,
+        )
+    )
+    assert runtime.state_for(run_id).status is RunStatus.VERIFYING
+
+    resumed_runtime = _tuned_runtime(
+        path,
+        actions=[write],
+        results=[ToolResult(ok=True, observation="all tests pass")],
+        metadata=[_write_metadata()],
+    )
+    resumed = resumed_runtime.resume(run_id)
+
+    assert resumed.status is RunStatus.SUCCEEDED
+    assert resumed.iteration == steady_state.iteration
+    assert resumed.consecutive_no_progress == 0
+    events = resumed_runtime.store.events_for(run_id)
+    read_succeeded = next(
+        index
+        for index, event in enumerate(events)
+        if isinstance(event, ToolSucceeded) and event.action_id == read.action_id
+    )
+    read_turn_tail: list[Event] = []
+    for event in events[read_succeeded + 1 :]:
+        if isinstance(event, ActionProposed):
+            break
+        read_turn_tail.append(event)
+    # The skip replays exactly once: between the read's ToolSucceeded and the
+    # next turn's proposal there is exactly one PlanCreated (the skip's
+    # re-plan) — and never a verification event for the read turn.
+    assert [type(event) for event in read_turn_tail].count(PlanCreated) == 1
+    assert not [
+        event
+        for event in read_turn_tail
+        if isinstance(event, (VerificationPassed, VerificationFailed))
+    ]
+    # Only the workspace-changing write earned a verification.
+    assert sum(isinstance(event, VerificationPassed) for event in events) == 1
+    assert not [event for event in events if isinstance(event, VerificationFailed)]
+    # The run completes as the uninterrupted equivalent: from the skip's
+    # re-plan onward the durable streams record identical event types.
+    assert _after_skip_plan(events) == _after_skip_plan(steady_events)
+    # The stream stays valid across a third process boundary.
+    replay = _tuned_runtime(path, actions=[], results=[], metadata=[])
+    assert replay.state_for(run_id).status is RunStatus.SUCCEEDED
 
 
 # --- PACS-007: prompt template metadata survives durable persistence ------------

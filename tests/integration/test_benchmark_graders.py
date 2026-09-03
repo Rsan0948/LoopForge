@@ -166,6 +166,11 @@ def _evidence_for(  # noqa: PLR0913 - test wiring keeps the forging seam explici
         ),
         final_sources=sources,
         verification_summaries=summaries,
+        # Hook evidence is trusted only from PASSING summaries (anti-forgery
+        # split): project the VerificationPassed subset explicitly.
+        passing_verification_summaries=tuple(
+            event.summary for event in events if isinstance(event, VerificationPassed)
+        ),
         required_check_names=required_check_names,
         naive_solution=naive_solution,
     )

@@ -9,16 +9,19 @@ to any locked fixture must fail loudly here.
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import replace
 
 import pytest
 
+import loopforge.workloads.benchmarks as benchmark_module
 from loopforge.domain.benchmarks import (
     BenchmarkCategory,
     BenchmarkSandboxMode,
     GraderId,
     suite_lock_hash,
 )
+from loopforge.domain.reliability import RetrySettings
 from loopforge.workloads.benchmarks import (
     AMBIGUOUS_NAIVE_SOLUTION,
     BENCHMARK_SUITE_VERSION,
@@ -36,7 +39,11 @@ from loopforge.workloads.repair import OrchestratedRepairTask, RepairTask
 
 # Pinned operator-visible content lock: computed from the locked fixtures, so
 # ANY fixture content edit changes the hash and fails this test loudly.
-_PINNED_CONTENT_LOCK = "32095c0d5b74d88acc201b390851fb46a1d936f2af57f8b9b2ec2a1ed5a62549"
+# Re-pinned for the M9 adversarial-review fix: the canonical payload now also
+# covers each acceptance-check hook's SOURCE (inspect.getsource), so editing a
+# check body (e.g. unconditional ``passed=True``) relocks loudly instead of
+# silently neutralizing the false-success category the hook guards.
+_PINNED_CONTENT_LOCK = "9bc7fe19125b4946c2f1e10301b0e1b7de77a31b2ce81b2635bf57c00e969924"
 
 _LIVE_ELIGIBLE_TASKS = {
     "bench-simple-bug",
@@ -175,6 +182,19 @@ def test_approval_wiring_is_hitl_only() -> None:
             assert binding.approval_required_for == ()
 
 
+def test_transient_fault_count_stays_below_the_default_retry_streak() -> None:
+    # The TRANSIENT_API binding recovers only because its injected failure
+    # streak is strictly shorter than the runtime's default bounded retry
+    # streak (RetrySettings.max_attempts): with a streak at or above the
+    # default the injected failures would exhaust the retry budget and the
+    # trial would stop FAILURE instead of recovering. Pin the relationship
+    # so a change to EITHER side fails loudly instead of silently flipping
+    # the category's regime.
+    transient = build_benchmark_binding("bench-transient-api")
+    assert transient.fault is not None
+    assert transient.fault.transient_failure_count < RetrySettings().max_attempts
+
+
 def test_fault_descriptors_are_data_only_and_targeted() -> None:
     transient = build_benchmark_binding("bench-transient-api")
     assert transient.fault == BenchmarkFault(
@@ -277,6 +297,21 @@ def test_binding_rejects_non_callable_checks() -> None:
 
 def test_content_lock_matches_pinned_literal() -> None:
     assert benchmark_content_lock() == _PINNED_CONTENT_LOCK
+
+
+def test_content_lock_covers_check_source_not_just_identity() -> None:
+    # Deny pin for the hook-body attack: the canonical payload must embed
+    # each check's inspect.getsource text, so weakening a check body changes
+    # benchmark_content_lock() even though "module.qualname" is unchanged.
+    binding = build_benchmark_binding("bench-ambiguous-success")
+    canonical = benchmark_module._canonical_binding(binding)  # pyright: ignore[reportPrivateUsage]
+    check = ambiguous_success_edge_check
+    assert canonical["checks"] == [
+        {
+            "name": f"{check.__module__}.{check.__qualname__}",
+            "source": inspect.getsource(check),
+        }
+    ]
 
 
 def test_content_lock_is_stable_across_calls_and_executable_wiring() -> None:

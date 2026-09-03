@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState, type ReactElement } from "react";
-import { ApiError, getEvalReport, type ConfigReportRow, type EvalReport } from "../api";
+import {
+  ApiError,
+  getBenchmarkSuite,
+  getEvalReport,
+  type BenchmarkSuiteInfo,
+  type ConfigReportRow,
+  type EvalReport,
+} from "../api";
 import { formatCost } from "../format";
 import { ErrorBanner } from "../widgets";
 
@@ -46,11 +53,14 @@ function ReportRow({ row, pareto }: { row: ConfigReportRow; pareto: boolean }): 
 
 export default function EvalView({ reportId }: { reportId: string }): ReactElement {
   const [report, setReport] = useState<EvalReport | null>(null);
+  const [suite, setSuite] = useState<BenchmarkSuiteInfo | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async (): Promise<void> => {
     try {
-      setReport(await getEvalReport(reportId));
+      const [detail, suiteInfo] = await Promise.all([getEvalReport(reportId), getBenchmarkSuite()]);
+      setReport(detail);
+      setSuite(suiteInfo);
       setError(null);
     } catch (err) {
       setError(err instanceof ApiError ? err.detail : String(err));
@@ -62,6 +72,10 @@ export default function EvalView({ reportId }: { reportId: string }): ReactEleme
   }, [load]);
 
   const pareto = new Set(report?.pareto_config_ids ?? []);
+  // Stale-lock flag: the report pins the spec lock it was measured under; a
+  // mismatch against the live suite lock means the benchmark changed since.
+  const liveLock = suite?.lock_hash ?? null;
+  const stale = report !== null && liveLock !== null && report.lock_hash !== liveLock;
   // Deterministic display order: grouped by configuration, then task.
   const rows = [...(report?.config_reports ?? [])].sort(
     (a, b) => a.config_id.localeCompare(b.config_id) || a.task_id.localeCompare(b.task_id),
@@ -84,6 +98,17 @@ export default function EvalView({ reportId }: { reportId: string }): ReactEleme
           <>
             <p className="muted lock-line">
               suite lock <span className="mono">{report.lock_hash}</span>
+              {stale && (
+                <>
+                  {" "}
+                  <span
+                    className="badge badge-amber"
+                    title={`stale: measured under lock ${report.lock_hash}, live suite lock is ${liveLock}`}
+                  >
+                    stale
+                  </span>
+                </>
+              )}
             </p>
             <p className="muted">
               pareto frontier:{" "}

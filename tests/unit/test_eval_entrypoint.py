@@ -15,6 +15,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -62,9 +63,10 @@ from loopforge.domain.types import (
 from loopforge.entrypoints.eval import (
     EvalTrialDriver,
     EvalTrialError,
-    _check_names_from_summaries,  # pyright: ignore[reportPrivateUsage] - unit pins target the wiring internals
+    _check_names_from_checks,  # pyright: ignore[reportPrivateUsage] - unit pins target the wiring internals
     _evidence_for,  # pyright: ignore[reportPrivateUsage] - unit pins target the wiring internals
     _narrow_budget,  # pyright: ignore[reportPrivateUsage] - unit pins target the wiring internals
+    _narrow_no_progress_limit,  # pyright: ignore[reportPrivateUsage] - unit pins target the wiring internals
     resolve_configurations,
 )
 from loopforge.ports.model import ModelPort
@@ -211,34 +213,60 @@ def test_narrow_budget_uses_the_orchestrated_envelope() -> None:
     )
 
 
-# --- Check-name projection over durable summaries -----------------------------
+def test_narrow_no_progress_limit_never_widens_the_envelope() -> None:
+    # A programmatic configuration may not buy itself a longer stall leash
+    # than the builders' code-owned envelope default (3).
+    wide = EvalConfiguration(
+        config_id="cfg", max_cost_usd=1.0, max_iterations=8, no_progress_limit=10**9
+    )
+
+    assert _narrow_no_progress_limit(wide) == 3
 
 
-def test_check_names_keep_hook_outcomes_only() -> None:
-    summaries = (
-        (
-            "command:run_tests: passed (exit_code=0); "
-            "patch_constraints: passed (files changed: median.py); "
-            "edge_cases: passed (exit_code=0)"
+def test_narrow_no_progress_limit_keeps_a_tighter_threshold() -> None:
+    assert _narrow_no_progress_limit(_TIGHT) == 2
+
+
+# --- Check-name provenance: code-owned checks, never the durable stream -------
+
+
+@_REQUIRES_GIT
+def test_check_names_derive_from_the_code_owned_checks(tmp_path: Path) -> None:
+    binding, workspace = _materialize("bench-ambiguous-success", tmp_path)
+
+    assert _check_names_from_checks(binding, workspace) == ("edge_cases",)
+
+
+@_REQUIRES_GIT
+def test_check_names_are_empty_when_the_binding_has_no_checks(tmp_path: Path) -> None:
+    binding, workspace = _materialize("bench-transient-api", tmp_path)
+
+    assert _check_names_from_checks(binding, workspace) == ()
+
+
+@_REQUIRES_GIT
+def test_a_crafted_filename_cannot_inject_a_grader_check_name(tmp_path: Path) -> None:
+    """Regression (M9 W2): summary detail strings are model-influenceable.
+
+    Verification details embed unquoted workspace filenames, and ``; `` /
+    ``: `` are legal filename characters — scraping hook names from summaries
+    let a file named ``x; evil: failed`` inject ``evil`` into the grader's
+    required set. The names now come from the code-owned checks only.
+    """
+    binding, workspace = _materialize("bench-ambiguous-success", tmp_path)
+    events = (
+        _verification(
+            VerificationFailed,
+            "command:run_tests: failed (exit_code=1); "
+            "patch_constraints: failed (paths outside allowed prefixes: x; evil: failed)",
+            1,
         ),
-        "command:run_tests: failed (exit_code=1); edge_cases: failed (exit_code=1)",
     )
 
-    assert _check_names_from_summaries(summaries) == ("edge_cases",)
+    evidence = _evidence_for(binding, workspace, events)
 
-
-def test_check_names_are_sorted_and_deduplicated() -> None:
-    summaries = (
-        "zeta: passed (exit_code=0); alpha: passed (exit_code=0)",
-        "alpha: failed (exit_code=1)",
-    )
-
-    assert _check_names_from_summaries(summaries) == ("alpha", "zeta")
-
-
-def test_check_names_are_empty_without_hook_outcomes() -> None:
-    assert _check_names_from_summaries(("command:run_tests: passed (exit_code=0)",)) == ()
-    assert _check_names_from_summaries(()) == ()
+    assert evidence.required_check_names == ("edge_cases",)
+    assert "evil" not in evidence.required_check_names
 
 
 # --- Evidence projection over a real materialized fixture (no command runs) ----
@@ -282,6 +310,8 @@ def test_evidence_collects_hook_names_naive_solution_and_fixture_truth(tmp_path:
     assert evidence.required_check_names == ("edge_cases",)
     assert evidence.naive_solution == AMBIGUOUS_NAIVE_SOLUTION
     assert evidence.verification_summaries == tuple(event.summary for event in events)
+    # The anti-forgery split: only the VerificationPassed summaries.
+    assert evidence.passing_verification_summaries == (events[0].summary, events[2].summary)
     fixture = binding.task.fixture
     expected = tuple(item for item in fixture.files if item.path.startswith(_TESTS_PREFIX))
     assert evidence.expected_test_files == expected
@@ -334,6 +364,48 @@ def test_evidence_binds_no_naive_solution_outside_ambiguous_success(tmp_path: Pa
 
     assert evidence.naive_solution == ()
     assert evidence.required_check_names == ()
+
+
+# --- Bounded, symlink-safe evidence reads (M9 W1) ------------------------------
+#
+# A live-model trial controls the end-of-run workspace, so fixture paths are
+# an attack surface: a planted symlink, an oversize file, or binary content
+# must fail the TRIAL loudly (EvalTrialError), never hang/OOM the driver or
+# kill the whole eval with a raw exception. The allow side — ordinary fixture
+# files read byte-identically — is pinned by the evidence tests above.
+
+
+@_REQUIRES_GIT
+def test_evidence_read_rejects_a_trial_planted_symlink(tmp_path: Path) -> None:
+    binding, workspace = _materialize("bench-ambiguous-success", tmp_path)
+    elsewhere = tmp_path / "elsewhere.txt"
+    elsewhere.write_text("outside the workspace", encoding="utf-8")
+    target = workspace.root / "tests" / "test_median.py"
+    target.unlink()
+    target.symlink_to(elsewhere)
+
+    with pytest.raises(EvalTrialError, match="symlink component"):
+        _evidence_for(binding, workspace, ())
+
+
+@_REQUIRES_GIT
+def test_evidence_read_rejects_an_oversize_file(tmp_path: Path) -> None:
+    binding, workspace = _materialize("bench-ambiguous-success", tmp_path)
+    target = workspace.root / "tests" / "test_median.py"
+    target.write_bytes(b"x" * (1_000_001))
+
+    with pytest.raises(EvalTrialError, match="evidence read cap"):
+        _evidence_for(binding, workspace, ())
+
+
+@_REQUIRES_GIT
+def test_evidence_read_rejects_binary_content(tmp_path: Path) -> None:
+    binding, workspace = _materialize("bench-ambiguous-success", tmp_path)
+    target = workspace.root / "median.py"
+    target.write_bytes(b"\xff\xfe\x00 binary")
+
+    with pytest.raises(EvalTrialError, match="not valid utf-8"):
+        _evidence_for(binding, workspace, ())
 
 
 # --- Driver failure semantics -------------------------------------------------
@@ -578,3 +650,41 @@ def test_driver_narrows_the_runtime_budget_from_the_configuration(tmp_path: Path
     stop = result.events[-1]
     assert isinstance(stop, RunStopped)
     assert stop.reason is StopReason.MAX_ITERATIONS
+
+
+@_REQUIRES_GIT
+@_REQUIRES_RLIMIT_AS
+def test_driver_removes_only_its_own_fallback_workspaces_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """M9 W8: the mkdtemp fallback must not leak per-trial dirs.
+
+    Without an operator ``workspaces_root`` the driver mkdtemps per trial;
+    it owns those dirs and removes them after evidence collection. The allow
+    side — an operator-supplied root is never removed — is pinned by
+    ``test_driver_uses_a_fresh_workspace_per_trial`` above.
+    """
+    created: list[str] = []
+    real_mkdtemp = tempfile.mkdtemp
+
+    def capturing_mkdtemp(
+        suffix: str | None = None, prefix: str | None = None, directory: str | None = None
+    ) -> str:
+        path = real_mkdtemp(suffix=suffix, prefix=prefix, dir=directory)
+        # Only the driver's own fallback dirs (other wiring may mkdtemp too).
+        if Path(path).name.startswith("loopforge-eval-"):
+            created.append(path)
+        return path
+
+    monkeypatch.setattr(tempfile, "mkdtemp", capturing_mkdtemp)
+    driver = EvalTrialDriver(
+        clock_factory=lambda: FixedClock(NOW),
+        sleeper_factory=RecordingSleeper,
+    )
+    spec = build_benchmark_binding("bench-transient-api").spec
+
+    result = driver(spec, _BASELINE, "baseline:bench-transient-api:0")
+
+    assert result.status is RunStatus.SUCCEEDED
+    assert len(created) == 1
+    assert not Path(created[0]).exists()

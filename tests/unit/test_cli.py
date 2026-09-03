@@ -5,13 +5,17 @@ import runpy
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
+from loopforge.adapters.scripted import FixedClock
+from loopforge.domain.benchmarks import BenchmarkReport, ConfigReport
 from loopforge.entrypoints.cli import build_ollama_model, main
+from loopforge.entrypoints.eval import EvalReportStore
 from loopforge.workloads.fixtures import adder_repair_task
 
 
@@ -595,6 +599,91 @@ def test_eval_container_task_without_image_fails_closed(
     assert list(tmp_path.glob("*.json")) == []
 
 
+def test_eval_unexpected_driver_failure_is_a_clean_error_line(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    """M9 W8: unexpected exceptions never leak internals to the terminal.
+
+    ``EvalTrialError`` keeps its honest message (pinned by the container
+    fail-closed test above); any OTHER driver/runner exception maps to a
+    clean exit-1 line (PACS-011 CLI-leak precedent) — no raw traceback, no
+    wiring detail or paths.
+    """
+
+    def boom(*_args: object, **_kwargs: object) -> None:
+        msg = "internals: /secret/wiring/path"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("loopforge.entrypoints.cli.run_trials", boom)
+    _argv(
+        monkeypatch,
+        "eval",
+        "--tasks",
+        "bench-simple-bug",
+        "--trials",
+        "1",
+        "--results-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 1
+
+    captured = capsys.readouterr()
+    assert "unexpected internal error" in captured.out
+    assert "internals" not in captured.out
+    assert captured.err == ""
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_eval_show_names_the_covered_task_ids(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # Subset reports pin the full-suite lock_hash; the printed header names
+    # the covered task ids so the report is self-describing.
+    store = EvalReportStore(tmp_path, clock=FixedClock(datetime(2026, 9, 3, 12, 0, tzinfo=UTC)))
+    report = BenchmarkReport(
+        report_id="eval-subset",
+        suite_version="1.0.0",
+        lock_hash="0123456789abcdef" * 4,
+        config_reports=(
+            ConfigReport(
+                config_id="baseline",
+                task_id="bench-transient-api",
+                trials=1,
+                successes=1,
+                false_successes=0,
+                success_rate=1.0,
+                false_success_rate=0.0,
+                mean_cost_usd=0.02,
+                mean_latency_seconds=1.5,
+                mean_total_tokens=240.0,
+                mean_human_interventions=0.0,
+            ),
+            ConfigReport(
+                config_id="baseline",
+                task_id="bench-provider-outage",
+                trials=1,
+                successes=0,
+                false_successes=0,
+                success_rate=0.0,
+                false_success_rate=0.0,
+                mean_cost_usd=0.0,
+                mean_latency_seconds=0.25,
+                mean_total_tokens=0.0,
+                mean_human_interventions=0.0,
+            ),
+        ),
+        pareto_config_ids=("baseline",),
+    )
+    store.save(report)
+    _argv(monkeypatch, "eval", "--show", "eval-subset", "--results-dir", str(tmp_path))
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "tasks covered (2): bench-provider-outage, bench-transient-api" in out
+
+
 @_REQUIRES_GIT
 @_REQUIRES_RLIMIT_AS
 def test_eval_scripted_trial_runs_saves_lists_and_shows(
@@ -620,6 +709,8 @@ def test_eval_scripted_trial_runs_saves_lists_and_shows(
     out = captured.out
     assert "eval report=eval-" in out
     assert "bench-transient-api" in out
+    # A subset run pins the full-suite lock; the header self-describes coverage.
+    assert "tasks covered (1): bench-transient-api" in out
     assert "100.0%" in out
     assert "pareto frontier: baseline" in out
     saved_line = next(line for line in out.splitlines() if line.startswith("report saved: "))

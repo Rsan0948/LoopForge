@@ -10,8 +10,9 @@ Authority boundaries:
 
 - the driver only ever NARROWS runtime authority: the repair builders'
   default budgets are the code-owned envelope (``$1.00/8 iterations`` single
-  runtime, ``$2.00/8`` orchestrated), and an ``EvalConfiguration`` tightens
-  it per axis via ``min`` — never widens it (AGENTS.md rules 11, 12);
+  runtime, ``$2.00/8`` orchestrated, stall threshold 3), and an
+  ``EvalConfiguration`` tightens it per axis via ``min`` — budgets and the
+  no-progress stall threshold alike, never widens (AGENTS.md rules 11, 12);
 - sandbox mode is code-owned: ``CONTAINER`` tasks fail closed without a
   wired container image (rule 13), and ``TRUSTED_LOCAL`` tasks always run
   the trusted builder (their locked fixtures never run live) — with a
@@ -29,10 +30,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final, cast
@@ -57,8 +60,10 @@ from loopforge.domain.benchmarks import (
 from loopforge.domain.context_lifecycle import ContextAccounting
 from loopforge.domain.events import Event, VerificationFailed, VerificationPassed
 from loopforge.domain.routing import ModelTier
+from loopforge.domain.security import SandboxCapabilities
 from loopforge.domain.state import RunState
 from loopforge.domain.types import ActionId, BudgetLimit, RunStatus
+from loopforge.domain.verification import CheckOutcome
 from loopforge.domain.workspace import FixtureFile
 from loopforge.entrypoints.orchestrated import build_orchestrated_repair_runtime
 from loopforge.entrypoints.repair import (
@@ -69,6 +74,7 @@ from loopforge.entrypoints.repair import (
 from loopforge.ports.clock import ClockPort, SleeperPort
 from loopforge.ports.context import ContextAccountingSource
 from loopforge.ports.model import ModelPort
+from loopforge.ports.sandbox import SandboxCommandResult, SandboxPolicyError
 from loopforge.ports.telemetry import TelemetryPort
 from loopforge.ports.workspace import WorkspacePort
 from loopforge.workloads.benchmarks import (
@@ -88,6 +94,14 @@ _CONTAINER_EXECUTABLE: Final = "/usr/local/bin/python"
 
 _TRUSTED_ENVELOPE: Final = BudgetLimit(max_cost_usd=1.0, max_iterations=8)
 _ORCHESTRATED_ENVELOPE: Final = BudgetLimit(max_cost_usd=2.0, max_iterations=8)
+# The builders' code-owned stall threshold (the runtime default): the eval
+# configuration may tighten it, never widen it — same min-narrowing contract
+# as the budget axes.
+_ENVELOPE_NO_PROGRESS_LIMIT: Final = 3
+# End-of-run evidence reads share the sandbox tool's byte cap
+# (``SandboxLimits.max_read_bytes``): a trial-planted multi-GB fixture path
+# must fail the trial loudly, never OOM the eval driver.
+_EVIDENCE_READ_CAP_BYTES: Final = 1_000_000
 
 
 class EvalTrialError(RuntimeError):
@@ -110,6 +124,19 @@ class UnknownEvalReportError(EvalReportStoreError):
     Distinct from store corruption (M7): an operator server maps this to 404
     while a corrupted, drifted, or tampered file stays a 500 — the client
     asked for something absent versus the server's store failing closed.
+    Messages in this family never carry the absolute store path: the 404
+    detail goes to the client, and the server's directory layout is not the
+    client's business.
+    """
+
+
+class UnsafeEvalReportIdError(UnknownEvalReportError):
+    """The addressed report id is not safe for the report store.
+
+    A client-side addressing error (path traversal, separators, control
+    characters), mapped to 404 like any other unknown report id — the house
+    taxonomy treats an unaddressable resource as absent, never as the 500
+    store-corruption family.
     """
 
 
@@ -162,24 +189,88 @@ def _narrow_budget(config: EvalConfiguration, *, orchestrated: bool) -> BudgetLi
     )
 
 
-def _check_names_from_summaries(summaries: tuple[str, ...]) -> tuple[str, ...]:
-    """Hook check names observed in durable verification summaries.
+def _narrow_no_progress_limit(config: EvalConfiguration) -> int:
+    """Tighten the stall threshold against the code-owned envelope; never widen it."""
+    return min(config.no_progress_limit, _ENVELOPE_NO_PROGRESS_LIMIT)
 
-    ``RepairVerifier`` composes outcomes as ``"{name}: passed|failed (...)"``;
-    hook outcomes carry the hook's own ``CheckOutcome`` name (e.g.
-    ``edge_cases``) — exactly the names M3's ground-truth grader re-checks.
-    Command outcomes (``command:*``) and the patch-constraint check are not
-    hook evidence and are excluded. The names come from the durable stream
-    the code-owned verifier wrote, never from model output.
+
+class _CheckNameProbeSandbox:
+    """``SandboxPort`` stub that lets a code-owned check declare its outcome name.
+
+    ``RepairVerifier`` embeds each hook's own ``CheckOutcome.name`` in its
+    composed outcomes, so the grader's required names are whatever the
+    code-owned checks declare. Asking the checks directly keeps that
+    provenance in code: command runs return a canned non-succeeded result
+    (nothing executes) and the file APIs fail closed, so only the outcome's
+    NAME is consumed. The stub truthfully claims no enforced capabilities.
+    """
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(
+            file_api_confined=False,
+            symlink_protected=False,
+            environment_filtered=False,
+            process_timeout=False,
+            resource_limits=False,
+            output_limited=False,
+            process_filesystem_isolated=False,
+            network_isolated=False,
+            kernel_isolated=False,
+        )
+
+    def read_text(self, relative_path: str) -> str:
+        msg = f"check-name probe stub does not read files: {relative_path!r}"
+        raise SandboxPolicyError(msg)
+
+    def write_text(self, relative_path: str, content: str) -> None:
+        del content  # the probe writes nothing
+        msg = f"check-name probe stub does not write files: {relative_path!r}"
+        raise SandboxPolicyError(msg)
+
+    def run(
+        self, command_name: str, *, timeout_seconds: float | None = None
+    ) -> SandboxCommandResult:
+        del command_name, timeout_seconds  # the probe executes nothing
+        return SandboxCommandResult(exit_code=1, stdout="", stderr="", succeeded=False)
+
+
+_CHECK_NAME_PROBE_SANDBOX: Final = _CheckNameProbeSandbox()
+
+
+def _check_names_from_checks(
+    binding: BenchmarkTaskBinding, workspace: WorkspacePort
+) -> tuple[str, ...]:
+    """Hook check names, asked of the code-owned checks themselves.
+
+    The names M3's ground-truth grader re-checks are the ones
+    ``RepairVerifier`` embeds in outcomes — each hook's own
+    ``CheckOutcome.name``. Deriving them from ``binding.checks`` (never by
+    scraping the durable stream) keeps the grader input code-owned:
+    verification detail strings embed unquoted, model-influenceable
+    workspace filenames, so a file named ``x; evil: failed`` must not be
+    able to inject ``evil`` into the required set.
     """
     names: list[str] = []
-    for summary in summaries:
-        for entry in summary.split("; "):
-            name, separator, _verdict = entry.partition(": ")
-            if not separator or name.startswith("command:") or name == "patch_constraints":
-                continue
-            if name not in names:
-                names.append(name)
+    for check in binding.checks:
+        try:
+            outcome = check(_CHECK_NAME_PROBE_SANDBOX, workspace)
+        except Exception as exc:
+            msg = (
+                f"acceptance check {getattr(check, '__name__', repr(check))} could not "
+                f"declare its outcome name: {type(exc).__name__}: {exc}"
+            )
+            raise EvalTrialError(msg) from exc
+        # Boundary validation mirrors RepairVerifier's: hooks are code-owned,
+        # but a contract violation fails the trial loudly, never silently.
+        if not isinstance(outcome, CheckOutcome):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_2 = (
+                f"acceptance check {getattr(check, '__name__', repr(check))} returned "
+                f"{type(outcome).__name__}, expected CheckOutcome"
+            )
+            raise EvalTrialError(msg_2)
+        if outcome.name not in names:
+            names.append(outcome.name)
     return tuple(sorted(names))
 
 
@@ -211,7 +302,10 @@ class EvalTrialDriver:
 
     Wiring mirrors the CLI's repair builders: ``workspaces_root`` parents a
     FRESH workspace directory per trial (trial isolation — workspace dirs are
-    never reused); ``model_factory`` builds a live model per trial (``None``
+    never reused); when no root is wired the driver mkdtemps one itself and
+    REMOVES it after the trial's evidence is collected (driver-created,
+    driver-cleaned — the CLI's own TemporaryDirectory contract stays with the
+    CLI); ``model_factory`` builds a live model per trial (``None``
     wires the deterministic scripted model, per-worker for the orchestrated
     binding); ``container_image`` selects the untrusted sandbox path for
     ``CONTAINER`` tasks. ``router_enabled`` on the configuration is
@@ -242,6 +336,9 @@ class EvalTrialDriver:
         self._telemetry_factory = telemetry_factory
         self._executable = executable
         self._trusted_platform_ok: bool | None = None
+        # Directories the driver itself mkdtemp'd (no operator root wired):
+        # the driver owns their lifecycle and removes them after each trial.
+        self._fallback_workspaces_dirs: set[Path] = set()
 
     def __call__(
         self, spec: BenchmarkTaskSpec, config: EvalConfiguration, trial_id: str
@@ -271,7 +368,7 @@ class EvalTrialDriver:
             model=self._model_for(binding),
             model_tier=self._model_tier,
             budget=_narrow_budget(config, orchestrated=isinstance(task, OrchestratedRepairTask)),
-            no_progress_limit=config.no_progress_limit,
+            no_progress_limit=_narrow_no_progress_limit(config),
             verify_read_only_turns=config.verify_read_only_turns,
         )
         wiring = _TrialWiring(
@@ -324,7 +421,24 @@ class EvalTrialDriver:
     def _trial_workspaces_dir(self, trial_id: str) -> Path:
         if self._workspaces_root is not None:
             return self._workspaces_root / trial_id.replace(":", "_")
-        return Path(tempfile.mkdtemp(prefix=f"loopforge-eval-{trial_id.replace(':', '_')}-"))
+        # Driver-owned fallback: the driver created this directory, so the
+        # driver removes it once the trial's evidence is collected (the CLI's
+        # own TemporaryDirectory contract stays with the CLI).
+        directory = Path(tempfile.mkdtemp(prefix=f"loopforge-eval-{trial_id.replace(':', '_')}-"))
+        self._fallback_workspaces_dirs.add(directory)
+        return directory
+
+    def _release_workspaces_dir(self, workspaces_dir: Path) -> None:
+        """Remove a driver-created fallback dir; never an operator-supplied root.
+
+        Best-effort (``ignore_errors``): a cleanup failure must never mask the
+        trial's own outcome, and the residue is an operator-visible tmp dir,
+        not lost evidence.
+        """
+        if workspaces_dir not in self._fallback_workspaces_dirs:
+            return
+        self._fallback_workspaces_dirs.discard(workspaces_dir)
+        shutil.rmtree(workspaces_dir, ignore_errors=True)
 
     def _drive_single(
         self,
@@ -359,6 +473,7 @@ class EvalTrialDriver:
             accountings = _accountings_of(bundle.runtime.context)
         finally:
             bundle.close()
+            self._release_workspaces_dir(wiring.workspaces_dir)
         return TrialRunResult(
             run_id=str(state.run_id),
             status=state.status,
@@ -390,6 +505,7 @@ class EvalTrialDriver:
             accountings: tuple[ContextAccounting, ...] = ()
         finally:
             bundle.close()
+            self._release_workspaces_dir(wiring.workspaces_dir)
         return TrialRunResult(
             run_id=str(state.run_id),
             status=state.status,
@@ -441,6 +557,65 @@ def _wrap_fault(binding: BenchmarkTaskBinding, model: ModelPort) -> ModelPort:
     raise EvalTrialError(msg)
 
 
+def _read_evidence_text(workspace_root: Path, relative_path: str) -> str:
+    """Bounded, symlink-safe read of one end-of-run evidence file.
+
+    A live-model trial controls the workspace at evidence time, so a bare
+    ``Path.read_text`` on a fixture path is an attack surface: a planted
+    symlink (``/dev/zero`` hangs the driver), a multi-GB file (OOM), or a
+    binary file (``UnicodeDecodeError`` killing the WHOLE eval). Mirrors the
+    sandbox's own defenses (``local_sandbox`` byte cap + symlink rejection):
+    any symlink component under the workspace root, any escape of the root,
+    a non-regular or oversize (``_EVIDENCE_READ_CAP_BYTES``) target, and any
+    undecodable/unreadable content all raise ``EvalTrialError`` — a trial
+    whose evidence cannot be collected fails loudly by name, never silently
+    fabricates, and never aborts the eval with a raw exception.
+    """
+    root = workspace_root.resolve()
+    current = root
+    for part in relative_path.split("/"):
+        current = current / part
+        if current.is_symlink():
+            msg = (
+                f"evidence path {relative_path!r} contains a symlink component; "
+                "a trial-planted link cannot name grader evidence"
+            )
+            raise EvalTrialError(msg)
+    try:
+        resolved = current.resolve(strict=True)
+    except FileNotFoundError as exc:
+        msg = f"evidence path {relative_path!r} vanished during collection"
+        raise EvalTrialError(msg) from exc
+    except OSError as exc:
+        msg_2 = f"evidence path {relative_path!r} cannot be resolved: {exc}"
+        raise EvalTrialError(msg_2) from exc
+    if not resolved.is_relative_to(root):
+        msg_3 = f"evidence path {relative_path!r} escapes the workspace root"
+        raise EvalTrialError(msg_3)
+    try:
+        if not resolved.is_file():
+            msg_4 = f"evidence path {relative_path!r} is not a regular file"
+            raise EvalTrialError(msg_4)
+        if resolved.stat().st_size > _EVIDENCE_READ_CAP_BYTES:
+            msg_5 = (
+                f"evidence path {relative_path!r} exceeds the "
+                f"{_EVIDENCE_READ_CAP_BYTES}-byte evidence read cap"
+            )
+            raise EvalTrialError(msg_5)
+        # newline="" mirrors the sandbox read: evidence bytes stay faithful
+        # (CRLF included), never silently rewritten.
+        return resolved.read_text(encoding="utf-8", newline="")
+    except UnicodeDecodeError as exc:
+        msg_6 = f"evidence path {relative_path!r} is not valid utf-8 text"
+        raise EvalTrialError(msg_6) from exc
+    except PermissionError as exc:
+        msg_7 = f"evidence path {relative_path!r} is not readable"
+        raise EvalTrialError(msg_7) from exc
+    except OSError as exc:
+        msg_8 = f"evidence path {relative_path!r} read failed: {exc}"
+        raise EvalTrialError(msg_8) from exc
+
+
 def _evidence_for(
     binding: BenchmarkTaskBinding,
     workspace: WorkspacePort,
@@ -449,12 +624,16 @@ def _evidence_for(
     """Project the end-of-run workspace and durable stream into grader evidence.
 
     Test-file truth is three-way explicit: surviving files with on-disk
-    content, ``deleted_test_files`` for fixture test files that no longer
-    exist (a deletion is evidence, never a silent absence), and the locked
-    fixture originals as the expected ground truth. ``required_check_names``
-    derives from the durable verification summaries (the names the code-owned
-    verifier composed); ``naive_solution`` binds the known-wrong patch for
-    the ambiguous-success category.
+    content (read bounded and symlink-safe via ``_read_evidence_text``),
+    ``deleted_test_files`` for fixture test files that no longer exist (a
+    deletion is evidence, never a silent absence), and the locked fixture
+    originals as the expected ground truth. ``required_check_names`` derives
+    from the code-owned ``binding.checks`` (never scraped from the durable
+    stream — see ``_check_names_from_checks``);
+    ``passing_verification_summaries`` carries only the ``VerificationPassed``
+    summaries (the anti-forgery split the hook-evidence re-check trusts);
+    ``naive_solution`` binds the known-wrong patch for the ambiguous-success
+    category.
     """
     fixture = binding.task.fixture
     workspace_root = workspace.root
@@ -467,12 +646,10 @@ def _evidence_for(
         if not on_disk.exists():
             deleted.append(item.path)
             continue
-        content = on_disk.read_text(encoding="utf-8")
+        content = _read_evidence_text(workspace_root, item.path)
         test_files.append(FixtureFile(path=item.path, content=content))
     sources = tuple(
-        FixtureFile(
-            path=item.path, content=(workspace_root / item.path).read_text(encoding="utf-8")
-        )
+        FixtureFile(path=item.path, content=_read_evidence_text(workspace_root, item.path))
         for item in fixture.files
         if not item.path.startswith(_TESTS_PREFIX) and (workspace_root / item.path).exists()
     )
@@ -481,6 +658,7 @@ def _evidence_for(
         for event in events
         if isinstance(event, VerificationPassed | VerificationFailed)
     )
+    passing = tuple(event.summary for event in events if isinstance(event, VerificationPassed))
     naive: tuple[FixtureFile, ...] = ()
     if binding.spec.category is BenchmarkCategory.AMBIGUOUS_SUCCESS:
         naive = AMBIGUOUS_NAIVE_SOLUTION
@@ -493,7 +671,8 @@ def _evidence_for(
         ),
         final_sources=sources,
         verification_summaries=summaries,
-        required_check_names=_check_names_from_summaries(summaries),
+        passing_verification_summaries=passing,
+        required_check_names=_check_names_from_checks(binding, workspace),
         naive_solution=naive,
     )
 
@@ -663,18 +842,17 @@ class EvalReportStore:
     """JSON persistence for ``BenchmarkReport`` under an operator-owned directory.
 
     One file per report (``{report_id}.json``), atomic writes (tmp file +
-    rename, stale-tmp sweep at open), fail-closed reads: a corrupted,
-    wrong-version, drifted, or tampered file raises ``EvalReportStoreError``
-    — the domain constructors are the validation authority, so a hand-edited
-    rate that disagrees with its counts cannot load.
+    rename, stale-tmp swept on the writer side — a read-only construction
+    never deletes, so opening a store cannot race a concurrent ``save``),
+    fail-closed reads: a corrupted, wrong-version, drifted, or tampered file
+    raises ``EvalReportStoreError`` — the domain constructors are the
+    validation authority, so a hand-edited rate that disagrees with its
+    counts cannot load.
     """
 
     def __init__(self, directory: str | Path, *, clock: ClockPort | None = None) -> None:
         self._dir = Path(directory)
         self._clock = clock or SystemClock()
-        if self._dir.is_dir():
-            for stale in self._dir.glob("*.tmp"):
-                stale.unlink(missing_ok=True)
 
     def _path_for(self, report_id: str) -> Path:
         if not _REPORT_ID_PATTERN.fullmatch(report_id):
@@ -682,8 +860,18 @@ class EvalReportStore:
                 f"report_id {report_id!r} is not safe for the report store "
                 "(letters, digits, dot, underscore, dash)"
             )
-            raise EvalReportStoreError(msg)
+            raise UnsafeEvalReportIdError(msg)
         return self._dir / f"{report_id}.json"
+
+    def _sweep_stale_tmp_files(self) -> None:
+        """Remove interrupted-save residue, tolerating a concurrent save.
+
+        Writer-side only (called from ``save``): a vanished tmp is another
+        writer's completed rename, never an error.
+        """
+        for stale in self._dir.glob("*.tmp"):
+            with suppress(FileNotFoundError):
+                stale.unlink()
 
     def save(self, report: BenchmarkReport) -> Path:
         path = self._path_for(report.report_id)
@@ -693,9 +881,17 @@ class EvalReportStore:
             "report": report_to_dict(report),
         }
         self._dir.mkdir(parents=True, exist_ok=True)
+        self._sweep_stale_tmp_files()
         tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-        tmp_path.replace(path)
+        try:
+            tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            tmp_path.replace(path)
+        except OSError as exc:
+            # Losing a tmp-write/replace race (or any filesystem failure) at
+            # the end of an expensive eval is a code-owned store error, never
+            # a raw FileNotFoundError traceback.
+            msg = f"eval report save failed for {report.report_id!r}: {exc}"
+            raise EvalReportStoreError(msg) from exc
         return path
 
     def _decode(self, path: Path) -> tuple[str, BenchmarkReport]:
@@ -724,7 +920,7 @@ class EvalReportStore:
     def load(self, report_id: str) -> BenchmarkReport:
         path = self._path_for(report_id)
         if not path.is_file():
-            msg = f"unknown eval report {report_id!r} in {self._dir}"
+            msg = f"unknown eval report {report_id!r}"
             raise UnknownEvalReportError(msg)
         _created_at, report = self._decode(path)
         if report.report_id != report_id:

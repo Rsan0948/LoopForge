@@ -1,8 +1,9 @@
 """EvalReportStore: operator-owned JSON persistence for eval reports (PACS-016, M6).
 
 Pins the store contract without any sandbox: exact round-trip of every
-``BenchmarkReport``/``ConfigReport`` field, atomic writes (stale-tmp sweep at
-open, no residue after save), and fail-closed reads — corrupted JSON, schema
+``BenchmarkReport``/``ConfigReport`` field, atomic writes (stale-tmp swept on
+the writer side only — read-only construction never deletes, and a mid-save
+tmp loss surfaces as a code-owned store error), and fail-closed reads — corrupted JSON, schema
 version drift, key drift, hand-tampered rates, and file/content id mismatches
 all raise ``EvalReportStoreError`` instead of being repaired or skipped. The
 domain constructors are the validation authority: a hand-edited rate that
@@ -25,6 +26,8 @@ from loopforge.entrypoints.eval import (
     REPORT_SCHEMA_VERSION,
     EvalReportStore,
     EvalReportStoreError,
+    UnknownEvalReportError,
+    UnsafeEvalReportIdError,
 )
 
 EARLIER = datetime(2026, 9, 3, 10, 0, tzinfo=UTC)
@@ -142,13 +145,46 @@ def test_save_writes_one_json_file_atomically(tmp_path: Path) -> None:
     assert payload["created_at"] == EARLIER.isoformat()
 
 
-def test_opening_store_sweeps_stale_tmp_files(tmp_path: Path) -> None:
+def test_read_only_construction_never_deletes_tmp_files(tmp_path: Path) -> None:
+    # M9 W3: a construction-time sweep raced a concurrent save()'s write →
+    # replace; the sweep is writer-side (save) only now.
     stale = tmp_path / "eval-interrupted.1234.tmp"
     stale.write_text("{}", encoding="utf-8")
 
     EvalReportStore(tmp_path)
 
+    assert stale.is_file()
+
+
+def test_save_sweeps_stale_tmp_files(tmp_path: Path) -> None:
+    stale = tmp_path / "eval-interrupted.1234.tmp"
+    stale.write_text("{}", encoding="utf-8")
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+
+    store.save(_report())
+
     assert not stale.exists()
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_save_survives_a_concurrent_sweep_deleting_its_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # M9 W3: a concurrent store's stale-tmp sweep can delete this save's tmp
+    # between write_text and replace; the loser must fail as a code-owned
+    # store error at the end of an expensive eval, never a raw
+    # FileNotFoundError.
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    real_replace = Path.replace
+
+    def racing_replace(self: Path, target: Path) -> Path:
+        self.unlink(missing_ok=True)  # the concurrent sweep wins the race
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", racing_replace)
+
+    with pytest.raises(EvalReportStoreError, match="save failed"):
+        store.save(_report())
 
 
 def test_load_unknown_report_id_fails_closed(tmp_path: Path) -> None:
@@ -156,6 +192,29 @@ def test_load_unknown_report_id_fails_closed(tmp_path: Path) -> None:
 
     with pytest.raises(EvalReportStoreError, match="unknown eval report 'eval-missing'"):
         store.load("eval-missing")
+
+
+def test_unknown_and_unsafe_ids_never_leak_the_store_path(tmp_path: Path) -> None:
+    # M9 W4: the operator server maps this family to 404, and the response
+    # detail must not disclose the server's directory layout.
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+
+    with pytest.raises(UnknownEvalReportError) as unknown:
+        store.load("eval-missing")
+    assert str(tmp_path) not in str(unknown.value)
+    with pytest.raises(UnknownEvalReportError) as unsafe:
+        store.load("../evil")
+    assert str(tmp_path) not in str(unsafe.value)
+
+
+def test_unsafe_report_id_belongs_to_the_unknown_report_taxonomy(tmp_path: Path) -> None:
+    # M9 W4: an unsafe id is a client addressing error → the 404 (unknown
+    # report) family, never the 500 store-corruption family.
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+
+    with pytest.raises(UnsafeEvalReportIdError, match="not safe for the report store"):
+        store.load("../evil")
+    assert issubclass(UnsafeEvalReportIdError, UnknownEvalReportError)
 
 
 @pytest.mark.parametrize(

@@ -33,15 +33,17 @@ Honesty notes per derivation (what is exact, what is an estimate):
   counted: those are rejected at the schema/tool boundary, and this metric
   measures discipline (in-scope vs out-of-scope intent), not malformed
   output.
-- ``context_tokens_used``: two-source precedence — caller-supplied
+- ``context_tokens_used``: two-source MAXIMUM — the peak of caller-supplied
   ``ContextAccounting`` ledgers (the runtime's own budgeting counter, an
-  ESTIMATE owned by the runtime, not a provider tokenizer) win when present;
-  otherwise the peak durable ``BudgetDebited`` ``input_tokens`` (the real
-  billed prompt size). See the function docstring for the full precedence
-  contract.
+  ESTIMATE owned by the runtime, not a provider tokenizer) and the peak
+  durable ``BudgetDebited`` ``input_tokens`` (the real billed prompt size).
+  See the function docstring for the full contract.
 - ``context_items_dropped``: only knowable from caller-supplied accountings;
   the durable event stream does NOT carry compaction/drop detail, so the
-  metric is honestly 0 when no accountings are supplied.
+  metric is honestly 0 when no accountings are supplied. The accounting seam
+  also exposes only the MOST RECENT ledger per runtime, so the count
+  reflects the final assembly, not a run-wide total — see the helper's
+  docstring for the commensurability caveat.
 """
 
 from __future__ import annotations
@@ -85,16 +87,35 @@ this via the ``path_arguments`` keyword.
 """
 
 
+class ProposalArgumentsContractError(TypeError):
+    """Raised when a durable proposal's arguments violate the serializability contract.
+
+    ``ActionProposal.arguments`` is typed ``Mapping[str, str]`` but the
+    dataclass does not validate value types, so a misbehaving caller (e.g. a
+    trial driver hand-building events) can persist arguments ``json.dumps``
+    cannot canonicalize. The projection fails loudly with a code-owned error
+    instead of leaking a bare ``TypeError``.
+    """
+
+
 def _proposal_signature(event: ActionProposed) -> tuple[str, str]:
     """Canonical identity of one proposal: tool name + sorted-key JSON arguments.
 
     ``json.dumps(..., sort_keys=True)`` makes the signature insensitive to
     mapping insertion order, so two proposals that differ only in argument
     ordering are exact duplicates — while any real argument difference
-    (including same tool, different content) is not.
+    (including same tool, different content) is not. Non-serializable
+    argument values raise ``ProposalArgumentsContractError``.
     """
     proposal = event.proposal
-    canonical = json.dumps(dict(proposal.arguments), sort_keys=True, separators=(",", ":"))
+    try:
+        canonical = json.dumps(dict(proposal.arguments), sort_keys=True, separators=(",", ":"))
+    except TypeError as exc:
+        msg = (
+            f"proposal arguments for tool {proposal.tool_name!r} are not "
+            f"JSON-serializable (the contract is Mapping[str, str]): {exc}"
+        )
+        raise ProposalArgumentsContractError(msg) from exc
     return (proposal.tool_name, canonical)
 
 
@@ -189,20 +210,22 @@ def _scope_violations(
 def _context_tokens_used(
     events: tuple[Event, ...], context_accountings: tuple[ContextAccounting, ...]
 ) -> int:
-    """Peak context size, preferring accounting ledgers over billed usage.
+    """Peak context size: the MAXIMUM of the accounting-ledger and billed peaks.
 
-    Precedence: when the caller supplies per-assembly ``ContextAccounting``
-    ledgers (collected via the ``ContextAccountingSource`` seam), the peak
-    ``used_tokens`` across them wins — it is the runtime's own budgeting
-    ledger, an ESTIMATE from the runtime-owned token counter (not a provider
-    tokenizer) but the only source that reflects selection/compaction.
-    Otherwise the peak ``BudgetDebited`` ``usage.input_tokens`` is the
-    fallback: the real billed prompt size, exact but blind to dropped items.
-    0 when neither source carries data.
+    Two sources, neither authoritative alone: the caller-supplied
+    per-assembly ``ContextAccounting`` ledgers (collected via the
+    ``ContextAccountingSource`` seam) are the runtime's own budgeting
+    ledger — an ESTIMATE from the runtime-owned token counter (not a
+    provider tokenizer), the only source that reflects selection/compaction,
+    but partial (the seam exposes only the most recent ledger per runtime,
+    so its peak can under-report earlier assemblies). The durable
+    ``BudgetDebited`` ``usage.input_tokens`` peak is the real billed prompt
+    size — exact, but blind to dropped items. The metric is the maximum of
+    the two peaks so a higher value observed by EITHER source is never
+    silently under-reported. 0 when neither source carries data.
     """
-    if context_accountings:
-        return max(accounting.used_tokens for accounting in context_accountings)
     peaks = [event.usage.input_tokens for event in events if isinstance(event, BudgetDebited)]
+    peaks.extend(accounting.used_tokens for accounting in context_accountings)
     return max(peaks) if peaks else 0
 
 
@@ -213,8 +236,17 @@ def _context_items_dropped(context_accountings: tuple[ContextAccounting, ...]) -
     budget) plus kept-but-compacted entries — a distinct population in
     ``ContextAccounting`` (compaction truncates content without dropping the
     item), included here because truncated content is partially lost context.
-    Honestly 0 when no accountings are supplied: the durable event stream
-    does not carry compaction/drop detail, so this module never fabricates it.
+
+    LIMITATIONS, stated precisely: (a) the ``ContextAccountingSource`` seam
+    exposes only the MOST RECENT ledger per runtime, so when the caller
+    supplies what the seam yields the count describes the final assembly
+    only — drops from earlier assemblies in the same run are not visible and
+    are never fabricated; (b) orchestrated (multi-runtime) trials supply no
+    ledger at all and honestly report 0. Consequently the metric is
+    commensurable ONLY across runs with the same ledger availability:
+    comparing a single-runtime trial (final-assembly count) against an
+    orchestrated trial (0) would conflate "nothing dropped" with "nothing
+    observable".
     """
     dropped = 0
     for accounting in context_accountings:
@@ -252,7 +284,8 @@ def compute_trajectory_metrics(
     - ``permission_requests``: count of ``ApprovalRequested`` (grants and
       rejections are human interventions, not requests).
     - ``context_tokens_used`` / ``context_items_dropped``: see their helpers
-      for the two-source precedence and the honest-0 fallback.
+      for the two-source maximum contract and the ledger-visibility
+      limitations (final-assembly-only counts, honest 0 without ledgers).
     - ``recovery_events``: count of ``RetryScheduled`` + ``CircuitOpened`` +
       ``ToolFailed`` (every failure class) + ``ReflectionRecorded``.
     """

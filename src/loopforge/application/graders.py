@@ -100,7 +100,15 @@ class GraderEvidence:
     - ``final_sources``: final on-disk content of the fixture's non-test
       source files;
     - ``verification_summaries``: the durable ``VerificationPassed`` /
-      ``VerificationFailed`` summaries in stream order;
+      ``VerificationFailed`` summaries in stream order (kept for
+      compatibility/debugging; graders never TRUST it for hook evidence);
+    - ``passing_verification_summaries``: only the ``VerificationPassed``
+      summaries, in stream order — the SOLE summary source the hook-evidence
+      re-check trusts. Splitting passing from failing is the anti-forgery
+      boundary: verification detail strings embed unquoted workspace
+      filenames, and ``"; "``/``": "`` are legal filename characters, so a
+      name like ``zz; edge_cases: passed`` inside a FAILED summary would
+      otherwise forge the ``"{name}: passed"`` marker;
     - ``required_check_names``: the check names of the task's code-owned
       acceptance hooks (as ``RepairVerifier`` names hook outcomes in the
       composed summary, e.g. ``edge_cases``), empty when the task binds no
@@ -114,6 +122,7 @@ class GraderEvidence:
     expected_test_files: tuple[FixtureFile, ...]
     final_sources: tuple[FixtureFile, ...]
     verification_summaries: tuple[str, ...]
+    passing_verification_summaries: tuple[str, ...] = ()
     deleted_test_files: tuple[str, ...] = ()
     required_check_names: tuple[str, ...] = ()
     naive_solution: tuple[FixtureFile, ...] = ()
@@ -127,6 +136,11 @@ class GraderEvidence:
         _validate_files(self.final_sources, field_name="final_sources")
         _validate_strings(
             self.verification_summaries, field_name="verification_summaries", allow_empty=True
+        )
+        _validate_strings(
+            self.passing_verification_summaries,
+            field_name="passing_verification_summaries",
+            allow_empty=True,
         )
         _validate_strings(
             self.deleted_test_files, field_name="deleted_test_files", allow_empty=False
@@ -280,8 +294,8 @@ def grade_ground_truth(
         objective stays unmet);
     (c) HOOK EVIDENCE — when the task carries acceptance hooks
         (``evidence.required_check_names`` non-empty), every hook's check
-        name must appear as ``"{name}: passed"`` in a durable verification
-        summary: the proof the hook actually ran and passed, in
+        name must appear as ``"{name}: passed"`` in a durable PASSING
+        verification summary: the proof the hook actually ran and passed, in
         ``RepairVerifier``'s composed-summary naming. A success without that
         durable evidence never ran the operator's hidden criterion.
 
@@ -308,9 +322,13 @@ def grade_ground_truth(
             if final_sources.get(naive.path) == naive.content
         )
 
+    # The grader trusts ONLY code-owned check names (arriving as evidence
+    # data) matched against PASSING summaries — never the mixed
+    # verification_summaries stream, where a failed check's detail can embed
+    # an unquoted filename carrying a forged "{name}: passed" substring.
     for name in evidence.required_check_names:
         marker = f"{name}: passed"
-        if not any(marker in summary for summary in evidence.verification_summaries):
+        if not any(marker in summary for summary in evidence.passing_verification_summaries):
             findings.append(f"no passing verification evidence for check: {name}")
 
     return _verdict(

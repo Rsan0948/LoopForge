@@ -1559,6 +1559,22 @@ def test_eval_detail_unknown_report_id_is_404(tmp_path: Path) -> None:
 
         assert response.status_code == 404, response.text
         assert "unknown eval report" in response.json()["detail"]
+        # The 404 detail never discloses the server's directory layout.
+        assert str(tmp_path) not in response.json()["detail"]
+
+
+def test_eval_detail_unsafe_report_id_is_404_not_500(tmp_path: Path) -> None:
+    # M9 W4: ".." (URL-encoded) is a client addressing error, not store
+    # corruption — unknown-resource 404 per the house taxonomy, and the
+    # detail must not leak the absolute store path.
+    evals_dir = tmp_path / "evals"
+    with _client(tmp_path, _plain_factory(), evals_dir=evals_dir) as client:
+        response = client.get("/api/evals/%2E%2E")
+
+        assert response.status_code == 404, response.text
+        detail = response.json()["detail"]
+        assert "not safe for the report store" in detail
+        assert str(evals_dir) not in detail
 
 
 def test_evals_routes_fail_closed_500_on_a_tampered_report(tmp_path: Path) -> None:

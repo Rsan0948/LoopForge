@@ -5,16 +5,20 @@ the empty stream yields all zeros; repetition pins cover exact duplicates at
 known ratios AND same-tool-different-args NOT counting; expensive-turn pins
 cover provider/model mismatches; scope pins cover out-of-scope vs in-scope
 paths, non-path argument values (search patterns) NOT counting, empty
-prefixes, and invalid path values; context-token pins cover BOTH precedence
-paths; recovery and human-intervention pins cover the full event mixes. All
-streams are hand-built durable event tuples; no network, no sandbox.
+prefixes, and invalid path values; context-token pins cover BOTH directions
+of the two-source maximum contract; recovery and human-intervention pins
+cover the full event mixes. All streams are hand-built durable event tuples;
+no network, no sandbox.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
 
+import pytest
+
 from loopforge.application.trajectory import (
+    ProposalArgumentsContractError,
     compute_trajectory_metrics,
     count_human_interventions,
 )
@@ -233,6 +237,18 @@ def test_repetition_ratio_full_stall_is_one_minus_first() -> None:
     assert compute_trajectory_metrics(_spec(), events).repetition_ratio == 0.75
 
 
+def test_non_serializable_proposal_arguments_fail_loudly() -> None:
+    # ActionProposal.arguments is typed Mapping[str, str] but not validated
+    # per value; a misbehaving caller can persist arguments json.dumps cannot
+    # canonicalize. The projection raises its code-owned contract error
+    # instead of leaking a bare TypeError.
+    events: tuple[Event, ...] = (
+        _proposed(1, "write_file", {"path": "src/a.py", "content": b"bytes"}),  # pyright: ignore[reportArgumentType]
+    )
+    with pytest.raises(ProposalArgumentsContractError, match="not JSON-serializable"):
+        compute_trajectory_metrics(_spec(), events)
+
+
 # --- expensive_model_turns -------------------------------------------------------
 
 
@@ -344,19 +360,32 @@ def test_permission_requests_count_approval_requested_only() -> None:
     assert compute_trajectory_metrics(_spec(), events).permission_requests == 2
 
 
-# --- context_tokens_used precedence ----------------------------------------------
+# --- context_tokens_used two-source maximum --------------------------------------
 
 
-def test_context_tokens_used_prefers_accountings_over_budget_debits() -> None:
+def test_context_tokens_used_never_under_reports_a_higher_billed_peak() -> None:
     events: tuple[Event, ...] = (_debit(1, 900), _debit(2, 1200))
     accountings = (
         _accounting(used_content=300, overhead=50),
         _accounting(used_content=500, overhead=50),
     )
     metrics = compute_trajectory_metrics(_spec(), events, context_accountings=accountings)
-    # Peak used_tokens (550) wins even though billed input_tokens peak (1200)
-    # is higher: the accounting precedence is explicit, not max-of-everything.
-    assert metrics.context_tokens_used == 550
+    # The billed peak (1200) exceeds the accounting peak (550): the metric is
+    # the MAXIMUM of the two sources, so a higher real billed prompt size is
+    # never silently under-reported by a partial ledger.
+    assert metrics.context_tokens_used == 1200
+
+
+def test_context_tokens_used_uses_the_accounting_peak_when_it_is_higher() -> None:
+    events: tuple[Event, ...] = (_debit(1, 900), _debit(2, 1200))
+    accountings = (
+        _accounting(used_content=1500, overhead=50),
+        _accounting(used_content=500, overhead=50),
+    )
+    metrics = compute_trajectory_metrics(_spec(), events, context_accountings=accountings)
+    # The accounting peak (1550) exceeds the billed peak (1200): the runtime's
+    # budgeting ledger observed a larger assembly than any single billed turn.
+    assert metrics.context_tokens_used == 1550
 
 
 def test_context_tokens_used_falls_back_to_peak_billed_input_tokens() -> None:

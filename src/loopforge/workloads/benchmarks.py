@@ -31,15 +31,22 @@ Operator-authority boundaries (AGENTS.md rules 12, 14, 16):
   fixture would measure nothing; these stay deterministic-only.
 
 ``benchmark_content_lock()`` is the operator-visible lock on actual benchmark
-content: M1's ``suite_lock_hash`` covers task *spec* fields only, while this
-hash additionally covers every fixture file, every solution, command,
-acceptance/patch-constraint field, and the approval/fault wiring. Any edit
-to any locked fixture fails the pinned hash loudly.
+content. M1's ``suite_lock_hash`` covers task *spec* fields only; this hash
+additionally pins every fixture file's bytes, every solution, every command,
+every acceptance/patch-constraint field, the approval/fault wiring, AND the
+source of every acceptance-check hook (``inspect.getsource`` — editing a
+check's body changes the lock, so a weakened ``passed=True`` hook cannot
+neutralize a category silently). It deliberately does NOT cover grader
+semantics in ``loopforge.application.graders`` (operator authority pinned by
+their own test suites) or runtime policy code (retry/budget/verification
+cadence — the harness under test, not benchmark content). Any edit to any
+locked fixture fails the pinned hash loudly.
 """
 
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import sys
 from dataclasses import dataclass
@@ -606,7 +613,11 @@ def transient_api_fixture() -> FixtureSpec:
 
     The transient API behavior is an environment property injected by M5's
     model-port decorator; this fixture itself is a plain repair task whose
-    binding records the fault descriptor.
+    binding records the fault descriptor. The binding's
+    ``transient_failure_count`` recovers ONLY because it stays strictly below
+    the runtime's default bounded retry streak
+    (``RetrySettings.max_attempts``, domain/reliability) — the unit suite
+    pins that relationship so a change to either side fails loudly.
     """
     return FixtureSpec(
         fixture_id="bench-transient-api",
@@ -646,6 +657,10 @@ def _transient_api_binding(executable: str) -> BenchmarkTaskBinding:
         ),
         fault=BenchmarkFault(
             kind=BenchmarkFaultKind.TRANSIENT_API_FAILURE,
+            # Recovery relies on this count staying strictly below the
+            # runtime's default bounded retry streak
+            # (``RetrySettings.max_attempts``, domain/reliability); the unit
+            # suite pins that relationship so a default change fails loudly.
             transient_failure_count=2,
         ),
     )
@@ -1759,7 +1774,19 @@ def _canonical_binding(binding: BenchmarkTaskBinding) -> dict[str, object]:
         "task_id": binding.spec.task_id,
         "approval_required_for": sorted(binding.approval_required_for),
         "fault": fault,
-        "checks": sorted(f"{check.__module__}.{check.__qualname__}" for check in binding.checks),
+        # The hook CODE is locked, not just its identity: hashing only
+        # "module.qualname" would let an edit that weakens a check body (e.g.
+        # unconditional ``passed=True``) leave the lock unchanged and silently
+        # neutralize the category the hook guards. ``inspect.getsource`` is
+        # stdlib, I/O-free apart from reading the in-repo source file, and
+        # deterministic for these module-level code-owned callables.
+        "checks": [
+            {
+                "name": f"{check.__module__}.{check.__qualname__}",
+                "source": inspect.getsource(check),
+            }
+            for check in sorted(binding.checks, key=lambda c: (c.__module__, c.__qualname__))
+        ],
         "task": _canonical_task(binding.task),
     }
 
@@ -1770,9 +1797,10 @@ def benchmark_content_lock() -> str:
     Canonical JSON (sorted keys, compact separators, bindings sorted by
     task_id, executable paths replaced by a placeholder) covering every
     fixture's files and solution, every command, every acceptance/patch
-    constraint field, the approval/fault/check wiring, and M1's
-    ``suite_lock_hash`` over the task specs. Any edit to any locked fixture
-    changes this hash; the unit suite pins the literal so drift fails loudly.
+    constraint field, the approval/fault wiring, the identity AND source of
+    every acceptance-check hook, and M1's ``suite_lock_hash`` over the task
+    specs. Any edit to any locked fixture or check body changes this hash;
+    the unit suite pins the literal so drift fails loudly.
     """
     bindings = benchmark_bindings()
     payload = {

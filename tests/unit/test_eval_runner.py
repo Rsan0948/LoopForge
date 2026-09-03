@@ -3,9 +3,11 @@
 Stub drivers return canned ``TrialRunResult``s so the runner's own logic is
 pinned without any runtime: aggregation math (rates/means), success vs
 false-success counting including the forged case, Pareto frontier semantics
-(dominated excluded, tied retained, tradeoffs co-frontier), deterministic
-trial ids, runner validation allow+deny (AGENTS.md rule 10), and latency
-derivation for terminal and non-terminal streams.
+(dominated excluded, tied retained, tradeoffs co-frontier) plus the uniform
+cross-product task coverage that makes dominance commensurable, deterministic
+trial ids, runner validation allow+deny (AGENTS.md rule 10) including the
+driver run-id stream contract, and latency derivation for terminal and
+non-terminal streams.
 """
 
 from __future__ import annotations
@@ -568,6 +570,29 @@ def test_pareto_uses_config_level_means_across_tasks() -> None:
 # --- Determinism ----------------------------------------------------------------------
 
 
+def test_run_trials_guarantees_uniform_task_coverage_across_configs() -> None:
+    # Pareto dominance vectors are per-config means over task reports, so
+    # they are only commensurable when every config covers the same tasks;
+    # run_trials iterates the full config x task cross product and this pins
+    # that guarantee explicitly.
+    specs = (_spec("task-a"), _spec("task-b"))
+    configs = (_config("cfg-a"), _config("cfg-b"))
+    outcomes = {
+        (config_id, task_id): _outcome(0.01, 1.0)
+        for config_id in ("cfg-a", "cfg-b")
+        for task_id in ("task-a", "task-b")
+    }
+    driver = _StubDriver(outcomes)
+    report = _run(specs, configs, 1, driver)
+    coverage: dict[str, set[str]] = {}
+    for entry in report.config_reports:
+        coverage.setdefault(entry.config_id, set()).add(entry.task_id)
+    assert coverage == {
+        "cfg-a": {"task-a", "task-b"},
+        "cfg-b": {"task-a", "task-b"},
+    }
+
+
 def test_trial_ids_and_driver_call_order_are_deterministic() -> None:
     specs = (_spec("task-b"), _spec("task-a"))  # deliberately unsorted
     configs = (_config("cfg-b"), _config("cfg-a"))  # deliberately unsorted
@@ -713,6 +738,21 @@ def test_run_trials_rejects_driver_contract_violation() -> None:
             suite_version="1.0.0",
             lock_hash=suite_lock_hash((spec,)),
         )
+
+
+def test_run_trials_rejects_events_from_a_foreign_run() -> None:
+    # A driver that mixes another run's events into the trial result would
+    # silently grade and meter foreign work as this trial's; the runner
+    # refuses the mismatched stream as a contract violation.
+    spec = _spec("task-a")
+    foreign = _result(
+        "run-claimed",
+        RunStatus.SUCCEEDED,
+        _success_events("run-foreign", cost=0.02, latency=5.0),
+    )
+    driver = _StubDriver({("cfg-a", "task-a"): foreign})
+    with pytest.raises(TrialDriverContractError, match="does not match the trial run_id"):
+        _run((spec,), (_config("cfg-a"),), 1, driver)
 
 
 def test_run_trials_echoes_but_never_forges_the_lock() -> None:

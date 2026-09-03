@@ -308,7 +308,9 @@ class ConfigReport:
     The rates are stored (not derived) so reports round-trip exactly, but
     they are pinned consistent with the counts: a report whose
     ``success_rate`` disagrees with ``successes / trials`` beyond a small
-    epsilon cannot exist.
+    epsilon cannot exist. Success and false success are mutually exclusive
+    per the M3 contract (a verifier-granted success is either real or false,
+    never both), so their counts can never sum above ``trials``.
     """
 
     config_id: str
@@ -340,6 +342,9 @@ class ConfigReport:
         if self.false_successes > self.trials:
             msg_4 = "false_successes cannot exceed trials"
             raise ValueError(msg_4)
+        if self.successes + self.false_successes > self.trials:
+            msg_7 = "successes + false_successes cannot exceed trials (mutually exclusive outcomes)"
+            raise ValueError(msg_7)
         _validate_unit_interval(self.success_rate, field_name="success_rate")
         _validate_unit_interval(self.false_success_rate, field_name="false_success_rate")
         if abs(self.success_rate - self.successes / self.trials) > _RATE_EPSILON:

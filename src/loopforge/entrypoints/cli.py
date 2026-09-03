@@ -658,9 +658,13 @@ def _eval_model_factory(
 
 
 def _print_eval_report(report: BenchmarkReport, *, saved_path: Path | None = None) -> None:
+    # Subset reports stay self-describing: --tasks <subset> still pins the
+    # full-suite lock_hash, so the header names the covered task ids.
+    task_ids = sorted({entry.task_id for entry in report.config_reports})
     print(
         f"eval report={report.report_id} suite={report.suite_version} lock={report.lock_hash[:12]}"
     )
+    print(f"tasks covered ({len(task_ids)}): {', '.join(task_ids)}")
     print(
         f"{'config':<14} {'task':<26} {'trials':>6} {'success':>8} "
         f"{'false-succ':>10} {'cost':>9} {'latency':>9} {'interv':>7}"
@@ -677,7 +681,7 @@ def _print_eval_report(report: BenchmarkReport, *, saved_path: Path | None = Non
         print(f"report saved: {saved_path}")
 
 
-def _eval(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps one return per outcome
+def _eval(args: argparse.Namespace) -> int:  # noqa: PLR0911, PLR0912 - CLI flow keeps one return per outcome
     """Run the locked benchmark suite through the M5 multi-trial eval runner.
 
     Default is fully deterministic: scripted model, no credentials, no
@@ -748,6 +752,12 @@ def _eval(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps on
             )
         except EvalTrialError as exc:
             print(f"error: eval trial failed: {exc}")
+            return 1
+        except Exception:
+            # CLI-leak precedent (PACS-011): an unexpected driver/runner
+            # failure is a clean exit-1 line with no internals — never a raw
+            # traceback leaking wiring detail or paths to the terminal.
+            print("error: eval aborted with an unexpected internal error; no report written")
             return 1
     try:
         saved_path = store.save(report)

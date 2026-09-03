@@ -22,6 +22,14 @@ These adapters exist for the evaluation laboratory: deterministic suites
 wrap ``ScriptedModel`` (the two fault-injection benchmark categories are
 never live-eligible), and a live evaluation may optionally wrap the live
 adapter to measure recovery behavior against a real provider.
+
+WARNING — PER-TRIAL INSTANCES ONLY: the fault decorators are per-instance
+STATEFUL (``TransientFailureModel`` counts down ``_remaining`` across
+calls). Reusing one decorator instance across trials silently changes the
+fault regime — later trials see fewer (or zero) injected failures than the
+binding declares. Construct a FRESH decorator for every trial; the shipped
+M6 eval driver does exactly this (one runtime bundle, one decorator, per
+trial).
 """
 
 from __future__ import annotations
@@ -67,6 +75,11 @@ class TransientFailureModel:
     the wrapped model unchanged. ``transient_failures=0`` is a pure
     passthrough. One instance is single-threaded, matching the runtime's
     synchronous control loop and the wrapped adapters' own contract.
+
+    STATEFUL: ``_remaining`` counts down across calls, so one instance
+    encodes exactly one trial's fault regime. NEVER share an instance
+    across trials — build a fresh decorator per trial (see the module
+    docstring).
     """
 
     def __init__(self, wrapped: ModelPort, transient_failures: int) -> None:

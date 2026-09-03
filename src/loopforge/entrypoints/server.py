@@ -369,7 +369,10 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_exception_handler(ValueError, unprocessable_handler)
     app.add_exception_handler(SessionRegistryError, registry_error_handler)
     # Eval report store (PACS-016, M7): an unknown report id is a 404 (the
-    # addressed sub-resource does not exist); a corrupted, drifted, or
+    # addressed sub-resource does not exist); an UNSAFE report id (path
+    # traversal, separators — a client addressing error) is also a 404 per
+    # the house taxonomy (an unaddressable resource is absent, and the 404
+    # detail never leaks the absolute store path); a corrupted, drifted, or
     # tampered report file is server-side corruption in the 500 {"detail"}
     # family — never a bare traceback, never a silent skip.
     app.add_exception_handler(UnknownEvalReportError, unknown_run_handler)

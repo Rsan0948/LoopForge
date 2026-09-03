@@ -13,9 +13,10 @@ configuration, network-free):
   one identical write_file proposal four times, so the repetition_ratio pin
   is 3/4 — the stall fixture's scripted behavior is the honest repetition
   signal, not a contrived stream;
-- the accounting-precedence pin: the runtime's real ``ContextAccounting``
-  ledger (captured through the ``ContextAccountingSource`` seam) beats the
-  billed-usage fallback, proving the two-source contract on real data.
+- the two-source maximum pin: the metric equals the MAXIMUM of the runtime's
+  real ``ContextAccounting`` ledger peak (captured through the
+  ``ContextAccountingSource`` seam) and the billed-usage peak, proving the
+  two-source contract on real data.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from loopforge.application.trajectory import (
 )
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.benchmarks import TrajectoryMetrics
-from loopforge.domain.events import Event
+from loopforge.domain.events import BudgetDebited, Event
 from loopforge.domain.state import RunState
 from loopforge.domain.types import ActionId, RunStatus
 from loopforge.entrypoints.repair import (
@@ -187,7 +188,9 @@ def test_ambiguous_success_naive_stall_metrics_pin_repetition(tmp_path: Path) ->
 
 
 @_REQUIRES_RLIMIT_AS
-def test_accounting_precedence_on_the_real_ledger(tmp_path: Path) -> None:
+def test_context_tokens_used_is_the_max_of_the_real_ledger_and_billed_peaks(
+    tmp_path: Path,
+) -> None:
     binding = build_benchmark_binding("bench-simple-bug")
 
     state, events, bundle = _run(binding, tmp_path)
@@ -198,10 +201,15 @@ def test_accounting_precedence_on_the_real_ledger(tmp_path: Path) -> None:
     accounting = builder.last_accounting
     assert accounting is not None
     metrics = compute_trajectory_metrics(binding.spec, events, context_accountings=(accounting,))
-    # The real ledger beats the billed-usage fallback: used_tokens comes from
-    # the runtime's budgeting counter, not from UsageDelta.input_tokens.
-    assert metrics.context_tokens_used == accounting.used_tokens
-    assert metrics.context_tokens_used != 100
+    # Two-source maximum on real data: the ledger peak (the runtime's
+    # budgeting counter, larger than any single billed prompt here) wins over
+    # the billed peak (100), and neither source is under-reported.
+    billed_peak = max(
+        (event.usage.input_tokens for event in events if isinstance(event, BudgetDebited)),
+        default=0,
+    )
+    assert metrics.context_tokens_used == max(accounting.used_tokens, billed_peak)
+    assert metrics.context_tokens_used == accounting.used_tokens != 100
     assert metrics.context_items_dropped == len(accounting.dropped_entries) + sum(
         1 for entry in accounting.kept_entries if entry.compacted
     )

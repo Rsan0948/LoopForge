@@ -425,6 +425,20 @@ def test_config_report_rejects_false_successes_above_trials() -> None:
         _config_report(false_successes=5, false_success_rate=1.0)
 
 
+def test_config_report_rejects_successes_plus_false_successes_above_trials() -> None:
+    # Success and false success are mutually exclusive per the M3 contract, so
+    # their counts may never sum above trials even when each is individually
+    # in range (trials=5, successes=5, false_successes=5 must not construct).
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        _config_report(
+            trials=5,
+            successes=5,
+            false_successes=5,
+            success_rate=1.0,
+            false_success_rate=1.0,
+        )
+
+
 @pytest.mark.parametrize("rate", [-0.1, 1.1, float("nan")])
 def test_config_report_rejects_out_of_range_success_rate(rate: float) -> None:
     with pytest.raises(ValueError, match="success_rate"):

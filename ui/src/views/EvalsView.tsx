@@ -83,6 +83,11 @@ export default function EvalsView(): ReactElement {
     void refresh();
   }, [refresh]);
 
+  // A stored report whose pinned spec lock differs from the LIVE suite lock
+  // was measured against benchmark content that has since changed: flag it
+  // stale instead of letting the operator compare across locks silently.
+  const liveLock = suite?.lock_hash ?? null;
+
   return (
     <div className="stack">
       {error !== null && <ErrorBanner message={error} onDismiss={() => setError(null)} />}
@@ -129,6 +134,17 @@ export default function EvalsView(): ReactElement {
                   <td className="mono">v{report.suite_version}</td>
                   <td className="mono muted" title={report.lock_hash}>
                     {shortHash(report.lock_hash)}
+                    {liveLock !== null && report.lock_hash !== liveLock && (
+                      <>
+                        {" "}
+                        <span
+                          className="badge badge-amber"
+                          title={`stale: measured under lock ${report.lock_hash}, live suite lock is ${liveLock}`}
+                        >
+                          stale
+                        </span>
+                      </>
+                    )}
                   </td>
                   <td className="mono">{report.config_ids.join(", ")}</td>
                   <td className="mono">{report.task_ids.length}</td>

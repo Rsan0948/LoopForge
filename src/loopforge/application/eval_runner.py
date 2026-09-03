@@ -318,6 +318,17 @@ class _ConfigSummary:
 
 
 def _config_summaries(reports: tuple[ConfigReport, ...]) -> tuple[_ConfigSummary, ...]:
+    """Per-config dominance vectors: means over that config's task reports.
+
+    COMPARABILITY CAVEAT: each mean covers whatever tasks that config
+    appears against in ``reports``, so dominance comparisons between two
+    configs are only meaningful when both have IDENTICAL task coverage.
+    ``run_trials`` guarantees uniform coverage (it iterates the full
+    config x task cross product), and ``BenchmarkReport.config_reports``
+    keeps the per-(config, task) breakdown so consumers can always verify
+    coverage before comparing; subset runs assembled outside ``run_trials``
+    must check it themselves.
+    """
     groups: dict[str, list[ConfigReport]] = {}
     for report in reports:
         groups.setdefault(report.config_id, []).append(report)
@@ -426,6 +437,11 @@ def run_trials(  # noqa: PLR0913 - the report identity is explicit operator wiri
     Trial ids are deterministic: ``f"{config_id}:{task_id}:{index}"`` with
     zero-based indices, iterated config-major then task-id order (both sorted
     by id), so the same inputs always produce the same trial sequence.
+    Coverage is the FULL config x task cross product: every configuration is
+    evaluated against every task, which is what makes the Pareto dominance
+    vectors commensurable (see ``_config_summaries`` for the caveat that
+    applies to reports assembled any other way; consumers can always inspect
+    per-config task coverage via ``BenchmarkReport.config_reports``).
     ``suite_version`` and ``lock_hash`` are echoed verbatim from the locked
     suite the caller evaluated against — the runner never recomputes or
     alters benchmark content, and the domain report refuses a malformed
@@ -445,6 +461,17 @@ def run_trials(  # noqa: PLR0913 - the report identity is explicit operator wiri
                 if not isinstance(result, TrialRunResult):  # pyright: ignore[reportUnnecessaryIsInstance]
                     msg = f"trial driver returned {type(result).__name__}, expected TrialRunResult"
                     raise TrialDriverContractError(msg)
+                # The stream must belong to the trial's own run: a driver
+                # that mixes in another run's events would silently grade
+                # and meter foreign work as this trial's.
+                for event in result.events:
+                    if event.run_id != result.run_id:
+                        msg_2 = (
+                            f"trial driver returned an event with run_id "
+                            f"{event.run_id!r} that does not match the trial "
+                            f"run_id {result.run_id!r}"
+                        )
+                        raise TrialDriverContractError(msg_2)
                 trials.append(_grade_trial(spec, config, trial_id, result))
     config_reports = _aggregate(tuple(trials))
     return BenchmarkReport(
