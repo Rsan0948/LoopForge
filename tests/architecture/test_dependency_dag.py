@@ -51,6 +51,22 @@ def test_core_dependency_dag_has_no_upward_imports() -> None:
 
 
 def test_domain_has_no_external_runtime_dependencies() -> None:
+    # Deterministic, I/O-free stdlib only: hashing/JSON for content-addressed
+    # locks, containers/math/dataclasses/datetime/enum/typing for vocabulary.
+    # Anything with runtime effect (network, persistence, Git, provider SDKs,
+    # CLI, telemetry) stays forbidden (AGENTS.md rule 1).
+    allowed = {
+        "__future__",
+        "collections",
+        "dataclasses",
+        "datetime",
+        "enum",
+        "hashlib",
+        "json",
+        "loopforge",
+        "math",
+        "typing",
+    }
     violations: list[str] = []
     for path in (SRC / "domain").rglob("*.py"):
         tree = ast.parse(path.read_text())
@@ -58,30 +74,10 @@ def test_domain_has_no_external_runtime_dependencies() -> None:
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     root = alias.name.split(".")[0]
-                    allowed = {
-                        "__future__",
-                        "collections",
-                        "math",
-                        "dataclasses",
-                        "datetime",
-                        "enum",
-                        "typing",
-                        "loopforge",
-                    }
                     if root not in allowed:
                         violations.append(f"{path.name}: import {alias.name}")
             elif isinstance(node, ast.ImportFrom) and node.module:
                 root = node.module.split(".")[0]
-                allowed = {
-                    "__future__",
-                    "collections",
-                    "math",
-                    "dataclasses",
-                    "datetime",
-                    "enum",
-                    "typing",
-                    "loopforge",
-                }
                 if root not in allowed:
                     violations.append(f"{path.name}: from {node.module}")
     assert violations == [], "Domain external dependencies:\n" + "\n".join(violations)
