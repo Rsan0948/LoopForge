@@ -780,6 +780,7 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
     sqlite: str | None,
     data_dir: str,
     static_dir: str | None,
+    evals_dir: str | None,
 ) -> int:
     """Run the operator server (PACS-014): REST + WebSocket over the durable store.
 
@@ -801,6 +802,7 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
         sqlite_path=sqlite if sqlite is not None else ".loopforge/server/events.db",
         data_dir=Path(data_dir),
         static_dir=Path(static_dir) if static_dir else None,
+        evals_dir=Path(evals_dir) if evals_dir else None,
     )
     uvicorn.run(create_app(settings), host=host, port=port)
     return 0
@@ -943,6 +945,13 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         default=None,
         help="serve only: built UI directory (for example ui/dist) mounted at /",
     )
+    parser.add_argument(
+        "--evals-dir",
+        metavar="DIR",
+        default=None,
+        help="serve only: operator-owned eval report store the /api/evals routes read "
+        "(default: DATA-DIR/evals)",
+    )
     args = parser.parse_args()
     if args.profile is not None and args.command != "loop":
         parser.error(f"unrecognized arguments: {args.profile}")
@@ -985,6 +994,7 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
             sqlite=args.sqlite,
             data_dir=args.data_dir,
             static_dir=args.static_dir,
+            evals_dir=args.evals_dir,
         )
     return 2
 

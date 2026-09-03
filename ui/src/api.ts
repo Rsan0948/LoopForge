@@ -357,6 +357,74 @@ export function forceRelease(
   );
 }
 
+// -- Benchmark suite + eval reports (PACS-016) ----------------------------------
+// Mirrors the M7 read-only routes in server.py: reports are operator-owned
+// artifacts (written by `loopforge eval`), the console only ever reads them.
+
+export interface BenchmarkTaskDescriptor {
+  task_id: string;
+  category: string;
+  sandbox_mode: string;
+  live_eligible: boolean;
+  grader_ids: string[];
+}
+
+export interface BenchmarkSuiteInfo {
+  version: string;
+  /** M1 spec lock (suite_lock_hash). */
+  lock_hash: string;
+  /** M2 full content lock (benchmark_content_lock). */
+  content_lock: string;
+  tasks: BenchmarkTaskDescriptor[];
+}
+
+export interface EvalReportSummary {
+  report_id: string;
+  suite_version: string;
+  lock_hash: string;
+  config_ids: string[];
+  task_ids: string[];
+  created_at: string;
+}
+
+export interface ConfigReportRow {
+  config_id: string;
+  task_id: string;
+  trials: number;
+  successes: number;
+  false_successes: number;
+  success_rate: number;
+  false_success_rate: number;
+  mean_cost_usd: number;
+  mean_latency_seconds: number;
+  mean_total_tokens: number;
+  mean_human_interventions: number;
+}
+
+export interface EvalReport {
+  report_id: string;
+  suite_version: string;
+  lock_hash: string;
+  config_reports: ConfigReportRow[];
+  pareto_config_ids: string[];
+}
+
+/** The LOCKED benchmark definition: version, both lock hashes, task specs. */
+export function getBenchmarkSuite(): Promise<BenchmarkSuiteInfo> {
+  return request<BenchmarkSuiteInfo>("/api/benchmark/suite");
+}
+
+/** Stored eval report summaries (EvalReportStore.list), empty when none. */
+export async function listEvalReports(): Promise<EvalReportSummary[]> {
+  const data = await request<{ reports: EvalReportSummary[] }>("/api/evals");
+  return data.reports;
+}
+
+/** One full stored report. 404 (ApiError) when the report id is unknown. */
+export function getEvalReport(reportId: string): Promise<EvalReport> {
+  return request<EvalReport>(`/api/evals/${encodeURIComponent(reportId)}`);
+}
+
 export function sessionWsUrl(runId: string): string {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${window.location.host}/ws/sessions/${encodeURIComponent(runId)}`;

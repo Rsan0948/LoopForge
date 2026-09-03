@@ -104,6 +104,15 @@ class EvalReportStoreError(RuntimeError):
     """The on-disk report store cannot be decoded or fails revalidation."""
 
 
+class UnknownEvalReportError(EvalReportStoreError):
+    """The addressed report id does not exist in the store.
+
+    Distinct from store corruption (M7): an operator server maps this to 404
+    while a corrupted, drifted, or tampered file stays a 500 — the client
+    asked for something absent versus the server's store failing closed.
+    """
+
+
 _RLIMIT_PROBE: Final = (
     "import resource; resource.setrlimit(resource.RLIMIT_AS, (268435456, 268435456))"
 )
@@ -569,7 +578,12 @@ class EvalReportSummary:
     created_at: str
 
 
-def _report_to_dict(report: BenchmarkReport) -> dict[str, object]:
+def report_to_dict(report: BenchmarkReport) -> dict[str, object]:
+    """JSON-safe serialization of one report; the exact shape the store saves.
+
+    Shared by the atomic writer and the M7 operator server so the wire
+    projection of a report is byte-identical to its operator-owned artifact.
+    """
     return {
         "report_id": report.report_id,
         "suite_version": report.suite_version,
@@ -665,7 +679,7 @@ class EvalReportStore:
         payload = {
             "schema_version": REPORT_SCHEMA_VERSION,
             "created_at": self._clock.now().isoformat(),
-            "report": _report_to_dict(report),
+            "report": report_to_dict(report),
         }
         self._dir.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
@@ -700,7 +714,7 @@ class EvalReportStore:
         path = self._path_for(report_id)
         if not path.is_file():
             msg = f"unknown eval report {report_id!r} in {self._dir}"
-            raise EvalReportStoreError(msg)
+            raise UnknownEvalReportError(msg)
         _created_at, report = self._decode(path)
         if report.report_id != report_id:
             msg_2 = (

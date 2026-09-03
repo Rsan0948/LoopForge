@@ -14,7 +14,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -35,6 +35,7 @@ from loopforge.adapters.scripted import (
 )
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.benchmarks import BenchmarkReport, ConfigReport
 from loopforge.domain.events import OperatorInstruction
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -57,6 +58,7 @@ from loopforge.domain.types import (
 )
 from loopforge.domain.workspace import WorkspaceStatus
 from loopforge.entrypoints.cli import main
+from loopforge.entrypoints.eval import EvalReportStore, report_to_dict
 from loopforge.entrypoints.repair import RepairRuntimeBundle
 from loopforge.entrypoints.server import ServerSettings, create_app
 from loopforge.entrypoints.sessions import SessionManager, SessionWiring
@@ -64,6 +66,11 @@ from loopforge.ports.sandbox import SandboxCommandResult
 from loopforge.ports.state_store import StateStorePort, StreamVersionConflictError
 from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolError
 from loopforge.ports.workspace import WorkspaceError
+from loopforge.workloads.benchmarks import (
+    BENCHMARK_SUITE_VERSION,
+    benchmark_content_lock,
+    benchmark_suite,
+)
 
 NOW = datetime(2026, 9, 1, tzinfo=UTC)
 
@@ -272,11 +279,13 @@ def _client(
     *,
     data_dir: Path | None = None,
     sqlite_path: Path | None = None,
+    evals_dir: Path | None = None,
 ) -> TestClient:
     settings = ServerSettings(
         store_kind="sqlite",
         sqlite_path=str(sqlite_path or tmp_path / "events.db"),
         data_dir=data_dir or tmp_path / "data",
+        evals_dir=evals_dir,
     )
     return TestClient(create_app(settings, bundle_factory=factory))
 
@@ -1429,3 +1438,172 @@ def test_provenance_route_maps_unknown_event_types_to_500_not_422(tmp_path: Path
 
         assert response.status_code == 500, response.text
         assert "unknown event type" in response.json()["detail"]
+
+
+# --- Benchmark suite + eval report exposure (PACS-016, M7) ---------------------
+
+EVAL_LOCK_HASH = "0123456789abcdef" * 4
+
+
+def _eval_entry(  # noqa: PLR0913 - report fixture helper keeps every field explicit
+    config_id: str,
+    task_id: str,
+    *,
+    trials: int = 2,
+    successes: int = 1,
+    false_successes: int = 0,
+    mean_cost_usd: float = 0.02,
+    mean_latency_seconds: float = 1.5,
+    mean_total_tokens: float = 240.0,
+    mean_human_interventions: float = 0.0,
+) -> ConfigReport:
+    return ConfigReport(
+        config_id=config_id,
+        task_id=task_id,
+        trials=trials,
+        successes=successes,
+        false_successes=false_successes,
+        success_rate=successes / trials,
+        false_success_rate=false_successes / trials,
+        mean_cost_usd=mean_cost_usd,
+        mean_latency_seconds=mean_latency_seconds,
+        mean_total_tokens=mean_total_tokens,
+        mean_human_interventions=mean_human_interventions,
+    )
+
+
+def _eval_report(report_id: str = "eval-report-1") -> BenchmarkReport:
+    return BenchmarkReport(
+        report_id=report_id,
+        suite_version=BENCHMARK_SUITE_VERSION,
+        lock_hash=EVAL_LOCK_HASH,
+        config_reports=(
+            _eval_entry("baseline", "bench-transient-api", successes=2),
+            _eval_entry(
+                "baseline",
+                "bench-provider-outage",
+                successes=0,
+                mean_cost_usd=0.0,
+                mean_total_tokens=0.0,
+                mean_latency_seconds=0.25,
+            ),
+            _eval_entry("tight-budget", "bench-transient-api", false_successes=1),
+        ),
+        pareto_config_ids=("baseline",),
+    )
+
+
+def test_benchmark_suite_route_exposes_the_locked_definition(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/benchmark/suite")
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        suite = benchmark_suite()
+        # The operator-visible proof the benchmark is locked: both hashes are
+        # computed from the code-owned definitions on every request.
+        assert body["version"] == BENCHMARK_SUITE_VERSION == suite.version
+        assert body["lock_hash"] == suite.lock_hash
+        assert body["content_lock"] == benchmark_content_lock()
+        assert [task["task_id"] for task in body["tasks"]] == [task.task_id for task in suite.tasks]
+        assert len(body["tasks"]) == 12
+        for task in body["tasks"]:
+            assert set(task) == {
+                "task_id",
+                "category",
+                "sandbox_mode",
+                "live_eligible",
+                "grader_ids",
+            }
+        transient = next(t for t in body["tasks"] if t["task_id"] == "bench-transient-api")
+        assert transient["category"] == "transient_api"
+        assert transient["sandbox_mode"] == "trusted_local"
+        assert transient["live_eligible"] is False
+        assert transient["grader_ids"] == ["verified_success", "scope_discipline", "recovery"]
+
+
+def test_evals_list_is_empty_when_no_reports_are_stored(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/evals")
+
+        assert response.status_code == 200, response.text
+        assert response.json() == {"reports": []}
+
+
+def test_evals_routes_round_trip_what_the_store_saved(tmp_path: Path) -> None:
+    evals_dir = tmp_path / "evals"
+    store = EvalReportStore(evals_dir, clock=FixedClock(NOW))
+    report = _eval_report()
+    store.save(report)
+
+    with _client(tmp_path, _plain_factory(), evals_dir=evals_dir) as client:
+        listing = client.get("/api/evals")
+        assert listing.status_code == 200, listing.text
+        expected_summaries = json.loads(json.dumps([asdict(s) for s in store.list()]))
+        assert listing.json() == {"reports": expected_summaries}
+        summary = listing.json()["reports"][0]
+        assert summary["report_id"] == report.report_id
+        assert summary["config_ids"] == ["baseline", "tight-budget"]
+        assert summary["task_ids"] == ["bench-provider-outage", "bench-transient-api"]
+
+        detail = client.get(f"/api/evals/{report.report_id}")
+        assert detail.status_code == 200, detail.text
+        # The wire projection is byte-identical to the operator-owned artifact
+        # the store wrote (floats stay finite, ids and rates round-trip).
+        assert detail.json() == report_to_dict(report)
+
+
+def test_eval_detail_unknown_report_id_is_404(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/evals/eval-no-such-report")
+
+        assert response.status_code == 404, response.text
+        assert "unknown eval report" in response.json()["detail"]
+
+
+def test_evals_routes_fail_closed_500_on_a_tampered_report(tmp_path: Path) -> None:
+    # A hand-edited rate that disagrees with its counts fails domain
+    # revalidation: server-side corruption in the 500 {"detail"} family —
+    # never a crash, never a 422 blaming a parameterless GET.
+    evals_dir = tmp_path / "evals"
+    store = EvalReportStore(evals_dir, clock=FixedClock(NOW))
+    report = _eval_report()
+    path = store.save(report)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["report"]["config_reports"][0]["success_rate"] = 0.75
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    with _client(tmp_path, _plain_factory(), evals_dir=evals_dir) as client:
+        detail = client.get(f"/api/evals/{report.report_id}")
+        assert detail.status_code == 500, detail.text
+        assert "revalidation" in detail.json()["detail"]
+
+        listing = client.get("/api/evals")
+        assert listing.status_code == 500, listing.text
+        assert "detail" in listing.json()
+
+
+def test_evals_dir_defaults_under_the_server_data_dir(tmp_path: Path) -> None:
+    # evals_dir unset resolves to data_dir/"evals" so the routes work out of
+    # the box, exactly like the other server-owned paths.
+    data_dir = tmp_path / "data"
+    store = EvalReportStore(data_dir / "evals", clock=FixedClock(NOW))
+    report = _eval_report()
+    store.save(report)
+
+    with _client(tmp_path, _plain_factory(), data_dir=data_dir) as client:
+        listing = client.get("/api/evals")
+        assert listing.status_code == 200, listing.text
+        assert [entry["report_id"] for entry in listing.json()["reports"]] == [report.report_id]
+
+        detail = client.get(f"/api/evals/{report.report_id}")
+        assert detail.status_code == 200, detail.text
+        assert detail.json() == report_to_dict(report)
+
+
+def test_eval_routes_are_read_only(tmp_path: Path) -> None:
+    # Reports are operator-owned artifacts: the server only reads them.
+    with _client(tmp_path, _plain_factory()) as client:
+        assert client.post("/api/evals").status_code == 405
+        assert client.delete("/api/evals/eval-report-1").status_code == 405
+        assert client.post("/api/benchmark/suite").status_code == 405

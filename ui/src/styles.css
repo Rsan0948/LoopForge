@@ -710,3 +710,29 @@ textarea:focus {
   display: flex;
   gap: 10px;
 }
+
+/* -- evals (PACS-016) ---------------------------------------------------------- */
+
+.lock-line {
+  font-size: 12.5px;
+  margin: 2px 0 8px;
+  overflow-wrap: anywhere;
+}
+
+.lock-line .mono {
+  color: var(--text);
+}
+
+.false-success-cell {
+  color: var(--red);
+  font-weight: 600;
+}
+
+.false-success-cell.zero {
+  color: var(--text-muted);
+  font-weight: 400;
+}
+
+.pareto-row td {
+  background: rgba(63, 185, 80, 0.07);
+}

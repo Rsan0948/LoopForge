@@ -19,7 +19,7 @@ import json
 import queue
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
@@ -41,6 +41,12 @@ from loopforge.domain.events import ApprovalRequested, ArtifactRecorded, Event
 from loopforge.domain.provenance import ProvenanceNode, UnknownProvenanceNodeError
 from loopforge.domain.state import InvalidTransitionError
 from loopforge.domain.types import RunId, RunStatus
+from loopforge.entrypoints.eval import (
+    EvalReportStore,
+    EvalReportStoreError,
+    UnknownEvalReportError,
+    report_to_dict,
+)
 from loopforge.entrypoints.profile import ProfileError
 from loopforge.entrypoints.sessions import (
     BundleFactory,
@@ -61,6 +67,7 @@ from loopforge.entrypoints.sessions import (
 )
 from loopforge.ports.state_store import StreamVersionConflictError
 from loopforge.ports.workspace import WorkspaceError
+from loopforge.workloads.benchmarks import benchmark_content_lock, benchmark_suite
 
 WS_CLOSE_UNKNOWN_RUN = 4404
 _WS_POLL_SECONDS = 0.1
@@ -102,6 +109,20 @@ class ServerSettings:
     """Server-owned state: session registry and inline profiles live here."""
     static_dir: Path | None = None
     """Optional built UI (``ui/dist``) mounted at ``/`` when it exists."""
+    evals_dir: Path | None = None
+    """Operator-owned eval report store (``loopforge eval --results-dir``).
+
+    ``None`` resolves to ``data_dir / "evals"`` so the evals routes work out
+    of the box exactly like the other server-owned paths: with no reports
+    saved there yet, the list route honestly returns an empty list and the
+    detail route 404s — the server only READS these artifacts; creating them
+    stays with the CLI (M6).
+    """
+
+
+def data_dir_evals(settings: ServerSettings) -> Path:
+    """The default eval report store: ``data_dir / "evals"`` (see ServerSettings)."""
+    return settings.data_dir / "evals"
 
 
 # -- Request models -------------------------------------------------------------
@@ -347,6 +368,12 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_exception_handler(WorkspaceError, unprocessable_handler)
     app.add_exception_handler(ValueError, unprocessable_handler)
     app.add_exception_handler(SessionRegistryError, registry_error_handler)
+    # Eval report store (PACS-016, M7): an unknown report id is a 404 (the
+    # addressed sub-resource does not exist); a corrupted, drifted, or
+    # tampered report file is server-side corruption in the 500 {"detail"}
+    # family — never a bare traceback, never a silent skip.
+    app.add_exception_handler(UnknownEvalReportError, unknown_run_handler)
+    app.add_exception_handler(EvalReportStoreError, registry_error_handler)
 
     # -- REST: sessions ---------------------------------------------------------
 
@@ -578,6 +605,53 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_route(
         "/api/sessions/{run_id}/follow-up", follow_up_route, methods=["POST"], status_code=201
     )
+
+    # -- REST: benchmark suite + eval reports (PACS-016, M7) ----------------------
+    #
+    # Reports are operator-owned artifacts: the server ONLY reads them (no
+    # POST/delete routes). ``evals_dir`` defaults under the server data dir
+    # (see ServerSettings), so the routes work out of the box and honestly
+    # report an empty store. Parameterless GETs never 422.
+
+    evals_dir = settings.evals_dir if settings.evals_dir is not None else data_dir_evals(settings)
+    eval_reports = EvalReportStore(evals_dir)
+
+    def benchmark_suite_route() -> dict[str, object]:
+        """The LOCKED suite definition, read-only: version, lock hashes, task specs.
+
+        ``lock_hash`` is M1's spec lock (``suite_lock_hash``), ``content_lock``
+        M2's full content lock (``benchmark_content_lock``); both are computed
+        from the code-owned definitions on every request, so a benchmark edit
+        is visible to the operator immediately.
+        """
+        suite = benchmark_suite()
+        return {
+            "version": suite.version,
+            "lock_hash": suite.lock_hash,
+            "content_lock": benchmark_content_lock(),
+            "tasks": [
+                {
+                    "task_id": task.task_id,
+                    "category": task.category.value,
+                    "sandbox_mode": task.sandbox_mode.value,
+                    "live_eligible": task.live_eligible,
+                    "grader_ids": [grader_id.value for grader_id in task.grader_ids],
+                }
+                for task in suite.tasks
+            ],
+        }
+
+    def list_evals_route() -> dict[str, object]:
+        """Stored report summaries, derived from the artifacts' content only."""
+        return {"reports": [asdict(summary) for summary in eval_reports.list()]}
+
+    def eval_detail_route(report_id: str) -> dict[str, object]:
+        """The full stored report, serialized exactly as the artifact saves it."""
+        return report_to_dict(eval_reports.load(report_id))
+
+    app.add_api_route("/api/benchmark/suite", benchmark_suite_route, methods=["GET"])
+    app.add_api_route("/api/evals", list_evals_route, methods=["GET"])
+    app.add_api_route("/api/evals/{report_id}", eval_detail_route, methods=["GET"])
 
     # -- WebSocket: live event stream --------------------------------------------
 
