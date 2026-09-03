@@ -286,6 +286,77 @@ export function followUp(runId: string): Promise<{ run_id: string }> {
   return post<{ run_id: string }>(`/api/sessions/${encodeURIComponent(runId)}/follow-up`);
 }
 
+// -- Provenance / explain / lineage (PACS-015) --------------------------------
+
+export interface ProvenanceNode {
+  node_id: string;
+  kind: string;
+  event_type: string;
+  sequence: number;
+  occurred_at: string;
+  summary: string;
+  attributes: Record<string, string>;
+}
+
+export interface ProvenanceEdge {
+  source_id: string;
+  target_id: string;
+  kind: string;
+}
+
+export interface ProvenanceGraph {
+  run_id: string;
+  nodes: ProvenanceNode[];
+  edges: ProvenanceEdge[];
+}
+
+export interface ProvenanceExplanation {
+  run_id: string;
+  node: ProvenanceNode;
+  chain: ProvenanceNode[];
+  supporting: ProvenanceNode[];
+  outcomes: ProvenanceNode[];
+}
+
+export interface SessionLineage {
+  run_id: string;
+  parent_run_id: string | null;
+  ancestors: string[];
+  children: string[];
+}
+
+/** The derived provenance DAG: a pure on-demand projection of the event
+ *  stream (one node per durable event). */
+export function getProvenance(runId: string): Promise<ProvenanceGraph> {
+  return request<ProvenanceGraph>(`/api/sessions/${encodeURIComponent(runId)}/provenance`);
+}
+
+/** The evidence chain answering "why did this node happen?". 404 when the
+ *  node id is not in the run's graph. */
+export function explainNode(runId: string, nodeId: string): Promise<ProvenanceExplanation> {
+  return request<ProvenanceExplanation>(
+    `/api/sessions/${encodeURIComponent(runId)}/explain?node=${encodeURIComponent(nodeId)}`,
+  );
+}
+
+/** The run's follow-up lineage: parent, ancestors (parent-first), children. */
+export function getLineage(runId: string): Promise<SessionLineage> {
+  return request<SessionLineage>(`/api/sessions/${encodeURIComponent(runId)}/lineage`);
+}
+
+/** Force-release (PACS-015): the zombie escape hatch. Stops the run WITHOUT
+ *  replay checks, so the literal `confirm: true` is only ever sent from the
+ *  confirmation dialog — never defaulted into a bare call. */
+export function forceRelease(
+  runId: string,
+  summary?: string,
+): Promise<{ run_id: string; status: string }> {
+  return post<{ run_id: string; status: string }>(
+    `/api/sessions/${encodeURIComponent(runId)}/force-release`,
+    { summary: summary ?? "force-released by operator", confirm: true },
+  );
+}
+
 export function sessionWsUrl(runId: string): string {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${window.location.host}/ws/sessions/${encodeURIComponent(runId)}`;

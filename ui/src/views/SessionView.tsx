@@ -2,9 +2,13 @@ import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactEle
 import {
   ApiError,
   approveAction,
+  explainNode,
   followUp,
+  forceRelease,
   getArtifacts,
   getEvents,
+  getLineage,
+  getProvenance,
   getSession,
   pauseSession,
   rejectAction,
@@ -16,7 +20,11 @@ import {
   stopSession,
   TERMINAL_STATUSES,
   type ArtifactInfo,
+  type ProvenanceExplanation,
+  type ProvenanceGraph,
+  type ProvenanceNode,
   type SessionDetail,
+  type SessionLineage,
 } from "../api";
 import { navigateToSession } from "../App";
 import DiffViewer from "../DiffViewer";
@@ -45,6 +53,29 @@ function EventRow({ envelope }: { envelope: EventEnvelope }): ReactElement {
   );
 }
 
+function ProvenanceNodeRow({
+  node,
+  selected,
+  onExplain,
+}: {
+  node: ProvenanceNode;
+  selected: boolean;
+  onExplain: (nodeId: string) => void;
+}): ReactElement {
+  return (
+    <button
+      type="button"
+      className={`prov-node${selected ? " prov-selected" : ""}`}
+      title={`${node.event_type} — click for the evidence chain`}
+      onClick={() => onExplain(node.node_id)}
+    >
+      <span className="mono event-seq">#{node.sequence}</span>
+      <span className="badge badge-muted">{node.kind}</span>
+      <span className="prov-summary">{node.summary}</span>
+    </button>
+  );
+}
+
 export default function SessionView({ runId }: { runId: string }): ReactElement {
   const [detail, setDetail] = useState<SessionDetail | null>(null);
   const [events, setEvents] = useState<EventEnvelope[]>([]);
@@ -54,8 +85,16 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   const [toast, setToast] = useState<string | null>(null);
   const [follow, setFollow] = useState(true);
 
+  const [lineage, setLineage] = useState<SessionLineage | null>(null);
+  const [graph, setGraph] = useState<ProvenanceGraph | null>(null);
+  const [provOpen, setProvOpen] = useState(false);
+  const [explained, setExplained] = useState<ProvenanceExplanation | null>(null);
+
   const [stopOpen, setStopOpen] = useState(false);
   const [stopSummary, setStopSummary] = useState("");
+  const [forceOpen, setForceOpen] = useState(false);
+  const [forceSummary, setForceSummary] = useState("");
+  const [forceChecked, setForceChecked] = useState(false);
   const [amendOpen, setAmendOpen] = useState(false);
   const [amendText, setAmendText] = useState("");
   const [rejectOpen, setRejectOpen] = useState(false);
@@ -96,6 +135,14 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
       void getArtifacts(runId)
         .then((fresh) => {
           if (!disposed.current) setArtifacts(fresh);
+        })
+        .catch(() => undefined);
+    };
+
+    const refreshLineage = (): void => {
+      void getLineage(runId)
+        .then((fresh) => {
+          if (!disposed.current) setLineage(fresh);
         })
         .catch(() => undefined);
     };
@@ -179,6 +226,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
         applyDetail(initial);
         setArtifacts(initialArtifacts);
         ingest(page.events);
+        refreshLineage();
         connect();
       } catch (err) {
         if (disposed.current) return;
@@ -200,6 +248,22 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
       if (artifactTimer !== null) window.clearTimeout(artifactTimer);
     };
   }, [runId]);
+
+  // -- provenance: derived on demand, refreshed with the stream while open -------
+
+  const eventCount = events.length;
+  useEffect(() => {
+    if (!provOpen) return;
+    let disposed = false;
+    void getProvenance(runId)
+      .then((fresh) => {
+        if (!disposed) setGraph(fresh);
+      })
+      .catch(() => undefined);
+    return () => {
+      disposed = true;
+    };
+  }, [runId, provOpen, eventCount]);
 
   // -- auto-scroll -------------------------------------------------------------
 
@@ -227,12 +291,14 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
           await command();
           // The server is authoritative; re-pull projections after every
           // command (a rollback's effect shows up in the next snapshot).
-          const [freshDetail, freshArtifacts] = await Promise.all([
+          const [freshDetail, freshArtifacts, freshLineage] = await Promise.all([
             getSession(runId),
             getArtifacts(runId),
+            getLineage(runId),
           ]);
           applyDetail(freshDetail);
           setArtifacts(freshArtifacts);
+          setLineage(freshLineage);
         } catch (err) {
           setToast(err instanceof ApiError ? err.detail : String(err));
         }
@@ -248,6 +314,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   const canResume = detail !== null && !terminal && !detail.driving && detail.managed;
   const canStop = detail !== null && !terminal;
   const canInstruct = detail !== null && !terminal;
+  const canForceRelease = detail !== null && !terminal && !detail.driving;
   const pending = detail !== null && detail.waiting_for_approval ? detail.pending_approval : null;
 
   const onStop = (event: FormEvent): void => {
@@ -256,6 +323,26 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
     setStopOpen(false);
     setStopSummary("");
     runCommand(() => stopSession(runId, summary === "" ? undefined : summary));
+  };
+
+  const onForceRelease = (event: FormEvent): void => {
+    event.preventDefault();
+    if (!forceChecked) return;
+    const summary = forceSummary.trim();
+    setForceOpen(false);
+    setForceSummary("");
+    setForceChecked(false);
+    runCommand(() => forceRelease(runId, summary === "" ? undefined : summary));
+  };
+
+  const onExplainNode = (nodeId: string): void => {
+    if (explained?.node.node_id === nodeId) {
+      setExplained(null);
+      return;
+    }
+    void explainNode(runId, nodeId)
+      .then(setExplained)
+      .catch((err) => setToast(err instanceof ApiError ? err.detail : String(err)));
   };
 
   const onFollowUp = (): void => {
@@ -365,6 +452,42 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
                 </dd>
               </div>
               <div>
+                <dt>lineage</dt>
+                <dd className="lineage-links">
+                  {lineage === null ||
+                  (lineage.parent_run_id === null && lineage.children.length === 0) ? (
+                    "—"
+                  ) : (
+                    <>
+                      {lineage.parent_run_id !== null && (
+                        <button
+                          type="button"
+                          className="link-button"
+                          title="parent run (this session was seeded as its follow-up)"
+                          onClick={() => {
+                            const parent = lineage.parent_run_id;
+                            if (parent !== null) navigateToSession(parent);
+                          }}
+                        >
+                          ← parent
+                        </button>
+                      )}
+                      {lineage.children.map((child) => (
+                        <button
+                          key={child}
+                          type="button"
+                          className="link-button"
+                          title="follow-up run seeded from this one"
+                          onClick={() => navigateToSession(child)}
+                        >
+                          child →
+                        </button>
+                      ))}
+                    </>
+                  )}
+                </dd>
+              </div>
+              <div>
                 <dt>last verification</dt>
                 <dd>
                   {detail.last_verification === null
@@ -439,6 +562,80 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
       )}
 
       <section className="panel">
+        <div className="panel-header">
+          <h2>
+            provenance
+            {graph !== null && provOpen
+              ? ` (${graph.nodes.length} nodes / ${graph.edges.length} edges)`
+              : ""}
+          </h2>
+          <button type="button" onClick={() => setProvOpen((open) => !open)}>
+            {provOpen ? "hide" : "show"}
+          </button>
+        </div>
+        {provOpen && (
+          <>
+            {graph === null ? (
+              <p className="muted">deriving graph…</p>
+            ) : (
+              <div className="prov-list">
+                {graph.nodes.map((node) => (
+                  <ProvenanceNodeRow
+                    key={node.node_id}
+                    node={node}
+                    selected={explained?.node.node_id === node.node_id}
+                    onExplain={onExplainNode}
+                  />
+                ))}
+              </div>
+            )}
+            {explained !== null && (
+              <div className="explain-panel">
+                <p className="muted">
+                  why did <span className="mono">{explained.node.node_id}</span> happen? causal
+                  spine → focus → outcomes
+                </p>
+                <div className="prov-list">
+                  {explained.chain.map((node) => (
+                    <ProvenanceNodeRow
+                      key={node.node_id}
+                      node={node}
+                      selected={false}
+                      onExplain={onExplainNode}
+                    />
+                  ))}
+                  <div className="prov-node prov-selected">
+                    <span className="mono event-seq">#{explained.node.sequence}</span>
+                    <span className="badge badge-active">{explained.node.kind}</span>
+                    <span className="prov-summary">{explained.node.summary}</span>
+                  </div>
+                  {explained.outcomes.map((node) => (
+                    <ProvenanceNodeRow
+                      key={node.node_id}
+                      node={node}
+                      selected={false}
+                      onExplain={onExplainNode}
+                    />
+                  ))}
+                </div>
+                {Object.keys(explained.node.attributes).length > 0 && (
+                  <pre className="event-raw">
+                    {JSON.stringify(explained.node.attributes, null, 2)}
+                  </pre>
+                )}
+                {explained.supporting.length > 0 && (
+                  <p className="muted">
+                    supporting evidence:{" "}
+                    {explained.supporting.map((node) => node.node_id).join(", ")}
+                  </p>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </section>
+
+      <section className="panel">
         <div className="controls-row">
           <button type="button" disabled={!canStart} onClick={() => runCommand(() => startSession(runId))}>
             start
@@ -467,6 +664,46 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
           ) : (
             <button type="button" className="danger" disabled={!canStop} onClick={() => setStopOpen(true)}>
               stop…
+            </button>
+          )}
+          {forceOpen ? (
+            <form onSubmit={onForceRelease} className="inline-form">
+              <input
+                autoFocus
+                value={forceSummary}
+                onChange={(e) => setForceSummary(e.target.value)}
+                placeholder="force-release summary (optional)"
+              />
+              <label className="follow-toggle" title="The stop is appended WITHOUT replaying the stream. Use only when a normal stop cannot work (e.g. a corrupted stream).">
+                <input
+                  type="checkbox"
+                  checked={forceChecked}
+                  onChange={(e) => setForceChecked(e.target.checked)}
+                />
+                bypass replay checks
+              </label>
+              <button type="submit" className="danger" disabled={!forceChecked}>
+                confirm force-release
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setForceOpen(false);
+                  setForceChecked(false);
+                }}
+              >
+                cancel
+              </button>
+            </form>
+          ) : (
+            <button
+              type="button"
+              className="danger"
+              disabled={!canForceRelease}
+              title="Zombie escape hatch: durably stops the run WITHOUT replaying its stream, releasing the repository claim. The operator is the liveness check — use only when stop cannot work."
+              onClick={() => setForceOpen(true)}
+            >
+              force release…
             </button>
           )}
           <form onSubmit={onInstruct} className="inline-form instruction-form">
