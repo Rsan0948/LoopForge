@@ -26,7 +26,11 @@ from pathlib import Path
 from loopforge.adapters.approval_gate_tools import ApprovalGateTools
 from loopforge.adapters.composite_tools import CompositeToolExecutor, NamedToolExecutor
 from loopforge.adapters.container_sandbox import ContainerSandbox, ContainerSandboxConfig
-from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
+from loopforge.adapters.context import (
+    AdaptiveContextBuilder,
+    BudgetedContextBuilder,
+    CharsPerTokenCounter,
+)
 from loopforge.adapters.file_tools import WorkspaceFileTools
 from loopforge.adapters.git_workspace import GitWorkspaceManager
 from loopforge.adapters.local_sandbox import CommandSpec, ConstrainedLocalSandbox, SandboxLimits
@@ -37,6 +41,7 @@ from loopforge.adapters.scripted import ScriptedModel
 from loopforge.adapters.workspace_git_tools import WorkspaceGitTools
 from loopforge.application.runtime import Runtime
 from loopforge.domain.context_lifecycle import ContextTokenBudget
+from loopforge.domain.policies import ContextAllocationBounds
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -51,6 +56,7 @@ from loopforge.domain.tooling import (
 )
 from loopforge.domain.types import BudgetLimit, Permission, RiskLevel, WorkspaceId
 from loopforge.ports.clock import ClockPort, SleeperPort
+from loopforge.ports.context import ContextBuilderPort
 from loopforge.ports.model import ModelPort
 from loopforge.ports.sandbox import SandboxPort
 from loopforge.ports.state_store import StateStorePort
@@ -112,6 +118,27 @@ def repair_command_bindings(
     ]
 
 
+REPAIR_CONTEXT_BUDGET: ContextTokenBudget = ContextTokenBudget(max_tokens=4096, reserve_tokens=256)
+"""The wired context budget envelope for repair runtimes (pre-PACS-017 literal)."""
+
+
+def repair_context_builder(deps: RepairRuntimeDeps) -> ContextBuilderPort:
+    """The repair context stack: budgeted assembly, optionally adaptive (PACS-017)."""
+    builder: ContextBuilderPort = BudgetedContextBuilder(
+        deps.clock,
+        CharsPerTokenCounter(),
+        template=default_controller_template(),
+        token_budget=REPAIR_CONTEXT_BUDGET,
+    )
+    if deps.context_allocation is not None:
+        builder = AdaptiveContextBuilder(
+            builder,
+            bounds=deps.context_allocation,
+            envelope=REPAIR_CONTEXT_BUDGET,
+        )
+    return RepairContextBuilder(builder)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class RepairRuntimeDeps:
     """Shared runtime dependencies for repair wiring."""
@@ -131,6 +158,10 @@ class RepairRuntimeDeps:
     """Legacy verification cadence opt-in (PACS-016 M8): None/False keeps the
     tuned default (read-only turns skip verification); True verifies every
     turn exactly as before."""
+    context_allocation: ContextAllocationBounds | None = None
+    """Adaptive context-budget bounds (PACS-017); None keeps the fixed wired
+    budget. Bounds are validated against the wired envelope at wiring time —
+    allocation can narrow, never widen (rule 12)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -344,14 +375,7 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
         ),
         permissions=PermissionPolicy(frozenset({Permission.READ, Permission.LOCAL_WRITE})),
         reliability=ReliabilityPolicy(),
-        context=RepairContextBuilder(
-            BudgetedContextBuilder(
-                deps.clock,
-                CharsPerTokenCounter(),
-                template=default_controller_template(),
-                token_budget=ContextTokenBudget(max_tokens=4096, reserve_tokens=256),
-            )
-        ),
+        context=repair_context_builder(deps),
         clock=deps.clock,
         sleeper=deps.sleeper,
         telemetry=deps.telemetry,

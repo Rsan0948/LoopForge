@@ -7,16 +7,18 @@ from loopforge.domain.context_lifecycle import (
     ContextAccounting,
     ContextCandidate,
     ContextTokenBudget,
+    DropReason,
     PreservationClass,
     select_context,
 )
+from loopforge.domain.policies import ContextAllocationBounds
 from loopforge.domain.prompts import PromptTemplate
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import RunState
 from loopforge.domain.tooling import DataSensitivity, SideEffectClass
 from loopforge.domain.types import ContextItemId, RunStatus
 from loopforge.ports.clock import ClockPort
-from loopforge.ports.context import TokenCounterPort
+from loopforge.ports.context import ContextAccountingSource, ContextBuilderPort, TokenCounterPort
 
 
 class BasicContextBuilder:
@@ -340,3 +342,75 @@ class BudgetedContextBuilder:
             )
 
         return candidates
+
+
+class AdaptiveContextBuilder:
+    """Per-turn adaptive context-budget allocation within policy bounds (PACS-017).
+
+    A ``ContextBuilderPort`` decorator: each build requests the current
+    adaptive budget from the delegate, then derives the NEXT budget from the
+    fresh accounting ledger — growing toward the policy ceiling when content
+    was dropped over budget, contracting toward the floor when utilization
+    sits below the policy threshold (both by the policy step, always clamped
+    inside the bounds). Enforcement stays with
+    ``select_context``/``ContextAccounting``: an over-budget assembly is
+    unrepresentable no matter what the allocator asks for, and preservation
+    contracts are the delegate's unchanged contract.
+
+    The allocator can narrow, never widen (AGENTS.md rule 12): construction
+    fails closed when the bounds would exceed the wired envelope budget or
+    undercut its reserve. An explicit caller ``token_budget`` bypasses
+    adaptation unchanged. A delegate without the ``ContextAccountingSource``
+    seam yields no ledger, so the budget honestly stays at the floor.
+    """
+
+    def __init__(
+        self,
+        delegate: ContextBuilderPort,
+        *,
+        bounds: ContextAllocationBounds,
+        envelope: ContextTokenBudget,
+    ) -> None:
+        if bounds.ceiling_tokens > envelope.max_tokens:
+            msg = "allocation ceiling cannot exceed the wired context budget envelope"
+            raise ValueError(msg)
+        if bounds.reserve_tokens < envelope.reserve_tokens:
+            msg_2 = "allocation reserve cannot undercut the wired budget envelope reserve"
+            raise ValueError(msg_2)
+        self._delegate = delegate
+        self._bounds = bounds
+        self._current = bounds.initial_budget()
+
+    @property
+    def current_budget(self) -> ContextTokenBudget:
+        """The budget the next adaptive build requests (evidence for telemetry/shadow)."""
+        return self._current
+
+    @property
+    def last_accounting(self) -> ContextAccounting | None:
+        if isinstance(self._delegate, ContextAccountingSource):
+            return self._delegate.last_accounting
+        return None
+
+    def build_context(
+        self,
+        state: RunState,
+        *,
+        role: ModelRole = ModelRole.CONTROLLER,
+        token_budget: ContextTokenBudget | None = None,
+    ) -> ModelContext:
+        if token_budget is not None:
+            return self._delegate.build_context(state, role=role, token_budget=token_budget)
+        budget = self._current
+        context = self._delegate.build_context(state, role=role, token_budget=budget)
+        accounting = self.last_accounting
+        if accounting is not None and accounting.usable_tokens > 0:
+            dropped_over_budget = any(
+                entry.drop_reason is DropReason.OVER_BUDGET for entry in accounting.dropped_entries
+            )
+            self._current = self._bounds.adjust(
+                budget,
+                dropped_over_budget=dropped_over_budget,
+                utilization_fraction=accounting.used_tokens / accounting.usable_tokens,
+            )
+        return context
