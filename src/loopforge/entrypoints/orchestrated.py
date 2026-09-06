@@ -29,7 +29,6 @@ from loopforge.application.runtime import Runtime
 from loopforge.domain.orchestration import partition_budget
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
-from loopforge.domain.routing import RoutingPolicyConfig
 from loopforge.domain.security import SandboxRequirements
 from loopforge.domain.types import BudgetLimit, Permission, WorkerId
 from loopforge.entrypoints.repair import (
@@ -37,12 +36,12 @@ from loopforge.entrypoints.repair import (
     repair_command_bindings,
     repair_command_specs,
     repair_context_builder,
+    repair_routing_config,
 )
 from loopforge.ports.model import ModelPort
 from loopforge.ports.sandbox import SandboxPort
 from loopforge.ports.workspace import WorkspacePort
 from loopforge.workloads.repair import (
-    REPAIR_MODEL_REQUIREMENTS,
     UNTRUSTED_REPAIR_REQUIREMENTS,
     OrchestratedRepairTask,
     RepairVerifier,
@@ -208,13 +207,7 @@ def _worker_runtime(  # noqa: PLR0913 - composition wiring keeps every seam expl
     # shared live adapter is registered per worker, never duplicated in one
     # registry), so worker-role model selection stays a wiring-time decision.
     registry = ModelRegistry((ModelRegistryEntry(model=model, tier=deps.model_tier),))
-    router = TieredRoutingPolicy(
-        registry,
-        config=RoutingPolicyConfig(
-            requirements=REPAIR_MODEL_REQUIREMENTS,
-            default_tier=deps.model_tier,
-        ),
-    )
+    router = TieredRoutingPolicy(registry, config=repair_routing_config(deps))
     return Runtime(
         model=model,
         router=router,

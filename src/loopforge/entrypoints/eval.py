@@ -926,6 +926,11 @@ class EvalReportStore:
     raises ``EvalReportStoreError`` — the domain constructors are the
     validation authority, so a hand-edited rate that disagrees with its
     counts cannot load.
+
+    Honest boundary (M9 review disposition): revalidation proves
+    CONSISTENCY (shape, keys, domain invariants), not provenance — the
+    store is a trusted-local operator-owned artifact directory (D10);
+    with write access to it an attacker can forge worse than a report.
     """
 
     def __init__(self, directory: str | Path, *, clock: ClockPort | None = None) -> None:
@@ -976,26 +981,37 @@ class EvalReportStore:
         try:
             raw: object = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            msg = f"eval report file is not valid JSON: {path} ({exc})"
+            # Never leak the absolute store path (the server's directory
+            # layout is not the client's business) — file name only.
+            msg = f"eval report file is not valid JSON: {path.name} ({exc})"
             raise EvalReportStoreError(msg) from exc
+        except OSError as exc:
+            # Unreadable artifact (permissions, glob/read race): server-side
+            # corruption in the 500 family, never a bare plain-text 500.
+            # ``str(exc)`` would embed the absolute path — strerror only.
+            msg_0 = f"eval report file is unreadable: {path.name} ({exc.strerror})"
+            raise EvalReportStoreError(msg_0) from exc
         envelope = _require_keys(
             raw,
             frozenset({"schema_version", "created_at", "report"}),
             what="eval report file",
         )
-        if envelope["schema_version"] not in (1, REPORT_SCHEMA_VERSION):
+        version_marker = envelope["schema_version"]
+        if (
+            not isinstance(version_marker, int)
+            or isinstance(version_marker, bool)
+            or version_marker not in (1, REPORT_SCHEMA_VERSION)
+        ):
             msg_2 = (
-                f"eval report schema version {envelope['schema_version']!r} is not "
-                f"supported (expected 1..{REPORT_SCHEMA_VERSION}): {path}"
+                f"eval report schema version {version_marker!r} is not "
+                f"supported (expected 1..{REPORT_SCHEMA_VERSION}): {path.name}"
             )
             raise EvalReportStoreError(msg_2)
         created_at = envelope["created_at"]
         if not isinstance(created_at, str):
-            msg_3 = f"eval report created_at must be a string: {path}"
+            msg_3 = f"eval report created_at must be a string: {path.name}"
             raise EvalReportStoreError(msg_3)
-        return created_at, _report_from_dict(
-            envelope["report"], schema_version=cast("int", envelope["schema_version"])
-        )
+        return created_at, _report_from_dict(envelope["report"], schema_version=version_marker)
 
     def load(self, report_id: str) -> BenchmarkReport:
         path = self._path_for(report_id)

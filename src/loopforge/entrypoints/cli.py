@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import sys
 import tempfile
 from collections.abc import Callable
@@ -718,9 +719,20 @@ def _replay(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps 
     except UnknownPolicyError as exc:
         print(f"error: {exc}")
         return 2
-    store = SQLiteEventStore(Path(args.sqlite), codec=JsonEventCodec())
+    sqlite_path = Path(args.sqlite)
+    if not sqlite_path.is_file():
+        # Never silently CREATE an empty store on a typo'd path — the
+        # operator would read "unknown run" (or empty shadow evidence) as
+        # a property of their data, not of their command line.
+        print(f"error: no SQLite event store at {args.sqlite}")
+        return 2
+    try:
+        store = SQLiteEventStore(sqlite_path, codec=JsonEventCodec())
+        historical = store.events_for(RunId(args.run_id))
+    except (sqlite3.Error, OSError) as exc:
+        print(f"error: cannot read the SQLite event store: {exc}")
+        return 1
     run_id = RunId(args.run_id)
-    historical = store.events_for(run_id)
     if not historical:
         print(f"error: unknown run {args.run_id!r} in {args.sqlite}")
         return 1
@@ -936,7 +948,7 @@ def _print_policy_record(record: PolicyRecord) -> None:
     )
 
 
-def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps one return per outcome
+def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911, PLR0912 - CLI flow keeps one return per outcome
     """Operator-owned candidate policy registry (PACS-017 M6).
 
     Local-file only, mirroring ``eval --list/--show``: the registry under
@@ -946,6 +958,19 @@ def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps 
     no runtime path performs it.
     """
     store = PolicyRegistryStore(Path(args.registry_dir))
+    actions = sum(
+        1
+        for action in (
+            args.list,
+            args.show is not None,
+            args.promote is not None,
+            args.transition is not None,
+        )
+        if action
+    )
+    if actions > 1 or (args.to is not None and args.transition is None):
+        print("error: policy accepts exactly one of --list, --show, --promote, --transition")
+        return 2
     try:
         if args.list:
             records = store.list()
@@ -961,6 +986,23 @@ def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps 
             return 0
         if args.show is not None:
             _print_policy_record(store.get(args.show, version=args.version))
+            return 0
+        if args.transition is not None:
+            if not args.evidence:
+                print("error: policy --transition requires --evidence TEXT (the referenced basis)")
+                return 2
+            if args.to is None:
+                print("error: policy --transition requires --to shadowed|benchmarked|retired")
+                return 2
+            record = store.get(args.transition, version=args.version)
+            updated = store.transition(
+                record.policy.policy_id,
+                record.policy.version,
+                PolicyLifecycle(args.to),
+                evidence_basis=args.evidence,
+                note=args.note,
+            )
+            _print_policy_record(updated)
             return 0
         if args.promote is not None:
             if not args.evidence:
@@ -986,11 +1028,11 @@ def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps 
     except PolicyRegistryError as exc:
         print(f"error: {exc}")
         return 1
-    print("error: policy requires one of --list, --show ID, or --promote ID")
+    print("error: policy requires one of --list, --show ID, --promote ID, or --transition ID")
     return 2
 
 
-def _derive_policy(args: argparse.Namespace) -> int:
+def _derive_policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps one return per outcome
     """Derive a suggested candidate from stored eval evidence (PACS-017 M8).
 
     Reads every report in --results-dir (plus shadowed context-budget
@@ -1008,7 +1050,11 @@ def _derive_policy(args: argparse.Namespace) -> int:
         reports = tuple(eval_reports.load(summary.report_id) for summary in summaries)
         shadow_samples: tuple[int, ...] = ()
         if args.sqlite is not None:
-            event_store = SQLiteEventStore(Path(args.sqlite), codec=JsonEventCodec())
+            sqlite_path = Path(args.sqlite)
+            if not sqlite_path.is_file():
+                print(f"error: no SQLite event store at {args.sqlite}")
+                return 2
+            event_store = SQLiteEventStore(sqlite_path, codec=JsonEventCodec())
             shadow_samples = shadow_budget_samples(event_store)
         registry = PolicyRegistryStore(Path(args.registry_dir))
         if args.version is not None:
@@ -1032,6 +1078,9 @@ def _derive_policy(args: argparse.Namespace) -> int:
         return 1
     except (EvalReportStoreError, PolicyRegistryError) as exc:
         print(f"error: {exc}")
+        return 1
+    except (sqlite3.Error, OSError) as exc:
+        print(f"error: cannot read the SQLite event store: {exc}")
         return 1
     except ValueError as exc:
         # Domain validation of the requested id/version: a usage error.
@@ -1270,6 +1319,20 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
         help="policy only: explicit confirmation token required by --promote",
     )
     parser.add_argument(
+        "--transition",
+        metavar="ID",
+        default=None,
+        help="policy only: move the record ID along its lifecycle (requires --to and --evidence)",
+    )
+    parser.add_argument(
+        "--to",
+        metavar="STATE",
+        choices=["shadowed", "benchmarked", "retired"],
+        default=None,
+        help="policy only: target lifecycle for --transition "
+        "(promotion stays confirm-gated via --promote)",
+    )
+    parser.add_argument(
         "--derive",
         metavar="ID",
         default=None,
@@ -1315,8 +1378,16 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
         return _replay(args)
     if args.command == "policy":
         if args.derive is not None:
-            if args.list or args.show is not None or args.promote is not None:
-                print("error: policy --derive cannot be combined with --list/--show/--promote")
+            if (
+                args.list
+                or args.show is not None
+                or args.promote is not None
+                or args.transition is not None
+            ):
+                print(
+                    "error: policy --derive cannot be combined with "
+                    "--list/--show/--promote/--transition"
+                )
                 return 2
             return _derive_policy(args)
         return _policy(args)

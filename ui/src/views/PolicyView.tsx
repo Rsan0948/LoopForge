@@ -62,9 +62,9 @@ function PromoteControl({
   const onSubmit = (event: FormEvent): void => {
     event.preventDefault();
     const trimmed = basis.trim();
-    if (!checked || trimmed === "") return;
+    if (!checked || trimmed === "" || busy) return;
     setBusy(true);
-    promotePolicy(record.policy.policy_id, trimmed, note.trim())
+    promotePolicy(record.policy.policy_id, record.policy.version, trimmed, note.trim())
       .then((updated) => {
         reset();
         onPromoted(updated);

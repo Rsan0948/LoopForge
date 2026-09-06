@@ -151,6 +151,22 @@ def test_recovery_mean_is_weighted_by_trials() -> None:
     assert suggestion.policy.routing.stall_escalation_threshold == 3
 
 
+def test_zero_filled_v1_rows_do_not_dilute_the_recovery_mean() -> None:
+    # M9 (B4): schema-v1 rows carry zero-FILLED v2 means (unknown, not a
+    # measured zero) — pooling them would silently dilute the mean. The
+    # heuristic excludes them and the rationale names the exclusion.
+    rows = (
+        _row("cfg", "t1", ctx_tokens=2000.0, recovery=1.5),
+        _row("cfg", "t2", ctx_tokens=0.0, recovery=0.0),  # v1-style zero-fill
+    )
+    suggestion = derive_candidate_policy((_report(rows=rows),), policy_id="derived", version=1)
+    # Pooled, the mean would be 0.75 → threshold 3; undiluted 1.5 → 4.
+    assert suggestion.policy.routing.stall_escalation_threshold == 4
+    assert any(
+        "1 schema-v1 row(s) without measured axes excluded" in line for line in suggestion.rationale
+    )
+
+
 # --- Derivation: deny / clamp ---------------------------------------------------
 
 

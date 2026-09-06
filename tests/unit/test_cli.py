@@ -1316,3 +1316,231 @@ def test_policy_derive_cannot_combine_with_other_actions(
     assert main() == 2
 
     assert "cannot be combined" in capsys.readouterr().out
+
+
+# --- M9: --sqlite misuse never silently creates or escapes ----------------------
+
+
+def test_replay_sqlite_path_must_already_exist(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # M9 (B3): a typo'd --sqlite path must not silently CREATE an empty store
+    # — the operator would read "unknown run" as a property of their data.
+    missing = tmp_path / "typo.db"
+    _argv(monkeypatch, "replay", "--sqlite", str(missing), "--run-id", "r1", "--prefix", "1")
+
+    assert main() == 2
+
+    assert f"error: no SQLite event store at {missing}" in capsys.readouterr().out
+    assert not missing.exists()
+
+
+def test_replay_sqlite_not_a_database_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    not_a_db = tmp_path / "events.db"
+    not_a_db.write_text("this is not sqlite", encoding="utf-8")
+    _argv(monkeypatch, "replay", "--sqlite", str(not_a_db), "--run-id", "r1", "--prefix", "1")
+
+    assert main() == 1
+
+    assert "error: cannot read the SQLite event store:" in capsys.readouterr().out
+
+
+def test_policy_derive_sqlite_path_must_already_exist(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    results_dir = tmp_path / "evals"
+    _seed_eval_report(results_dir)
+    missing = tmp_path / "typo.db"
+    _argv(
+        monkeypatch,
+        "policy",
+        "--derive",
+        "derived-candidate",
+        "--results-dir",
+        str(results_dir),
+        "--registry-dir",
+        str(tmp_path / "policies"),
+        "--sqlite",
+        str(missing),
+    )
+
+    assert main() == 2
+
+    assert f"error: no SQLite event store at {missing}" in capsys.readouterr().out
+    assert not missing.exists()
+
+
+def test_policy_derive_sqlite_not_a_database_fails_cleanly(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    results_dir = tmp_path / "evals"
+    _seed_eval_report(results_dir)
+    not_a_db = tmp_path / "events.db"
+    not_a_db.write_text("this is not sqlite", encoding="utf-8")
+    _argv(
+        monkeypatch,
+        "policy",
+        "--derive",
+        "derived-candidate",
+        "--results-dir",
+        str(results_dir),
+        "--registry-dir",
+        str(tmp_path / "policies"),
+        "--sqlite",
+        str(not_a_db),
+    )
+
+    assert main() == 1
+
+    assert "error: cannot read the SQLite event store:" in capsys.readouterr().out
+
+
+# --- M9 (A1): the evidence lifecycle is reachable end-to-end via the CLI ---------
+
+
+def test_policy_transition_requires_evidence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--transition",
+        "candidate-x",
+        "--to",
+        "benchmarked",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 2
+
+    assert "policy --transition requires --evidence" in capsys.readouterr().out
+
+
+def test_policy_transition_requires_a_target(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--transition",
+        "candidate-x",
+        "--evidence",
+        "eval-report-6",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 2
+
+    assert "policy --transition requires --to" in capsys.readouterr().out
+
+
+def test_policy_transition_denies_backwards_moves(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path)
+    PolicyRegistryStore(tmp_path).transition(
+        "candidate-x", 1, PolicyLifecycle.BENCHMARKED, evidence_basis="eval-report-6"
+    )
+    _argv(
+        monkeypatch,
+        "policy",
+        "--transition",
+        "candidate-x",
+        "--to",
+        "shadowed",
+        "--evidence",
+        "attempted regression",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 1
+
+    assert "is not legal" in capsys.readouterr().out
+
+
+def test_policy_lifecycle_is_reachable_end_to_end_via_the_cli(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # M9 (A1): CANDIDATE → BENCHMARKED → PROMOTED, every step operator-explicit
+    # with its referenced evidence basis — no dead-end states.
+    registry_dir = tmp_path / "policies"
+    _register_policy(registry_dir)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--transition",
+        "candidate-x",
+        "--to",
+        "benchmarked",
+        "--evidence",
+        "eval-report-6",
+        "--registry-dir",
+        str(registry_dir),
+    )
+
+    assert main() == 0
+    assert "lifecycle=benchmarked" in capsys.readouterr().out
+
+    _argv(
+        monkeypatch,
+        "policy",
+        "--promote",
+        "candidate-x",
+        "--evidence",
+        "eval-report-7",
+        "--confirm",
+        "--registry-dir",
+        str(registry_dir),
+    )
+
+    assert main() == 0
+    assert "lifecycle=promoted" in capsys.readouterr().out
+
+    record = PolicyRegistryStore(registry_dir).get("candidate-x")
+    assert record.lifecycle is PolicyLifecycle.PROMOTED
+    assert record.evidence_basis == "eval-report-7"
+
+
+def test_policy_retire_is_reachable_and_terminal(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    registry_dir = tmp_path / "policies"
+    _register_policy(registry_dir)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--transition",
+        "candidate-x",
+        "--to",
+        "retired",
+        "--evidence",
+        "superseded by candidate-y v2",
+        "--registry-dir",
+        str(registry_dir),
+    )
+
+    assert main() == 0
+    assert "lifecycle=retired" in capsys.readouterr().out
+
+    # RETIRED is terminal: even the confirm-gated promote path denies it.
+    _argv(
+        monkeypatch,
+        "policy",
+        "--promote",
+        "candidate-x",
+        "--evidence",
+        "eval-report-7",
+        "--confirm",
+        "--registry-dir",
+        str(registry_dir),
+    )
+
+    assert main() == 1
+    assert "is not legal" in capsys.readouterr().out

@@ -129,7 +129,7 @@ def _validate_nonnegative_int(value: int, *, field_name: str) -> None:
 
 
 def _validate_finite_nonnegative(value: float, *, field_name: str) -> None:
-    if not math.isfinite(value):
+    if isinstance(value, bool) or not math.isfinite(value):
         msg = f"{field_name} must be finite"
         raise ValueError(msg)
     if value < 0:
@@ -138,7 +138,7 @@ def _validate_finite_nonnegative(value: float, *, field_name: str) -> None:
 
 
 def _validate_unit_interval(value: float, *, field_name: str) -> None:
-    if not math.isfinite(value):
+    if isinstance(value, bool) or not math.isfinite(value):
         msg = f"{field_name} must be finite"
         raise ValueError(msg)
     if not 0.0 <= value <= 1.0:

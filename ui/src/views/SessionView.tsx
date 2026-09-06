@@ -717,7 +717,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
                     <th>candidate policy</th>
                     <th>kind</th>
                     <th>candidate decision</th>
-                    <th>active (enacted)</th>
+                    <th>nearest enacted (heuristic)</th>
                     <th>basis</th>
                   </tr>
                 </thead>

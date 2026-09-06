@@ -138,6 +138,13 @@ def test_routing_knobs_reject_bad_budget_pressure_fraction(fraction: float) -> N
         PolicyRoutingKnobs(budget_pressure_remaining_fraction=fraction)
 
 
+@pytest.mark.parametrize("fraction", [True, False])
+def test_routing_knobs_reject_bool_budget_pressure_fraction(fraction: bool) -> None:
+    # M9: JSON ``true``/``false`` must not pass as 1.0/0.0.
+    with pytest.raises(ValueError, match="budget pressure fraction"):
+        PolicyRoutingKnobs(budget_pressure_remaining_fraction=fraction)
+
+
 # --- Context allocation bounds: allow + deny ----------------------------------
 
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -258,16 +259,81 @@ def test_transition_replaces_the_note_only_when_given(tmp_path: Path) -> None:
     assert replaced.note == "benchmarked clean"
 
 
-def test_save_sweeps_stale_tmp_files(tmp_path: Path) -> None:
+def test_save_sweeps_only_its_own_stale_tmp_files(tmp_path: Path) -> None:
     directory = tmp_path / "registry"
     directory.mkdir()
-    stale = directory / "orphan.tmp"
+    stale = directory / "candidate-x--v1.json.999.tmp"
     stale.write_text("partial", encoding="utf-8")
+    # A foreign .tmp file (another tool's lockfile) is never swept.
+    foreign = directory / "orphan.tmp"
+    foreign.write_text("not ours", encoding="utf-8")
     store = PolicyRegistryStore(directory, clock=FixedClock(EARLIER))
 
     _register(store)
 
     assert not stale.exists()
+    assert foreign.exists()
+
+
+def test_concurrent_saves_across_threads_all_persist(tmp_path: Path) -> None:
+    # M9: the REST promote route runs in the FastAPI threadpool, so saves
+    # from several threads share the pid — the tmp path defense must cover
+    # threads, not just processes.
+    store = PolicyRegistryStore(tmp_path, clock=FixedClock(EARLIER))
+
+    def register_one(index: int) -> None:
+        _register(store, f"candidate-{index:02d}")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(register_one, range(40)))
+
+    assert len(store.list()) == 40
+
+
+def test_misnamed_file_is_tampering_not_a_phantom_record(tmp_path: Path) -> None:
+    # M9: filename/content binding — copying a record under another version
+    # name must fail loudly, never inject a phantom "latest" version.
+    store = PolicyRegistryStore(tmp_path, clock=FixedClock(EARLIER))
+    _register(store)
+    (tmp_path / "candidate-x--v1.json").replace(tmp_path / "candidate-x--v9.json")
+
+    with pytest.raises(PolicyRegistryError, match="holds candidate-x v1"):
+        store.list()
+
+
+def test_unreadable_file_fails_in_the_store_taxonomy(tmp_path: Path) -> None:
+    # M9: an unreadable artifact is server-side corruption (500 {detail}),
+    # never an escaping OSError bare 500.
+    store = PolicyRegistryStore(tmp_path, clock=FixedClock(EARLIER))
+    _register(store)
+    path = tmp_path / "candidate-x--v1.json"
+    path.chmod(0o000)
+    try:
+        with pytest.raises(PolicyRegistryError, match="unreadable") as excinfo:
+            store.list()
+        assert str(tmp_path) not in str(excinfo.value)
+    finally:
+        path.chmod(0o644)
+
+
+@pytest.mark.parametrize("marker", [True, 1.0, "1"])
+def test_non_integer_schema_version_fails_closed(tmp_path: Path, marker: object) -> None:
+    # M9: the schema marker is type-checked — JSON true/1.0/"1" are not v1.
+    store = PolicyRegistryStore(tmp_path, clock=FixedClock(EARLIER))
+    _register(store)
+    _rewrite(tmp_path, "candidate-x", 1, lambda payload: payload.update(schema_version=marker))
+
+    with pytest.raises(PolicyRegistryError, match="schema version"):
+        store.list()
+
+
+def test_non_string_updated_at_fails_closed(tmp_path: Path) -> None:
+    store = PolicyRegistryStore(tmp_path, clock=FixedClock(EARLIER))
+    _register(store)
+    _rewrite(tmp_path, "candidate-x", 1, lambda payload: payload.update(updated_at=12345))
+
+    with pytest.raises(PolicyRegistryError, match="updated_at must be a string"):
+        store.list()
 
 
 def test_corrupt_json_fails_closed_on_list_and_get(tmp_path: Path) -> None:

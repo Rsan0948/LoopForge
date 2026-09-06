@@ -40,8 +40,9 @@ from loopforge.adapters.sandbox_tools import SandboxCommandTools, SandboxToolBin
 from loopforge.adapters.scripted import ScriptedModel
 from loopforge.adapters.workspace_git_tools import WorkspaceGitTools
 from loopforge.application.runtime import Runtime
+from loopforge.application.shadow import CandidateShadowAdvisor
 from loopforge.domain.context_lifecycle import ContextTokenBudget
-from loopforge.domain.policies import ContextAllocationBounds
+from loopforge.domain.policies import ContextAllocationBounds, ExecutionPolicy
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -166,6 +167,30 @@ class RepairRuntimeDeps:
     """Candidate routing configuration (PACS-017 M5); None keeps the default
     tier-only config. The requirements stay code-owned by the workload — a
     candidate tunes selection knobs, never the model contract (rule 12)."""
+    shadow_policy: ExecutionPolicy | None = None
+    """Candidate policy to shadow alongside the active run (PACS-017 M3/M9).
+
+    None keeps the run unshadowed. When set, a ``CandidateShadowAdvisor``
+    journals the candidate's routing/context-budget/cadence decisions as
+    evidence-only ``ShadowDecisionRecorded`` events — never enacted, and
+    the active path stays byte-identical (the M3 pin)."""
+
+
+def repair_routing_config(deps: RepairRuntimeDeps) -> RoutingPolicyConfig:
+    """The routing config for every repair composition root.
+
+    The candidate's knobs when supplied (``deps.routing``), else the default
+    tier-only config — always over the code-owned workload requirements.
+    Single source for the single-runtime and orchestrated-worker paths (M9
+    A10: the orchestrated arm silently dropped ``deps.routing`` when the two
+    paths diverged).
+    """
+    if deps.routing is not None:
+        return deps.routing
+    return RoutingPolicyConfig(
+        requirements=REPAIR_MODEL_REQUIREMENTS,
+        default_tier=deps.model_tier,
+    )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -360,17 +385,7 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
     # (or stops the run ROUTE_NO_COMPATIBLE_MODEL if it cannot satisfy the
     # requirements — fail closed, never route to an incompatible model).
     registry = ModelRegistry((ModelRegistryEntry(model=model, tier=deps.model_tier),))
-    router = TieredRoutingPolicy(
-        registry,
-        config=(
-            deps.routing
-            if deps.routing is not None
-            else RoutingPolicyConfig(
-                requirements=REPAIR_MODEL_REQUIREMENTS,
-                default_tier=deps.model_tier,
-            )
-        ),
-    )
+    router = TieredRoutingPolicy(registry, config=repair_routing_config(deps))
     runtime = Runtime(
         model=model,
         router=router,
@@ -390,6 +405,18 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
         artifacts=WorkspaceArtifactCollector(workspace),
         verify_read_only_turns=bool(deps.verify_read_only_turns),
     )
+    if deps.shadow_policy is not None:
+        # Evidence-only shadowing (PACS-017): the candidate advises through
+        # its own router over the same registry; its decisions are journaled
+        # for audit and never feed the active path.
+        runtime.shadow = CandidateShadowAdvisor(
+            deps.shadow_policy,
+            router=TieredRoutingPolicy(
+                registry,
+                config=deps.shadow_policy.routing.for_requirements(REPAIR_MODEL_REQUIREMENTS),
+            ),
+            accounting_source=runtime.context,
+        )
     return RepairRuntimeBundle(
         runtime=runtime,
         workspace=workspace,

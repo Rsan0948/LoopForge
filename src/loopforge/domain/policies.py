@@ -95,7 +95,9 @@ class PolicyRoutingKnobs:
             msg_2 = "stall escalation threshold must be positive"
             raise ValueError(msg_2)
         if self.budget_pressure_remaining_fraction is not None:
-            if not math.isfinite(self.budget_pressure_remaining_fraction):
+            if isinstance(self.budget_pressure_remaining_fraction, bool) or not math.isfinite(
+                self.budget_pressure_remaining_fraction
+            ):
                 msg_3 = "budget pressure fraction must be finite"
                 raise ValueError(msg_3)
             if not 0.0 < self.budget_pressure_remaining_fraction <= 1.0:
@@ -155,7 +157,9 @@ class ContextAllocationBounds:
         if self.step_tokens <= 0:
             msg_6 = "step_tokens must be positive"
             raise ValueError(msg_6)
-        if not math.isfinite(self.low_utilization_fraction):
+        if isinstance(self.low_utilization_fraction, bool) or not math.isfinite(
+            self.low_utilization_fraction
+        ):
             msg_7 = "low utilization fraction must be finite"
             raise ValueError(msg_7)
         if not 0.0 < self.low_utilization_fraction < 1.0:

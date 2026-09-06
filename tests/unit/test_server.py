@@ -1608,6 +1608,25 @@ def test_evals_routes_fail_closed_500_on_a_tampered_report(tmp_path: Path) -> No
         assert "detail" in listing.json()
 
 
+def test_evals_routes_fail_closed_500_on_an_unreadable_report(tmp_path: Path) -> None:
+    # M9 (B1/B2): an unreadable artifact is a 500 {"detail"} naming the file
+    # only — never an escaping OSError, never a path leak.
+    evals_dir = tmp_path / "evals"
+    store = EvalReportStore(evals_dir, clock=FixedClock(NOW))
+    report = _eval_report()
+    path = store.save(report)
+    path.chmod(0o000)
+    try:
+        with _client(tmp_path, _plain_factory(), evals_dir=evals_dir) as client:
+            detail = client.get(f"/api/evals/{report.report_id}")
+            assert detail.status_code == 500, detail.text
+            message = detail.json()["detail"]
+            assert "unreadable" in message
+            assert str(evals_dir) not in message
+    finally:
+        path.chmod(0o644)
+
+
 def test_evals_dir_defaults_under_the_server_data_dir(tmp_path: Path) -> None:
     # evals_dir unset resolves to data_dir/"evals" so the routes work out of
     # the box, exactly like the other server-owned paths.
@@ -1805,6 +1824,24 @@ def test_policies_routes_fail_closed_500_on_a_tampered_registry(tmp_path: Path) 
         listing = client.get("/api/policies")
         assert listing.status_code == 500, listing.text
         assert "revalidation" in listing.json()["detail"]
+
+
+def test_policies_routes_fail_closed_500_on_an_unreadable_artifact(tmp_path: Path) -> None:
+    # M9 (B1/B2): an unreadable artifact is a 500 {"detail"} naming the file
+    # only — never an escaping OSError, never a path leak.
+    policies_dir = tmp_path / "policies"
+    _register_policy(policies_dir)
+    path = policies_dir / "candidate-x--v1.json"
+    path.chmod(0o000)
+    try:
+        with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+            listing = client.get("/api/policies")
+            assert listing.status_code == 500, listing.text
+            detail = listing.json()["detail"]
+            assert "unreadable" in detail
+            assert str(policies_dir) not in detail
+    finally:
+        path.chmod(0o644)
 
 
 def test_policies_dir_defaults_under_the_server_data_dir(tmp_path: Path) -> None:

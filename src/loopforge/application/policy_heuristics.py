@@ -9,6 +9,13 @@ impossible by construction — and the result is only ever registered as
 a CANDIDATE with a referenced evidence basis. Nothing here applies or
 promotes anything: authority stays with the operator (rule 16,
 ADR-0012), exactly like a hand-authored candidate.
+
+Note (M9 disposition): a derived ceiling may exceed a deployment's
+wired context envelope (the envelope here is code-owned, up to 16384;
+a given runtime wiring may allow less). That is safe today — wiring a
+policy whose bounds exceed the wired envelope fails closed at
+``AdaptiveContextBuilder`` construction — but envelope compatibility is
+an operator review item at registration/promotion time.
 """
 
 from __future__ import annotations
@@ -120,9 +127,34 @@ def derive_candidate_policy(
         raise HeuristicDerivationError(msg_2)
     ceiling, ceiling_rationale = _derive_ceiling(ctx_samples)
     floor = max(CTX_FLOOR_MIN, int(ceiling * CTX_FLOOR_FRACTION) // CTX_STEP * CTX_STEP)
-    total_trials = sum(row.trials for row in rows)
-    mean_recovery = sum(row.mean_recovery_events * row.trials for row in rows) / total_trials
-    threshold, stall_rationale = _derive_stall_threshold(mean_recovery, len(rows))
+    # Recovery evidence: schema-v1 rows carry zero-FILLED v2 means (unknown,
+    # not measured zero) — including them would silently dilute the mean, so
+    # only rows with at least one measured v2 axis count. With no recovery
+    # evidence at all the conservative code-owned default applies, and the
+    # rationale says so honestly.
+    measured = [
+        row
+        for row in rows
+        if row.mean_context_tokens_used > 0.0
+        or row.mean_context_items_dropped > 0.0
+        or row.mean_recovery_events > 0.0
+    ]
+    if measured:
+        total_trials = sum(row.trials for row in measured)
+        mean_recovery = (
+            sum(row.mean_recovery_events * row.trials for row in measured) / total_trials
+        )
+        threshold, stall_rationale = _derive_stall_threshold(mean_recovery, len(measured))
+        if len(measured) < len(rows):
+            stall_rationale += (
+                f" ({len(rows) - len(measured)} schema-v1 row(s) without measured axes excluded)"
+            )
+    else:
+        threshold = STALL_DEFAULT
+        stall_rationale = (
+            f"stall escalation threshold {STALL_DEFAULT} (code-owned default: "
+            "no measured recovery evidence)"
+        )
     report_ids = sorted({report.report_id for report in reports})
     basis = f"heuristic derivation from eval reports: {', '.join(report_ids)}"
     if shadow_budget_tokens:

@@ -267,6 +267,61 @@ def test_wrong_schema_version_fails_closed(tmp_path: Path) -> None:
         store.load("eval-report-1")
 
 
+@pytest.mark.parametrize("marker", [True, 2.0, "2"])
+def test_non_integer_schema_version_fails_closed(tmp_path: Path, marker: object) -> None:
+    # M9: the schema marker is type-checked — JSON true/2.0/"2" are not v2
+    # even though True == 1 and 2.0 == 2 in Python.
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    store.save(_report())
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["schema_version"] = marker
+
+    _rewrite(tmp_path, "eval-report-1", mutate)
+
+    with pytest.raises(EvalReportStoreError, match="schema version"):
+        store.load("eval-report-1")
+
+
+def test_unreadable_artifact_fails_in_the_store_taxonomy(tmp_path: Path) -> None:
+    # M9: an unreadable artifact is server-side corruption (500 {detail}),
+    # never an escaping OSError bare 500.
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    store.save(_report())
+    path = tmp_path / "eval-report-1.json"
+    path.chmod(0o000)
+    try:
+        with pytest.raises(EvalReportStoreError, match="unreadable") as excinfo:
+            store.load("eval-report-1")
+        assert str(tmp_path) not in str(excinfo.value)
+    finally:
+        path.chmod(0o644)
+
+
+def test_store_errors_never_leak_the_store_path(tmp_path: Path) -> None:
+    # M9: every decode failure names the artifact file only, so a 500 detail
+    # never discloses the on-disk store location.
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    store.save(_report())
+    path = tmp_path / "eval-report-1.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    with pytest.raises(EvalReportStoreError) as corrupt:
+        store.load("eval-report-1")
+    assert str(tmp_path) not in str(corrupt.value)
+
+    store.save(_report())  # restore a valid artifact
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["schema_version"] = 999
+
+    _rewrite(tmp_path, "eval-report-1", mutate)
+
+    with pytest.raises(EvalReportStoreError) as versioned:
+        store.load("eval-report-1")
+    assert str(tmp_path) not in str(versioned.value)
+
+
 def test_drifted_report_keys_fail_closed(tmp_path: Path) -> None:
     store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
     store.save(_report())

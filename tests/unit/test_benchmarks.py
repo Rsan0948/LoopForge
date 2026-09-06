@@ -482,6 +482,30 @@ def test_config_report_rejects_bad_means(field: str, bad: float) -> None:
         _config_report(**{field: bad})
 
 
+@pytest.mark.parametrize(
+    "field",
+    [
+        "mean_cost_usd",
+        "mean_latency_seconds",
+        "mean_total_tokens",
+        "mean_human_interventions",
+        "mean_context_tokens_used",
+        "mean_context_items_dropped",
+        "mean_recovery_events",
+    ],
+)
+def test_config_report_rejects_bool_means(field: str) -> None:
+    # M9: a JSON ``true`` must not pass as 1.0 — bools are not numbers here.
+    with pytest.raises(ValueError, match=field):
+        _config_report(**{field: True})
+
+
+@pytest.mark.parametrize("field", ["success_rate", "false_success_rate"])
+def test_config_report_rejects_bool_rates(field: str) -> None:
+    with pytest.raises(ValueError, match=field):
+        _config_report(**{field: True})
+
+
 def test_benchmark_report_accepts_pareto_subset_of_configs() -> None:
     configs = (
         _config_report(config_id="config-a"),

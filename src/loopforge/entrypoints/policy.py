@@ -13,12 +13,28 @@ exact-key envelopes, and domain revalidation on every load — a tampered
 registry fails loudly, never silently. The serving plane reads through
 the same ``policy_record_to_dict`` projection so the wire shape is
 byte-identical to the operator-owned artifact.
+
+Two honest boundaries (M9 review dispositions):
+
+- **Concurrency**: a per-instance lock plus pid-namespaced tmp files
+  defend the tmp path against threads and processes, and the rename is
+  atomic — but a cross-process get→transition→save sequence is NOT a
+  compare-and-swap: two operators transitioning the same record
+  concurrently produce a last-writer-wins lost update. The registry is a
+  trusted-local single-operator-writer tool (D10); concurrent multi-
+  writer promotion would need flock/CAS, deliberately out of scope.
+- **Authenticity**: revalidation proves CONSISTENCY (shape, keys, domain
+  invariants), not provenance — with write access to the store an
+  attacker can forge worse than a record. Evidence-basis references are
+  operator-resolved (the console links a basis naming a stored report),
+  never cryptographically bound.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import threading
 from contextlib import suppress
 from pathlib import Path
 from typing import Final, cast
@@ -177,12 +193,18 @@ class PolicyRegistryStore:
     def __init__(self, directory: str | Path, *, clock: ClockPort | None = None) -> None:
         self._directory = Path(directory)
         self._clock = clock if clock is not None else SystemClock()
+        # The tmp name is pid-namespaced (cross-process); this lock extends
+        # the same defense to threads (the REST promote route runs in the
+        # FastAPI threadpool, sharing the pid).
+        self._save_lock = threading.Lock()
 
     def _path_for(self, policy_id: str, version: int) -> Path:
         return self._directory / f"{policy_id}--v{version}.json"
 
     def _sweep_stale_tmp_files(self) -> None:
-        for stale in self._directory.glob("*.tmp"):
+        # Only our own tmp shape ("<record>.json.<pid>.tmp") — never foreign
+        # files that happen to end in .tmp.
+        for stale in self._directory.glob("*.json.*.tmp"):
             with suppress(OSError):
                 stale.unlink()
 
@@ -194,11 +216,12 @@ class PolicyRegistryStore:
         }
         path = self._path_for(record.policy.policy_id, record.policy.version)
         try:
-            self._directory.mkdir(parents=True, exist_ok=True)
-            self._sweep_stale_tmp_files()
-            tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-            tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-            tmp_path.replace(path)
+            with self._save_lock:
+                self._directory.mkdir(parents=True, exist_ok=True)
+                self._sweep_stale_tmp_files()
+                tmp_path = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+                tmp_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+                tmp_path.replace(path)
         except OSError as exc:
             msg = f"cannot persist policy record: {exc}"
             raise PolicyRegistryError(msg) from exc
@@ -210,14 +233,39 @@ class PolicyRegistryStore:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             msg = f"policy registry file is not valid JSON: {path.name} ({exc})"
             raise PolicyRegistryError(msg) from exc
+        except OSError as exc:
+            # Unreadable artifact (permissions, glob/read race): server-side
+            # corruption in the 500 family, never a bare plain-text 500.
+            # ``str(exc)`` would embed the absolute path — strerror only.
+            msg_0 = f"policy registry file is unreadable: {path.name} ({exc.strerror})"
+            raise PolicyRegistryError(msg_0) from exc
         envelope = _require_keys(raw, _ENVELOPE_KEYS, what="policy registry file")
-        if envelope["schema_version"] != REGISTRY_SCHEMA_VERSION:
+        version_marker = envelope["schema_version"]
+        if (
+            not isinstance(version_marker, int)
+            or isinstance(version_marker, bool)
+            or version_marker != REGISTRY_SCHEMA_VERSION
+        ):
             msg_2 = (
-                f"policy registry schema version {envelope['schema_version']!r} is not "
+                f"policy registry schema version {version_marker!r} is not "
                 f"supported (expected {REGISTRY_SCHEMA_VERSION}): {path.name}"
             )
             raise PolicyRegistryError(msg_2)
-        return _policy_record_from_dict(envelope["record"])
+        if not isinstance(envelope["updated_at"], str):
+            msg_3 = f"policy registry updated_at must be a string: {path.name}"
+            raise PolicyRegistryError(msg_3)
+        record = _policy_record_from_dict(envelope["record"])
+        # Filename/content binding (the EvalReportStore report-id precedent):
+        # a misnamed or copied file is tampering, not a phantom new record.
+        canonical = self._path_for(record.policy.policy_id, record.policy.version).name
+        if path.name != canonical:
+            msg_4 = (
+                f"policy registry file {path.name} holds "
+                f"{record.policy.policy_id} v{record.policy.version} "
+                f"(expected {canonical})"
+            )
+            raise PolicyRegistryError(msg_4)
+        return record
 
     def register(
         self,

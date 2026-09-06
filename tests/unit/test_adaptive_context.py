@@ -28,10 +28,15 @@ from loopforge.domain.context_lifecycle import (
 )
 from loopforge.domain.policies import ContextAllocationBounds
 from loopforge.domain.prompts import default_controller_template
+from loopforge.domain.routing import ModelTier, RoutingPolicyConfig
 from loopforge.domain.state import RunState
 from loopforge.domain.types import RunId, RunStatus
-from loopforge.entrypoints.repair import RepairRuntimeDeps, repair_context_builder
-from loopforge.workloads.repair import RepairContextBuilder
+from loopforge.entrypoints.repair import (
+    RepairRuntimeDeps,
+    repair_context_builder,
+    repair_routing_config,
+)
+from loopforge.workloads.repair import REPAIR_MODEL_REQUIREMENTS, RepairContextBuilder
 
 NOW = datetime(2026, 9, 5, tzinfo=UTC)
 RUN = RunId("run-adaptive")
@@ -259,3 +264,23 @@ def test_repair_wiring_fails_closed_when_allocation_widens_the_envelope() -> Non
                 )
             )
         )
+
+
+# --- Routing config: one source for every repair composition root (M9 A10) --------
+
+
+def test_repair_routing_config_defaults_to_the_deps_tier_over_workload_requirements() -> None:
+    config = repair_routing_config(_deps(model_tier=ModelTier.ADVANCED))
+
+    assert config.requirements is REPAIR_MODEL_REQUIREMENTS
+    assert config.default_tier is ModelTier.ADVANCED
+
+
+def test_repair_routing_config_prefers_the_candidate_knobs_when_supplied() -> None:
+    candidate = RoutingPolicyConfig(
+        requirements=REPAIR_MODEL_REQUIREMENTS,
+        default_tier=ModelTier.ECONOMY,
+        stall_escalation_threshold=4,
+    )
+
+    assert repair_routing_config(_deps(routing=candidate)) is candidate

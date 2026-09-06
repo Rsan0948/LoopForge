@@ -22,14 +22,17 @@ from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import FixedClock, RecordingSleeper, ScriptedModel
 from loopforge.adapters.sqlite_events import SQLiteEventStore
+from loopforge.application.shadow import CandidateShadowAdvisor
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.events import (
     ArtifactRecorded,
     Event,
+    ShadowDecisionRecorded,
     ToolFailed,
     VerificationFailed,
     VerificationPassed,
 )
+from loopforge.domain.policies import ADAPTIVE_CONTEXT_POLICY
 from loopforge.domain.state import replay
 from loopforge.domain.types import ActionId, RunStatus, StopReason
 from loopforge.entrypoints.repair import (
@@ -176,6 +179,62 @@ def test_scripted_model_repairs_fixture_through_full_runtime(tmp_path: Path) -> 
     decoded = tuple(codec.decode(codec.encode(event)) for event in events)
     assert decoded == events
     assert replay(state.run_id, decoded) == state
+
+
+def test_composition_root_wires_shadow_policy_from_deps(tmp_path: Path) -> None:
+    # M9 (A2): the candidate shadow advisor is reachable through the real
+    # composition root — deps.shadow_policy wires CandidateShadowAdvisor into
+    # the built runtime; without it the runtime stays unshadowed. Wiring-only:
+    # bundle construction executes no sandbox commands (no RLIMIT gate).
+    task = adder_repair_task()
+    shadowed = build_trusted_repair_runtime(
+        task,
+        workspaces_dir=tmp_path / "shadowed",
+        deps=RepairRuntimeDeps(
+            store=InMemoryEventStore(),
+            clock=CLOCK,
+            sleeper=RecordingSleeper(),
+            shadow_policy=ADAPTIVE_CONTEXT_POLICY,
+        ),
+    )
+    unshadowed = build_trusted_repair_runtime(
+        task,
+        workspaces_dir=tmp_path / "unshadowed",
+        deps=_deps(InMemoryEventStore()),
+    )
+
+    assert isinstance(shadowed.runtime.shadow, CandidateShadowAdvisor)
+    assert unshadowed.runtime.shadow is None
+
+
+@_REQUIRES_RLIMIT_AS
+def test_wired_shadow_journals_evidence_without_touching_the_active_path(
+    tmp_path: Path,
+) -> None:
+    task = adder_repair_task()
+    store = InMemoryEventStore()
+    deps = RepairRuntimeDeps(
+        store=store,
+        clock=CLOCK,
+        sleeper=RecordingSleeper(),
+        shadow_policy=ADAPTIVE_CONTEXT_POLICY,
+    )
+    bundle = build_trusted_repair_runtime(
+        task,
+        workspaces_dir=tmp_path / "workspaces",
+        deps=deps,
+    )
+
+    state = bundle.runtime.run(task.objective)
+
+    assert state.status is RunStatus.SUCCEEDED
+    events = store.events_for(state.run_id)
+    shadowed = [event for event in events if isinstance(event, ShadowDecisionRecorded)]
+    assert shadowed, "the wired advisor must journal shadow decisions"
+    assert {event.policy_id for event in shadowed} == {ADAPTIVE_CONTEXT_POLICY.policy_id}
+    # Evidence-only: the scripted active repair landed exactly as unshadowed.
+    repaired = (bundle.workspace.root / "adder.py").read_text(encoding="utf-8")
+    assert repaired == task.fixture.solution[0].content
 
 
 @_REQUIRES_RLIMIT_AS

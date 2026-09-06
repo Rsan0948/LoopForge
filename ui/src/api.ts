@@ -481,13 +481,18 @@ export function getPolicy(policyId: string): Promise<PolicyRecordInfo> {
  * through an evidence-gathering state first). */
 export function promotePolicy(
   policyId: string,
+  version: number,
   evidenceBasis: string,
   note?: string,
 ): Promise<PolicyRecordInfo> {
-  // `confirm: true` is only ever sent from the confirmation dialog.
+  // `confirm: true` is only ever sent from the confirmation dialog, and the
+  // version is always the record the operator is looking at — never a
+  // silently-newer registration (M9: promote-latest is a CLI convenience,
+  // not a console behavior).
   return post<PolicyRecordInfo>(`/api/policies/${encodeURIComponent(policyId)}/promote`, {
     evidence_basis: evidenceBasis,
     note: note ?? "",
+    version,
     confirm: true,
   });
 }
