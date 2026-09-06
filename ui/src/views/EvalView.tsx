@@ -47,6 +47,15 @@ function ReportRow({ row, pareto }: { row: ConfigReportRow; pareto: boolean }): 
       <td className="mono">{formatCost(row.mean_cost_usd)}</td>
       <td className="mono">{row.mean_latency_seconds.toFixed(2)}s</td>
       <td className="mono">{row.mean_human_interventions.toFixed(2)}</td>
+      <td className="mono" title="mean context tokens assembled per turn (Pareto: lower is better)">
+        {row.mean_context_tokens_used.toFixed(1)}
+      </td>
+      <td className="mono" title="mean context items dropped over budget per turn">
+        {row.mean_context_items_dropped.toFixed(2)}
+      </td>
+      <td className="mono" title="mean recovery events per trial (Pareto: lower is better)">
+        {row.mean_recovery_events.toFixed(2)}
+      </td>
     </tr>
   );
 }
@@ -129,6 +138,9 @@ export default function EvalView({ reportId }: { reportId: string }): ReactEleme
                   <th>mean cost</th>
                   <th>mean latency</th>
                   <th>mean interventions</th>
+                  <th>mean ctx tokens</th>
+                  <th>mean ctx dropped</th>
+                  <th>mean recovery</th>
                 </tr>
               </thead>
               <tbody>

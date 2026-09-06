@@ -878,6 +878,7 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
     data_dir: str,
     static_dir: str | None,
     evals_dir: str | None,
+    policies_dir: str | None,
 ) -> int:
     """Run the operator server (PACS-014): REST + WebSocket over the durable store.
 
@@ -900,6 +901,7 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
         data_dir=Path(data_dir),
         static_dir=Path(static_dir) if static_dir else None,
         evals_dir=Path(evals_dir) if evals_dir else None,
+        policies_dir=Path(policies_dir) if policies_dir else None,
     )
     uvicorn.run(create_app(settings), host=host, port=port)
     return 0
@@ -983,7 +985,7 @@ def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps 
     return 2
 
 
-def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
+def main() -> int:  # noqa: PLR0911, PLR0915 - CLI dispatch keeps one return per command
     parser = argparse.ArgumentParser(prog="loopforge", epilog="legacy commands: {demo,repair-demo}")
     parser.add_argument(
         "command",
@@ -1165,6 +1167,13 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         "(default: DATA-DIR/evals)",
     )
     parser.add_argument(
+        "--policies-dir",
+        metavar="DIR",
+        default=None,
+        help="serve only: operator-owned policy registry the /api/policies routes use "
+        "(default: DATA-DIR/policies)",
+    )
+    parser.add_argument(
         "--registry-dir",
         metavar="DIR",
         default=".loopforge/policies",
@@ -1247,6 +1256,7 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
             data_dir=args.data_dir,
             static_dir=args.static_dir,
             evals_dir=args.evals_dir,
+            policies_dir=args.policies_dir,
         )
     return 2
 

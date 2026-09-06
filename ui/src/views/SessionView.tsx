@@ -28,7 +28,13 @@ import {
 } from "../api";
 import { navigateToSession } from "../App";
 import DiffViewer from "../DiffViewer";
-import { describeEvent, type EventEnvelope } from "../events";
+import {
+  describeEvent,
+  type ContextAssembledPayload,
+  type EventEnvelope,
+  type ModelTurnRecordedPayload,
+  type ShadowDecisionRecordedPayload,
+} from "../events";
 import { formatClock, formatCost, formatTime } from "../format";
 import { ErrorBanner, StatusBadge } from "../widgets";
 
@@ -51,6 +57,50 @@ function EventRow({ envelope }: { envelope: EventEnvelope }): ReactElement {
       <pre className="event-raw">{JSON.stringify(envelope.event, null, 2)}</pre>
     </details>
   );
+}
+
+interface ShadowPair {
+  payload: ShadowDecisionRecordedPayload;
+  active: string;
+}
+
+// Active-vs-candidate pairing (PACS-017 M7): a ShadowDecisionRecorded event
+// carries only the CANDIDATE side — it is evidence-only and never feeds the
+// active run — so the enacted counterpart is derived from the sibling events
+// that followed it in the stream.
+function activeCounterpart(events: EventEnvelope[], shadow: ShadowDecisionRecordedPayload): string {
+  const after = events.filter((e) => e.event.sequence > shadow.sequence);
+  if (shadow.kind === "model_route") {
+    const turn = after.find((e) => e.event_type === "ModelTurnRecorded");
+    if (turn === undefined) return "—";
+    const p = turn.event as ModelTurnRecordedPayload;
+    return `${p.provider}/${p.model}`;
+  }
+  if (shadow.kind === "context_budget") {
+    // The shadow budget advice is journaled during the same turn's context
+    // build, so the enacted assembly may sit just BEFORE or just AFTER the
+    // shadow event — pair with the nearest ContextAssembled either way.
+    const assemblies = events
+      .filter((e) => e.event_type === "ContextAssembled")
+      .map((e) => e.event as ContextAssembledPayload);
+    const nearest = assemblies.reduce<ContextAssembledPayload | undefined>(
+      (best, candidate) =>
+        best === undefined ||
+        Math.abs(candidate.sequence - shadow.sequence) < Math.abs(best.sequence - shadow.sequence)
+          ? candidate
+          : best,
+      undefined,
+    );
+    return nearest === undefined ? "—" : `${nearest.context_items.length} items assembled`;
+  }
+  // verification_cadence: a verification event before the next model turn
+  // means the active cadence verified; otherwise the active run went on.
+  const nextTurn = after.findIndex((e) => e.event_type === "ModelTurnRecorded");
+  const window = nextTurn === -1 ? after : after.slice(0, nextTurn);
+  const verified = window.some(
+    (e) => e.event_type === "VerificationPassed" || e.event_type === "VerificationFailed",
+  );
+  return verified ? "verification ran" : "no verification ran";
 }
 
 function ProvenanceNodeRow({
@@ -88,6 +138,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   const [lineage, setLineage] = useState<SessionLineage | null>(null);
   const [graph, setGraph] = useState<ProvenanceGraph | null>(null);
   const [provOpen, setProvOpen] = useState(false);
+  const [shadowOpen, setShadowOpen] = useState(false);
   const [explained, setExplained] = useState<ProvenanceExplanation | null>(null);
 
   const [stopOpen, setStopOpen] = useState(false);
@@ -383,6 +434,15 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
 
   const budget = detail?.budget ?? null;
 
+  // Shadow-decision panel projection: candidate decisions recorded by the
+  // optional shadow advisor, paired with what the active run enacted.
+  const shadowPairs: ShadowPair[] = events
+    .filter((e) => e.event_type === "ShadowDecisionRecorded")
+    .map((envelope) => {
+      const payload = envelope.event as ShadowDecisionRecordedPayload;
+      return { payload, active: activeCounterpart(events, payload) };
+    });
+
   return (
     <div className="stack">
       <nav className="breadcrumb">
@@ -633,6 +693,53 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
             )}
           </>
         )}
+      </section>
+
+      <section className="panel">
+        <div className="panel-header">
+          <h2>shadow decisions{shadowPairs.length > 0 && shadowOpen ? ` (${shadowPairs.length})` : ""}</h2>
+          <button type="button" onClick={() => setShadowOpen((open) => !open)}>
+            {shadowOpen ? "hide" : "show"}
+          </button>
+        </div>
+        {shadowOpen &&
+          (shadowPairs.length === 0 ? (
+            <p className="muted">no shadow decisions recorded for this run</p>
+          ) : (
+            <>
+              <p className="muted">
+                evidence only — shadow decisions never feed the active run
+              </p>
+              <table className="sessions-table">
+                <thead>
+                  <tr>
+                    <th>seq</th>
+                    <th>candidate policy</th>
+                    <th>kind</th>
+                    <th>candidate decision</th>
+                    <th>active (enacted)</th>
+                    <th>basis</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {shadowPairs.map(({ payload, active }) => (
+                    <tr key={payload.event_id}>
+                      <td className="mono event-seq">#{payload.sequence}</td>
+                      <td className="mono">
+                        {payload.policy_id} v{payload.policy_version}
+                      </td>
+                      <td>
+                        <span className="badge badge-muted">{payload.kind}</span>
+                      </td>
+                      <td className="mono">{payload.decision}</td>
+                      <td className="mono">{active}</td>
+                      <td className="muted mono">{payload.basis}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </>
+          ))}
       </section>
 
       <section className="panel">

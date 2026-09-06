@@ -399,6 +399,11 @@ export interface ConfigReportRow {
   mean_latency_seconds: number;
   mean_total_tokens: number;
   mean_human_interventions: number;
+  // Report schema v2 (PACS-017 M5): the extended Pareto axes. Always present
+  // — v1 artifacts are zero-filled by the store's read shim.
+  mean_context_tokens_used: number;
+  mean_context_items_dropped: number;
+  mean_recovery_events: number;
 }
 
 export interface EvalReport {
@@ -423,6 +428,68 @@ export async function listEvalReports(): Promise<EvalReportSummary[]> {
 /** One full stored report. 404 (ApiError) when the report id is unknown. */
 export function getEvalReport(reportId: string): Promise<EvalReport> {
   return request<EvalReport>(`/api/evals/${encodeURIComponent(reportId)}`);
+}
+
+// -- Candidate policy registry (PACS-017 M6) -----------------------------------
+
+export type PolicyLifecycle = "candidate" | "shadowed" | "benchmarked" | "promoted" | "retired";
+
+export interface PolicyRoutingInfo {
+  default_tier: string;
+  stall_escalation_threshold: number;
+  budget_pressure_remaining_fraction: number | null;
+}
+
+export interface PolicyAllocationInfo {
+  floor_tokens: number;
+  ceiling_tokens: number;
+  reserve_tokens: number;
+  step_tokens: number;
+  low_utilization_fraction: number;
+}
+
+export interface ExecutionPolicyInfo {
+  policy_id: string;
+  version: number;
+  routing: PolicyRoutingInfo;
+  context_allocation: PolicyAllocationInfo;
+  verify_read_only_turns: boolean;
+  worker_count: number | null;
+}
+
+/** One operator-owned registry record (policy + lifecycle + evidence basis). */
+export interface PolicyRecordInfo {
+  policy: ExecutionPolicyInfo;
+  lifecycle: PolicyLifecycle;
+  evidence_basis: string;
+  note: string;
+}
+
+/** Every registered policy record (PolicyRegistryStore.list), empty when none. */
+export async function listPolicies(): Promise<PolicyRecordInfo[]> {
+  const data = await request<{ policies: PolicyRecordInfo[] }>("/api/policies");
+  return data.policies;
+}
+
+/** The latest registered record for one policy id. 404 (ApiError) when absent. */
+export function getPolicy(policyId: string): Promise<PolicyRecordInfo> {
+  return request<PolicyRecordInfo>(`/api/policies/${encodeURIComponent(policyId)}`);
+}
+
+/** The updated record after promotion. 404 unknown id; 422 when the basis is
+ * blank or the lifecycle transition is not legal (promotion always passes
+ * through an evidence-gathering state first). */
+export function promotePolicy(
+  policyId: string,
+  evidenceBasis: string,
+  note?: string,
+): Promise<PolicyRecordInfo> {
+  // `confirm: true` is only ever sent from the confirmation dialog.
+  return post<PolicyRecordInfo>(`/api/policies/${encodeURIComponent(policyId)}/promote`, {
+    evidence_basis: evidenceBasis,
+    note: note ?? "",
+    confirm: true,
+  });
 }
 
 export function sessionWsUrl(runId: string): string {

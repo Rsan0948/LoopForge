@@ -1,5 +1,5 @@
 import type { ReactElement } from "react";
-import type { RunStatus } from "./api";
+import type { PolicyLifecycle, RunStatus } from "./api";
 
 const STATUS_CLASS: Record<RunStatus, string> = {
   created: "badge badge-muted",
@@ -18,6 +18,19 @@ const STATUS_CLASS: Record<RunStatus, string> = {
 
 export function StatusBadge({ status }: { status: RunStatus }): ReactElement {
   return <span className={STATUS_CLASS[status] ?? "badge"}>{status}</span>;
+}
+
+const LIFECYCLE_CLASS: Record<PolicyLifecycle, string> = {
+  candidate: "badge badge-muted",
+  shadowed: "badge badge-active",
+  benchmarked: "badge badge-amber",
+  promoted: "badge badge-green",
+  retired: "badge badge-muted",
+};
+
+/** Lifecycle badge for the operator-owned policy registry (PACS-017 M6). */
+export function LifecycleBadge({ lifecycle }: { lifecycle: PolicyLifecycle }): ReactElement {
+  return <span className={LIFECYCLE_CLASS[lifecycle] ?? "badge"}>{lifecycle}</span>;
 }
 
 export function ErrorBanner({ message, onDismiss }: { message: string; onDismiss?: () => void }): ReactElement {

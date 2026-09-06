@@ -9,7 +9,7 @@ import {
   type ProfileInfo,
   type SessionEntry,
 } from "../api";
-import { navigateToEvals, navigateToSession } from "../App";
+import { navigateToEvals, navigateToPolicies, navigateToSession } from "../App";
 import { formatAge, formatCost, formatTime, shortRunId, truncate } from "../format";
 import { ErrorBanner, StatusBadge } from "../widgets";
 
@@ -473,6 +473,16 @@ export default function SessionsView(): ReactElement {
             }}
           >
             evals →
+          </a>
+          <a
+            className="link-button"
+            href="#/policies"
+            onClick={(event) => {
+              event.preventDefault();
+              navigateToPolicies();
+            }}
+          >
+            policies →
           </a>
           <button type="button" onClick={() => void refresh()}>
             Refresh

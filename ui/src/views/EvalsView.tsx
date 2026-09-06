@@ -6,7 +6,7 @@ import {
   type BenchmarkSuiteInfo,
   type EvalReportSummary,
 } from "../api";
-import { navigateToEval } from "../App";
+import { navigateToEval, navigateToPolicies } from "../App";
 import { formatTime } from "../format";
 import { ErrorBanner } from "../widgets";
 
@@ -95,6 +95,16 @@ export default function EvalsView(): ReactElement {
       <section className="panel">
         <div className="panel-header">
           <h2>Eval reports</h2>
+          <a
+            className="link-button"
+            href="#/policies"
+            onClick={(event) => {
+              event.preventDefault();
+              navigateToPolicies();
+            }}
+          >
+            policies →
+          </a>
           <button type="button" onClick={() => void refresh()}>
             Refresh
           </button>
