@@ -10,11 +10,18 @@ from pathlib import Path
 
 from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
 from loopforge.adapters.deepseek_model import DeepSeekModel
+from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.scripted import ObservationContainsVerifier, ScriptedModel, ScriptedTools
+from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.adapters.system_time import SystemClock, SystemSleeper
 from loopforge.adapters.telemetry import InMemoryTelemetry
+from loopforge.application.counterfactual import (
+    CounterfactualPrefixError,
+    CounterfactualResult,
+    counterfactual_redrive,
+)
 from loopforge.application.eval_runner import run_trials
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
@@ -25,6 +32,7 @@ from loopforge.domain.benchmarks import (
 )
 from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.events import ArtifactRecorded, RunStopped
+from loopforge.domain.policies import UnknownPolicyError, resolve_policy
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -38,7 +46,7 @@ from loopforge.domain.tooling import (
     SideEffectClass,
     ToolMetadata,
 )
-from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel, RunStatus
+from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel, RunId, RunStatus
 from loopforge.domain.workspace import (
     AcceptanceCriteria,
     FixtureFile,
@@ -60,6 +68,7 @@ from loopforge.entrypoints.repair import (
     build_container_repair_runtime,
     build_trusted_repair_runtime,
 )
+from loopforge.entrypoints.replay import build_counterfactual_runtime
 from loopforge.ports.model import ModelPort
 from loopforge.ports.tools import ToolResult
 from loopforge.workloads.benchmarks import (
@@ -657,6 +666,71 @@ def _eval_model_factory(
     return factory
 
 
+def _print_counterfactual(result: CounterfactualResult) -> None:
+    print(
+        f"replay run={result.run_id} prefix={result.prefix_length}/"
+        f"{result.historical_length} outcome={result.outcome.value}"
+    )
+    redriven = result.redriven_status.value if result.redriven_status is not None else "unknown"
+    print(f"historical status={result.historical_status.value} redriven status={redriven}")
+    if result.first_divergence_sequence is not None:
+        print(f"first divergence: sequence {result.first_divergence_sequence}")
+    print(f"detail: {result.detail}")
+
+
+def _replay(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps one return per outcome
+    """Counterfactual re-drive of a recorded run from a stream prefix.
+
+    Reads the historical stream from a SQLite event store (the durable
+    store the ``serve`` command writes), re-drives deterministically from
+    ``--prefix`` with the recorded model/tool/verification turns, and
+    reports the closed outcome vocabulary. ``--policy`` re-drives under a
+    built-in candidate policy; without it the honest legacy cadence
+    applies. Analysis only — the historical store is never written.
+    """
+    if not args.run_id:
+        print("error: replay requires --run-id ID")
+        return 2
+    if args.sqlite is None:
+        print("error: replay requires --sqlite PATH (the durable event store)")
+        return 2
+    if args.prefix is None or args.prefix < 1:
+        print("error: replay requires --prefix N (1..historical stream length)")
+        return 2
+    try:
+        policy = resolve_policy(args.policy) if args.policy is not None else None
+    except UnknownPolicyError as exc:
+        print(f"error: {exc}")
+        return 2
+    store = SQLiteEventStore(Path(args.sqlite), codec=JsonEventCodec())
+    run_id = RunId(args.run_id)
+    historical = store.events_for(run_id)
+    if not historical:
+        print(f"error: unknown run {args.run_id!r} in {args.sqlite}")
+        return 1
+    runtime = build_counterfactual_runtime(
+        historical,
+        store=InMemoryEventStore(),
+        budget=BudgetLimit(max_cost_usd=args.max_cost, max_iterations=args.max_iterations),
+        policy=policy,
+    )
+    try:
+        result = counterfactual_redrive(
+            runtime=runtime,
+            run_id=run_id,
+            historical=historical,
+            prefix_length=args.prefix,
+        )
+    except CounterfactualPrefixError as exc:
+        print(f"error: {exc}")
+        return 1
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 2
+    _print_counterfactual(result)
+    return 0
+
+
 def _print_eval_report(report: BenchmarkReport, *, saved_path: Path | None = None) -> None:
     # Subset reports stay self-describing: --tasks <subset> still pins the
     # full-suite lock_hash, so the header names the covered task ids.
@@ -830,6 +904,7 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
             "loop",
             "serve",
             "eval",
+            "replay",
         ],
     )
     parser.add_argument(
@@ -941,7 +1016,41 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         "--sqlite",
         metavar="PATH",
         default=None,
-        help="serve only: use a SQLite event store at PATH instead of Postgres",
+        help="serve/replay: use a SQLite event store at PATH instead of Postgres",
+    )
+    parser.add_argument(
+        "--run-id",
+        metavar="ID",
+        default=None,
+        help="replay only: id of the recorded run to re-drive",
+    )
+    parser.add_argument(
+        "--prefix",
+        metavar="N",
+        type=int,
+        default=None,
+        help="replay only: re-drive from the first N events of the recorded stream",
+    )
+    parser.add_argument(
+        "--policy",
+        metavar="ID",
+        default=None,
+        help="replay only: built-in candidate policy to re-drive under "
+        "(default: legacy cadence, no candidate knobs)",
+    )
+    parser.add_argument(
+        "--max-cost",
+        metavar="USD",
+        type=float,
+        default=1.0,
+        help="replay only: control budget cost cap for the re-drive (default: 1.0)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        metavar="N",
+        type=int,
+        default=8,
+        help="replay only: control budget iteration cap for the re-drive (default: 8)",
     )
     parser.add_argument(
         "--data-dir",
@@ -996,6 +1105,8 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         )
     if args.command == "eval":
         return _eval(args)
+    if args.command == "replay":
+        return _replay(args)
     if args.command == "serve":
         return _serve(
             host=args.host,

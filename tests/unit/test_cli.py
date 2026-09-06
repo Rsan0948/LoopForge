@@ -12,10 +12,35 @@ import pytest
 from hypothesis import HealthCheck, example, given, settings
 from hypothesis import strategies as st
 
-from loopforge.adapters.scripted import FixedClock
+from loopforge.adapters.context import BudgetedContextBuilder, CharsPerTokenCounter
+from loopforge.adapters.json_events import JsonEventCodec
+from loopforge.adapters.scripted import (
+    FixedClock,
+    ObservationContainsVerifier,
+    RecordingSleeper,
+    ScriptedModel,
+    ScriptedTools,
+)
+from loopforge.adapters.sqlite_events import SQLiteEventStore
+from loopforge.application.runtime import Runtime
+from loopforge.domain.actions import ActionProposal
 from loopforge.domain.benchmarks import BenchmarkReport, ConfigReport
+from loopforge.domain.context_lifecycle import ContextTokenBudget
+from loopforge.domain.policy import ControlPolicy, PermissionPolicy
+from loopforge.domain.prompts import default_controller_template
+from loopforge.domain.reliability import ReliabilityPolicy
+from loopforge.domain.tooling import (
+    ApprovalClass,
+    DataSensitivity,
+    IdempotencyClass,
+    RetryClass,
+    SideEffectClass,
+    ToolMetadata,
+)
+from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel
 from loopforge.entrypoints.cli import build_ollama_model, main
 from loopforge.entrypoints.eval import EvalReportStore
+from loopforge.ports.tools import ToolResult
 from loopforge.workloads.fixtures import adder_repair_task
 
 
@@ -764,3 +789,156 @@ def test_eval_trusted_task_names_the_platform_cause_on_unsupported_hosts(
     assert "rejects setrlimit(RLIMIT_AS)" in captured.out
     assert "scripted model exhausted" not in captured.out
     assert list(tmp_path.glob("*.json")) == []
+
+
+# --- replay: counterfactual re-drive of a recorded run (PACS-017 M4) -------------
+
+_REPLAY_NOW = datetime(2026, 9, 5, tzinfo=UTC)
+
+
+def _seed_replay_run(path: Path) -> str:
+    """Record one deterministic scripted run into a SQLite event store."""
+    metadata = ToolMetadata(
+        name="inspect",
+        risk=RiskLevel.READ_ONLY,
+        required_permission=Permission.READ,
+        side_effect=SideEffectClass.READ_ONLY,
+        retry=RetryClass.NEVER,
+        idempotency=IdempotencyClass.NATURAL,
+        approval=ApprovalClass.NONE,
+        timeout_seconds=5.0,
+        sensitivity=DataSensitivity.INTERNAL,
+    )
+    store = SQLiteEventStore(path, codec=JsonEventCodec())
+    runtime = Runtime(
+        model=ScriptedModel([ActionProposal(ActionId("a1"), "inspect", {})]),
+        tools=ScriptedTools([ToolResult(ok=True, observation="all done")], metadata=[metadata]),
+        verifier=ObservationContainsVerifier("done"),
+        store=store,
+        control=ControlPolicy(BudgetLimit(max_cost_usd=5.0, max_iterations=8)),
+        permissions=PermissionPolicy(frozenset({Permission.READ})),
+        reliability=ReliabilityPolicy(),
+        context=BudgetedContextBuilder(
+            FixedClock(_REPLAY_NOW),
+            CharsPerTokenCounter(),
+            template=default_controller_template(),
+            token_budget=ContextTokenBudget(max_tokens=4096, reserve_tokens=256),
+        ),
+        clock=FixedClock(_REPLAY_NOW),
+        sleeper=RecordingSleeper(),
+        verify_read_only_turns=True,
+    )
+    return str(runtime.run("replay probe").run_id)
+
+
+def test_replay_redrives_a_recorded_run_and_reports_matched(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    store_path = tmp_path / "events.db"
+    run_id = _seed_replay_run(store_path)
+    _argv(
+        monkeypatch,
+        "replay",
+        "--sqlite",
+        str(store_path),
+        "--run-id",
+        run_id,
+        "--prefix",
+        "2",
+    )
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert f"replay run={run_id} prefix=2/11 outcome=matched" in out
+    assert "historical status=succeeded redriven status=succeeded" in out
+    assert "detail:" in out
+
+
+def test_replay_from_a_planning_prefix_reports_diverged(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    store_path = tmp_path / "events.db"
+    run_id = _seed_replay_run(store_path)
+    _argv(
+        monkeypatch,
+        "replay",
+        "--sqlite",
+        str(store_path),
+        "--run-id",
+        run_id,
+        "--prefix",
+        "1",
+    )
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "outcome=diverged" in out
+    assert "first divergence: sequence 2" in out
+
+
+def test_replay_reports_unknown_run(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    store_path = tmp_path / "events.db"
+    _seed_replay_run(store_path)
+    _argv(
+        monkeypatch,
+        "replay",
+        "--sqlite",
+        str(store_path),
+        "--run-id",
+        "run_000000000000",
+        "--prefix",
+        "2",
+    )
+
+    assert main() == 1
+
+    assert "error: unknown run" in capsys.readouterr().out
+
+
+def test_replay_rejects_an_unknown_policy(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    store_path = tmp_path / "events.db"
+    run_id = _seed_replay_run(store_path)
+    _argv(
+        monkeypatch,
+        "replay",
+        "--sqlite",
+        str(store_path),
+        "--run-id",
+        run_id,
+        "--prefix",
+        "2",
+        "--policy",
+        "no-such-policy",
+    )
+
+    assert main() == 2
+
+    assert "error:" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        (),
+        ("--run-id", "run_000000000000"),
+        ("--prefix", "2"),
+    ],
+    ids=["no-flags", "no-prefix", "no-run-id"],
+)
+def test_replay_requires_sqlite_run_id_and_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    extra: tuple[str, ...],
+) -> None:
+    _argv(monkeypatch, "replay", *extra)
+
+    assert main() == 2
+
+    assert "error: replay requires" in capsys.readouterr().out

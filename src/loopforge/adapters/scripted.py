@@ -85,6 +85,25 @@ class ObservationContainsVerifier:
         return VerificationResult(passed=passed, summary=f"expected {self._expected!r}")
 
 
+class ScriptedVerifier:
+    """Deterministic verifier replaying recorded outcomes in stream order.
+
+    Used by counterfactual replay (PACS-017 M4): the re-driven run
+    verifies exactly what the historical run verified, so suffix
+    differences are attributable to the knobs under study alone.
+    """
+
+    def __init__(self, results: list[VerificationResult]) -> None:
+        self._results = deque(results)
+
+    def verify(self, state: RunState) -> VerificationResult:
+        del state
+        if not self._results:
+            msg = "scripted verifier results exhausted"
+            raise RuntimeError(msg)
+        return self._results.popleft()
+
+
 class FixedClock:
     def __init__(self, now: datetime) -> None:
         self._now = now
