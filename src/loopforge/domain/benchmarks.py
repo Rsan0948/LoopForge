@@ -324,6 +324,13 @@ class ConfigReport:
     mean_latency_seconds: float
     mean_total_tokens: float
     mean_human_interventions: float
+    # PACS-017 M5 Pareto axes (report schema v2): context-efficiency and
+    # recovery, averaged over the trial TrajectoryMetrics. Defaults keep
+    # schema-v1 artifacts loadable — v1 files never recorded these means,
+    # so the store's v1 read path fills the honest zero default.
+    mean_context_tokens_used: float = 0.0
+    mean_context_items_dropped: float = 0.0
+    mean_recovery_events: float = 0.0
 
     def __post_init__(self) -> None:
         _validate_id(self.config_id, field_name="config_id")
@@ -359,6 +366,13 @@ class ConfigReport:
         _validate_finite_nonnegative(
             self.mean_human_interventions, field_name="mean_human_interventions"
         )
+        _validate_finite_nonnegative(
+            self.mean_context_tokens_used, field_name="mean_context_tokens_used"
+        )
+        _validate_finite_nonnegative(
+            self.mean_context_items_dropped, field_name="mean_context_items_dropped"
+        )
+        _validate_finite_nonnegative(self.mean_recovery_events, field_name="mean_recovery_events")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

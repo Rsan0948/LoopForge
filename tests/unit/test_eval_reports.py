@@ -346,3 +346,105 @@ def test_list_summarizes_reports_in_created_at_order(tmp_path: Path) -> None:
     assert earlier.task_ids == ("bench-provider-outage", "bench-transient-api")
     assert earlier.created_at == EARLIER.isoformat()
     assert summaries[1].created_at == LATER.isoformat()
+
+
+# --- PACS-017 M5: report schema v2 + v1 read compatibility ------------------------
+
+_V2_MEAN_KEYS = (
+    "mean_context_tokens_used",
+    "mean_context_items_dropped",
+    "mean_recovery_events",
+)
+
+
+def _rewrite_as_v1(directory: Path, report_id: str) -> None:
+    """Downgrade a stored artifact to the v1 shape (pre context/recovery means)."""
+
+    def mutate(payload: dict[str, object]) -> None:
+        payload["schema_version"] = 1
+        report = cast("dict[str, object]", payload["report"])
+        for entry in cast("list[dict[str, object]]", report["config_reports"]):
+            for key in _V2_MEAN_KEYS:
+                del entry[key]
+
+    _rewrite(directory, report_id, mutate)
+
+
+def test_v1_artifacts_load_with_honest_zero_defaults(tmp_path: Path) -> None:
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    store.save(_report())
+    _rewrite_as_v1(tmp_path, "eval-report-1")
+
+    report = store.load("eval-report-1")
+
+    assert report.report_id == "eval-report-1"
+    for entry in report.config_reports:
+        # v1 never recorded these means: the zero default is the honest
+        # absence of data, not a measurement.
+        assert entry.mean_context_tokens_used == 0.0
+        assert entry.mean_context_items_dropped == 0.0
+        assert entry.mean_recovery_events == 0.0
+
+
+def test_v1_artifact_with_v2_keys_fails_closed_as_drifted(tmp_path: Path) -> None:
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    store.save(_report())
+    _rewrite_as_v1(tmp_path, "eval-report-1")
+
+    def mutate(payload: dict[str, object]) -> None:
+        report = cast("dict[str, object]", payload["report"])
+        entries = cast("list[dict[str, object]]", report["config_reports"])
+        entries[0]["mean_recovery_events"] = 3.0
+
+    _rewrite(tmp_path, "eval-report-1", mutate)
+
+    with pytest.raises(EvalReportStoreError, match="keys drifted"):
+        store.load("eval-report-1")
+
+
+def test_round_trip_preserves_the_v2_means(tmp_path: Path) -> None:
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    entry = ConfigReport(
+        config_id="cfg-a",
+        task_id="bench-transient-api",
+        trials=2,
+        successes=2,
+        false_successes=0,
+        success_rate=1.0,
+        false_success_rate=0.0,
+        mean_cost_usd=0.02,
+        mean_latency_seconds=1.5,
+        mean_total_tokens=240.0,
+        mean_human_interventions=0.0,
+        mean_context_tokens_used=300.0,
+        mean_context_items_dropped=4.0,
+        mean_recovery_events=2.0,
+    )
+    report = BenchmarkReport(
+        report_id="eval-v2-means",
+        suite_version="1.0.0",
+        lock_hash=LOCK_HASH,
+        config_reports=(entry,),
+        pareto_config_ids=("cfg-a",),
+    )
+
+    store.save(report)
+
+    assert store.load("eval-v2-means") == report
+
+
+def test_saved_artifacts_are_schema_v2(tmp_path: Path) -> None:
+    store = EvalReportStore(tmp_path, clock=FixedClock(EARLIER))
+    store.save(_report())
+    payload = cast(
+        "dict[str, object]",
+        json.loads((tmp_path / "eval-report-1.json").read_text(encoding="utf-8")),
+    )
+    assert payload["schema_version"] == 2
+    entries = cast(
+        "list[dict[str, object]]",
+        cast("dict[str, object]", payload["report"])["config_reports"],
+    )
+    for entry in entries:
+        for key in _V2_MEAN_KEYS:
+            assert key in entry

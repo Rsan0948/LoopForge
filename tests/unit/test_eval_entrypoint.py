@@ -688,3 +688,69 @@ def test_driver_removes_only_its_own_fallback_workspaces_dirs(
     assert result.status is RunStatus.SUCCEEDED
     assert len(created) == 1
     assert not Path(created[0]).exists()
+
+
+# --- PACS-017 M5: candidate-policy presets + fail-closed resolution ---------------
+
+from loopforge.domain.policies import UnknownPolicyError  # noqa: E402
+from loopforge.entrypoints.eval import (  # noqa: E402
+    _policy_for,  # pyright: ignore[reportPrivateUsage] - unit pins target the wiring internals
+)
+
+_POLICY_PRESETS = ("policy-baseline", "policy-adaptive-context", "policy-patient-router")
+
+
+def test_policy_presets_are_pinned() -> None:
+    assert resolve_configurations(("policy-baseline",)) == (
+        EvalConfiguration(
+            config_id="policy-baseline",
+            max_cost_usd=1.0,
+            max_iterations=8,
+            policy_id="baseline",
+            policy_version=1,
+        ),
+    )
+    assert resolve_configurations(("policy-adaptive-context",)) == (
+        EvalConfiguration(
+            config_id="policy-adaptive-context",
+            max_cost_usd=1.0,
+            max_iterations=8,
+            policy_id="adaptive-context",
+            policy_version=1,
+        ),
+    )
+    assert resolve_configurations(("policy-patient-router",)) == (
+        EvalConfiguration(
+            config_id="policy-patient-router",
+            max_cost_usd=1.0,
+            max_iterations=8,
+            policy_id="patient-router",
+            policy_version=1,
+        ),
+    )
+
+
+def test_policy_presets_resolve_against_the_code_owned_registry() -> None:
+    for name in _POLICY_PRESETS:
+        (config,) = resolve_configurations((name,))
+        policy = _policy_for(config)
+        assert policy is not None
+        assert policy.policy_id == config.policy_id
+        assert policy.version == config.policy_version
+
+
+def test_policy_for_returns_none_without_a_reference() -> None:
+    (config,) = resolve_configurations(("baseline",))
+    assert _policy_for(config) is None
+
+
+def test_policy_for_fails_closed_on_an_unresolvable_reference() -> None:
+    config = EvalConfiguration(
+        config_id="ghost-arm",
+        max_cost_usd=1.0,
+        max_iterations=8,
+        policy_id="baseline",
+        policy_version=99,
+    )
+    with pytest.raises(UnknownPolicyError):
+        _policy_for(config)

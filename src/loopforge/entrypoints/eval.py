@@ -59,6 +59,7 @@ from loopforge.domain.benchmarks import (
 )
 from loopforge.domain.context_lifecycle import ContextAccounting
 from loopforge.domain.events import Event, VerificationFailed, VerificationPassed
+from loopforge.domain.policies import ExecutionPolicy, resolve_policy
 from loopforge.domain.routing import ModelTier
 from loopforge.domain.security import SandboxCapabilities
 from loopforge.domain.state import RunState
@@ -84,6 +85,7 @@ from loopforge.workloads.benchmarks import (
     build_benchmark_binding,
 )
 from loopforge.workloads.repair import (
+    REPAIR_MODEL_REQUIREMENTS,
     OrchestratedRepairTask,
     RepairTask,
     scripted_repair_actions,
@@ -192,6 +194,18 @@ def _narrow_budget(config: EvalConfiguration, *, orchestrated: bool) -> BudgetLi
 def _narrow_no_progress_limit(config: EvalConfiguration) -> int:
     """Tighten the stall threshold against the code-owned envelope; never widen it."""
     return min(config.no_progress_limit, _ENVELOPE_NO_PROGRESS_LIMIT)
+
+
+def _policy_for(config: EvalConfiguration) -> ExecutionPolicy | None:
+    """Resolve a configuration's candidate policy reference, fail closed.
+
+    The registry is code-owned and versioned (PACS-017 M1): an unknown id
+    or version raises ``UnknownPolicyError`` — a trial can never run under
+    an invented policy.
+    """
+    if config.policy_id is None:
+        return None
+    return resolve_policy(config.policy_id, version=config.policy_version)
 
 
 class _CheckNameProbeSandbox:
@@ -360,16 +374,27 @@ class EvalTrialDriver:
         binding = build_benchmark_binding(spec.task_id, executable=executable)
         task = binding.task
         store = InMemoryEventStore()
+        policy = _policy_for(config)
         deps = RepairRuntimeDeps(
             store=store,
             clock=self._clock_factory(),
             sleeper=self._sleeper_factory(),
             telemetry=self._telemetry_factory() if self._telemetry_factory is not None else None,
             model=self._model_for(binding),
-            model_tier=self._model_tier,
+            model_tier=(policy.routing.default_tier if policy is not None else self._model_tier),
             budget=_narrow_budget(config, orchestrated=isinstance(task, OrchestratedRepairTask)),
             no_progress_limit=_narrow_no_progress_limit(config),
-            verify_read_only_turns=config.verify_read_only_turns,
+            verify_read_only_turns=(
+                policy.verify_read_only_turns
+                if policy is not None
+                else config.verify_read_only_turns
+            ),
+            context_allocation=policy.context_allocation if policy is not None else None,
+            routing=(
+                policy.routing.for_requirements(REPAIR_MODEL_REQUIREMENTS)
+                if policy is not None
+                else None
+            ),
         )
         wiring = _TrialWiring(
             deps=deps,
@@ -706,6 +731,31 @@ _EVAL_PRESETS: Final = {
         max_iterations=8,
         verify_read_only_turns=True,
     ),
+    # PACS-017 M5 candidate-policy arms: each carries a versioned built-in
+    # ExecutionPolicy reference (resolved fail-closed against the code-owned
+    # registry at trial time), so candidate-vs-active comparisons run
+    # through the same locked laboratory as every other configuration.
+    "policy-baseline": EvalConfiguration(
+        config_id="policy-baseline",
+        max_cost_usd=1.0,
+        max_iterations=8,
+        policy_id="baseline",
+        policy_version=1,
+    ),
+    "policy-adaptive-context": EvalConfiguration(
+        config_id="policy-adaptive-context",
+        max_cost_usd=1.0,
+        max_iterations=8,
+        policy_id="adaptive-context",
+        policy_version=1,
+    ),
+    "policy-patient-router": EvalConfiguration(
+        config_id="policy-patient-router",
+        max_cost_usd=1.0,
+        max_iterations=8,
+        policy_id="patient-router",
+        policy_version=1,
+    ),
 }
 
 
@@ -733,13 +783,17 @@ def resolve_configurations(names: tuple[str, ...]) -> tuple[EvalConfiguration, .
 # Operator-owned JSON report store.
 # ---------------------------------------------------------------------------
 
-REPORT_SCHEMA_VERSION: Final = 1
+REPORT_SCHEMA_VERSION: Final = 2
+"""Current report schema version. v2 (PACS-017 M5) adds the context-efficiency
+and recovery means to ``ConfigReport``; v1 artifacts stay loadable through the
+migration shim in ``_report_from_dict`` (missing means fill the honest zero
+default — v1 files never recorded them)."""
 
 _REPORT_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _REPORT_KEYS: Final = frozenset(
     {"report_id", "suite_version", "lock_hash", "config_reports", "pareto_config_ids"}
 )
-_CONFIG_REPORT_KEYS: Final = frozenset(
+_CONFIG_REPORT_KEYS_V1: Final = frozenset(
     {
         "config_id",
         "task_id",
@@ -754,6 +808,18 @@ _CONFIG_REPORT_KEYS: Final = frozenset(
         "mean_human_interventions",
     }
 )
+_CONFIG_REPORT_KEYS: Final = _CONFIG_REPORT_KEYS_V1 | frozenset(
+    {
+        "mean_context_tokens_used",
+        "mean_context_items_dropped",
+        "mean_recovery_events",
+    }
+)
+_CONFIG_REPORT_V2_DEFAULTS: Final = {
+    "mean_context_tokens_used": 0.0,
+    "mean_context_items_dropped": 0.0,
+    "mean_recovery_events": 0.0,
+}
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -791,6 +857,9 @@ def report_to_dict(report: BenchmarkReport) -> dict[str, object]:
                 "mean_latency_seconds": entry.mean_latency_seconds,
                 "mean_total_tokens": entry.mean_total_tokens,
                 "mean_human_interventions": entry.mean_human_interventions,
+                "mean_context_tokens_used": entry.mean_context_tokens_used,
+                "mean_context_items_dropped": entry.mean_context_items_dropped,
+                "mean_recovery_events": entry.mean_recovery_events,
             }
             for entry in report.config_reports
         ],
@@ -814,18 +883,27 @@ def _require_keys(data: object, expected: frozenset[str], *, what: str) -> dict[
     return mapping
 
 
-def _report_from_dict(data: object) -> BenchmarkReport:
-    """Rebuild a report through the domain constructors; tampering fails loudly."""
+def _report_from_dict(data: object, *, schema_version: int) -> BenchmarkReport:
+    """Rebuild a report through the domain constructors; tampering fails loudly.
+
+    v1 artifacts predate the context/recovery means: their exact v1 key set
+    is enforced first, then the missing means fill the honest zero default
+    so domain revalidation stays the single authority for both versions.
+    """
     fields = _require_keys(data, _REPORT_KEYS, what="eval report")
     entries = fields["config_reports"]
     if not isinstance(entries, list):
         msg = "eval report config_reports must be a list"
         raise EvalReportStoreError(msg)
+    expected_keys = _CONFIG_REPORT_KEYS if schema_version == 2 else _CONFIG_REPORT_KEYS_V1
     try:
-        config_reports = tuple(
-            ConfigReport(**_require_keys(entry, _CONFIG_REPORT_KEYS, what="config report"))  # type: ignore[arg-type]
-            for entry in cast("list[object]", entries)
-        )
+        reports: list[ConfigReport] = []
+        for entry in cast("list[object]", entries):
+            entry_fields = _require_keys(entry, expected_keys, what="config report")
+            if schema_version == 1:
+                entry_fields = {**_CONFIG_REPORT_V2_DEFAULTS, **entry_fields}
+            reports.append(ConfigReport(**entry_fields))  # type: ignore[arg-type]
+        config_reports = tuple(reports)
         return BenchmarkReport(
             report_id=fields["report_id"],  # type: ignore[arg-type]
             suite_version=fields["suite_version"],  # type: ignore[arg-type]
@@ -905,17 +983,19 @@ class EvalReportStore:
             frozenset({"schema_version", "created_at", "report"}),
             what="eval report file",
         )
-        if envelope["schema_version"] != REPORT_SCHEMA_VERSION:
+        if envelope["schema_version"] not in (1, REPORT_SCHEMA_VERSION):
             msg_2 = (
                 f"eval report schema version {envelope['schema_version']!r} is not "
-                f"supported (expected {REPORT_SCHEMA_VERSION}): {path}"
+                f"supported (expected 1..{REPORT_SCHEMA_VERSION}): {path}"
             )
             raise EvalReportStoreError(msg_2)
         created_at = envelope["created_at"]
         if not isinstance(created_at, str):
             msg_3 = f"eval report created_at must be a string: {path}"
             raise EvalReportStoreError(msg_3)
-        return created_at, _report_from_dict(envelope["report"])
+        return created_at, _report_from_dict(
+            envelope["report"], schema_version=cast("int", envelope["schema_version"])
+        )
 
     def load(self, report_id: str) -> BenchmarkReport:
         path = self._path_for(report_id)

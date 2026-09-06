@@ -769,3 +769,148 @@ def test_run_trials_echoes_but_never_forges_the_lock() -> None:
             suite_version="1.0.0",
             lock_hash="not-hex",
         )
+
+
+# --- PACS-017 M5: policy references, context/recovery axes -----------------------
+
+from loopforge.domain.events import RetryScheduled  # noqa: E402
+
+
+def _retry_scheduled(ids: _EventIds, *, at: float) -> RetryScheduled:
+    event_id, run_id, sequence = ids.next()
+    return RetryScheduled(
+        event_id=event_id,
+        run_id=run_id,
+        occurred_at=_at(at),
+        sequence=sequence,
+        action_id=ActionId(f"{run_id}-a{sequence}"),
+        next_attempt=2,
+        delay_seconds=0.5,
+        reason_code="RETRY_TRANSIENT_FAILURE",
+    )
+
+
+def _context_outcome(
+    run_id: str,
+    *,
+    cost: float = 0.02,
+    latency: float = 5.0,
+    tokens: int = 120,
+    retries: int = 0,
+) -> TrialRunResult:
+    """Canned success whose context footprint and recovery count are pinned."""
+    ids = _EventIds(run_id)
+    events: list[Event] = [
+        _started(ids, at=0.0),
+        _debit(ids, cost=cost, tokens=tokens, at=1.0),
+    ]
+    events.extend(_retry_scheduled(ids, at=1.2) for _ in range(retries))
+    events.extend(
+        [
+            _turn_recorded(ids, at=1.5),
+            _verified(ids, at=2.0),
+            _stopped(ids, StopReason.SUCCESS_VERIFIED, at=latency),
+        ]
+    )
+    return _result(run_id, RunStatus.SUCCEEDED, tuple(events))
+
+
+def test_eval_configuration_accepts_a_versioned_policy_reference() -> None:
+    config = _config("cfg-policy", policy_id="adaptive-context", policy_version=1)
+    assert config.policy_id == "adaptive-context"
+    assert config.policy_version == 1
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"policy_id": "adaptive-context"},
+        {"policy_version": 1},
+        {"policy_id": "bad id!", "policy_version": 1},
+        {"policy_id": "x" * 65, "policy_version": 1},
+        {"policy_id": "ok", "policy_version": 0},
+        {"policy_id": "ok", "policy_version": -1},
+        {"policy_id": "ok", "policy_version": True},
+    ],
+)
+def test_eval_configuration_rejects_bad_policy_references(
+    overrides: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError, match="policy_"):
+        _config("cfg-x", **overrides)
+
+
+def test_aggregate_includes_context_efficiency_and_recovery_means() -> None:
+    spec = _spec("task-a")
+    configs = (_config("cfg-a"),)
+    driver = _StubDriver({("cfg-a", "task-a"): _context_outcome("run-a", tokens=320, retries=2)})
+    report = _run((spec,), configs, 2, driver)
+    (entry,) = report.config_reports
+    # _debit(tokens=320) debits 300 input tokens: the context peak per trial.
+    assert entry.mean_context_tokens_used == 300.0
+    assert entry.mean_recovery_events == 2.0
+    assert entry.mean_context_items_dropped == 0.0
+
+
+def test_pareto_dominance_counts_context_efficiency() -> None:
+    spec = _spec("task-a")
+    configs = (_config("cfg-lean"), _config("cfg-wide"))
+    driver = _StubDriver(
+        {
+            # Identical legacy axes; cfg-lean assembles smaller contexts.
+            ("cfg-lean", "task-a"): _context_outcome("run-lean", tokens=120),
+            ("cfg-wide", "task-a"): _context_outcome("run-wide", tokens=420),
+        }
+    )
+    report = _run((spec,), configs, 1, driver)
+    assert report.pareto_config_ids == ("cfg-lean",)
+
+
+def test_pareto_dominance_counts_recovery_events() -> None:
+    spec = _spec("task-a")
+    configs = (_config("cfg-steady"), _config("cfg-flailing"))
+    driver = _StubDriver(
+        {
+            # Identical legacy and context axes; cfg-steady recovers less.
+            ("cfg-steady", "task-a"): _context_outcome("run-steady"),
+            ("cfg-flailing", "task-a"): _context_outcome("run-flailing", retries=2),
+        }
+    )
+    report = _run((spec,), configs, 1, driver)
+    assert report.pareto_config_ids == ("cfg-steady",)
+
+
+def test_pareto_retains_context_recovery_tradeoffs() -> None:
+    spec = _spec("task-a")
+    configs = (_config("cfg-lean-flailing"), _config("cfg-wide-steady"))
+    driver = _StubDriver(
+        {
+            ("cfg-lean-flailing", "task-a"): _context_outcome("run-lf", retries=2),
+            ("cfg-wide-steady", "task-a"): _context_outcome("run-ws", tokens=420),
+        }
+    )
+    report = _run((spec,), configs, 1, driver)
+    assert report.pareto_config_ids == ("cfg-lean-flailing", "cfg-wide-steady")
+
+
+def test_candidate_vs_active_laboratory_comparison_is_deterministic() -> None:
+    """The M5 A/B contract: active config vs policy-carrying candidate config,
+    same locked suite, same scripted outcomes, byte-identical reports."""
+    spec = _spec("task-a")
+    configs = (
+        _config("baseline"),
+        _config("policy-adaptive-context", policy_id="adaptive-context", policy_version=1),
+    )
+    outcomes = {
+        ("baseline", "task-a"): _context_outcome("run-active", tokens=420),
+        ("policy-adaptive-context", "task-a"): _context_outcome("run-candidate"),
+    }
+    report = _run((spec,), configs, 2, _StubDriver(outcomes))
+    again = _run((spec,), configs, 2, _StubDriver(outcomes))
+    assert report == again
+    assert {entry.config_id for entry in report.config_reports} == {
+        "baseline",
+        "policy-adaptive-context",
+    }
+    # Same success/cost/latency; the candidate's leaner contexts dominate.
+    assert report.pareto_config_ids == ("policy-adaptive-context",)

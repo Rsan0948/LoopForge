@@ -741,14 +741,16 @@ def _print_eval_report(report: BenchmarkReport, *, saved_path: Path | None = Non
     print(f"tasks covered ({len(task_ids)}): {', '.join(task_ids)}")
     print(
         f"{'config':<14} {'task':<26} {'trials':>6} {'success':>8} "
-        f"{'false-succ':>10} {'cost':>9} {'latency':>9} {'interv':>7}"
+        f"{'false-succ':>10} {'cost':>9} {'latency':>9} {'interv':>7} "
+        f"{'ctx-tok':>8} {'recov':>6}"
     )
     for entry in report.config_reports:
         print(
             f"{entry.config_id:<14} {entry.task_id:<26} {entry.trials:>6} "
             f"{entry.success_rate:>8.1%} {entry.false_success_rate:>10.1%} "
             f"${entry.mean_cost_usd:>8.4f} {entry.mean_latency_seconds:>8.2f}s "
-            f"{entry.mean_human_interventions:>7.2f}"
+            f"{entry.mean_human_interventions:>7.2f} "
+            f"{entry.mean_context_tokens_used:>8.1f} {entry.mean_recovery_events:>6.2f}"
         )
     print(f"pareto frontier: {', '.join(report.pareto_config_ids)}")
     if saved_path is not None:

@@ -54,6 +54,7 @@ from loopforge.domain.events import (
     RunStarted,
     RunStopped,
 )
+from loopforge.domain.policies import is_valid_policy_id
 from loopforge.domain.types import RunStatus
 
 _MAX_ID_LENGTH = 128
@@ -91,6 +92,14 @@ class EvalConfiguration:
     policy is wired, and the expensive-model set the trajectory metric's
     ``expensive_model_turns`` counts against (``(provider, model)`` pairs).
 
+    ``policy_id``/``policy_version`` (PACS-017 M5) reference a built-in
+    candidate ``ExecutionPolicy`` from the code-owned registry: the M6
+    driver resolves it fail-closed and wires its adaptive-surface knobs
+    (routing config, context-allocation bounds, verification cadence) for
+    the trial, so candidate-vs-active comparisons run through the same
+    laboratory as every other configuration. Both fields are set or both
+    are absent.
+
     Every field may only NARROW or SELECT within authority the operator
     already granted — a configuration can tighten a budget or disable the
     router, never expand budgets, permissions, sandbox capabilities, or
@@ -104,6 +113,8 @@ class EvalConfiguration:
     router_enabled: bool = False
     verify_read_only_turns: bool = False
     expensive_models: frozenset[tuple[str, str]] = frozenset()
+    policy_id: str | None = None
+    policy_version: int | None = None
 
     def __post_init__(self) -> None:
         _validate_id(self.config_id, field_name="config_id")
@@ -129,6 +140,14 @@ class EvalConfiguration:
             ):
                 msg_4 = "expensive_models entries must be (provider, model) non-empty string pairs"
                 raise ValueError(msg_4)
+        if (self.policy_id is None) is not (self.policy_version is None):
+            msg_6 = "policy_id and policy_version must be set together or both absent"
+            raise ValueError(msg_6)
+        if self.policy_id is not None and self.policy_version is not None:
+            if not is_valid_policy_id(self.policy_id):
+                msg_7 = "policy_id must match the code-owned policy identifier shape"
+                raise ValueError(msg_7)
+            _validate_positive_int(self.policy_version, field_name="policy_version")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -300,6 +319,15 @@ def _aggregate(trials: tuple[_GradedTrial, ...]) -> tuple[ConfigReport, ...]:
                 mean_human_interventions=_mean(
                     float(trial.record.human_interventions) for trial in group
                 ),
+                mean_context_tokens_used=_mean(
+                    float(trial.record.metrics.context_tokens_used) for trial in group
+                ),
+                mean_context_items_dropped=_mean(
+                    float(trial.record.metrics.context_items_dropped) for trial in group
+                ),
+                mean_recovery_events=_mean(
+                    float(trial.record.metrics.recovery_events) for trial in group
+                ),
             )
         )
     return tuple(reports)
@@ -315,6 +343,8 @@ class _ConfigSummary:
     mean_cost_usd: float
     mean_latency_seconds: float
     mean_human_interventions: float
+    mean_context_tokens_used: float
+    mean_recovery_events: float
 
 
 def _config_summaries(reports: tuple[ConfigReport, ...]) -> tuple[_ConfigSummary, ...]:
@@ -342,6 +372,10 @@ def _config_summaries(reports: tuple[ConfigReport, ...]) -> tuple[_ConfigSummary
             mean_human_interventions=_mean(
                 report.mean_human_interventions for report in groups[config_id]
             ),
+            mean_context_tokens_used=_mean(
+                report.mean_context_tokens_used for report in groups[config_id]
+            ),
+            mean_recovery_events=_mean(report.mean_recovery_events for report in groups[config_id]),
         )
         for config_id in sorted(groups)
     )
@@ -351,9 +385,10 @@ def _dominates(a: _ConfigSummary, b: _ConfigSummary) -> bool:
     """Pareto dominance: A is at least as good on every axis and strictly better on one.
 
     Axes: success rate (higher is better); false-success rate, mean cost,
-    mean latency, mean human interventions (lower is better). Ties —
-    identical summary vectors — do NOT dominate each other, so every tied
-    configuration stays on the frontier.
+    mean latency, mean human interventions, mean context tokens used, and
+    mean recovery events (lower is better). Ties — identical summary
+    vectors — do NOT dominate each other, so every tied configuration
+    stays on the frontier.
     """
     no_worse = (
         a.success_rate >= b.success_rate
@@ -361,6 +396,8 @@ def _dominates(a: _ConfigSummary, b: _ConfigSummary) -> bool:
         and a.mean_cost_usd <= b.mean_cost_usd
         and a.mean_latency_seconds <= b.mean_latency_seconds
         and a.mean_human_interventions <= b.mean_human_interventions
+        and a.mean_context_tokens_used <= b.mean_context_tokens_used
+        and a.mean_recovery_events <= b.mean_recovery_events
     )
     strictly_better = (
         a.success_rate > b.success_rate
@@ -368,6 +405,8 @@ def _dominates(a: _ConfigSummary, b: _ConfigSummary) -> bool:
         or a.mean_cost_usd < b.mean_cost_usd
         or a.mean_latency_seconds < b.mean_latency_seconds
         or a.mean_human_interventions < b.mean_human_interventions
+        or a.mean_context_tokens_used < b.mean_context_tokens_used
+        or a.mean_recovery_events < b.mean_recovery_events
     )
     return no_worse and strictly_better
 

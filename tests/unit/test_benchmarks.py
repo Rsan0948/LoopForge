@@ -399,6 +399,15 @@ def test_config_report_accepts_consistent_counts_and_rates() -> None:
     assert report.false_success_rate == 0.25
 
 
+def test_config_report_v2_means_default_to_honest_zero() -> None:
+    # The schema-v1 read path constructs reports without the context/recovery
+    # means; the zero default is the honest absence of data (PACS-017 M5).
+    report = _config_report()
+    assert report.mean_context_tokens_used == 0.0
+    assert report.mean_context_items_dropped == 0.0
+    assert report.mean_recovery_events == 0.0
+
+
 @pytest.mark.parametrize("trials", [0, -3])
 def test_config_report_rejects_non_positive_trials(trials: int) -> None:
     with pytest.raises(ValueError, match="trials must be positive"):
@@ -462,6 +471,9 @@ def test_config_report_rejects_false_success_rate_inconsistent_with_counts() -> 
         "mean_latency_seconds",
         "mean_total_tokens",
         "mean_human_interventions",
+        "mean_context_tokens_used",
+        "mean_context_items_dropped",
+        "mean_recovery_events",
     ],
 )
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1.0])

@@ -162,6 +162,10 @@ class RepairRuntimeDeps:
     """Adaptive context-budget bounds (PACS-017); None keeps the fixed wired
     budget. Bounds are validated against the wired envelope at wiring time —
     allocation can narrow, never widen (rule 12)."""
+    routing: RoutingPolicyConfig | None = None
+    """Candidate routing configuration (PACS-017 M5); None keeps the default
+    tier-only config. The requirements stay code-owned by the workload — a
+    candidate tunes selection knobs, never the model contract (rule 12)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -358,9 +362,13 @@ def _repair_bundle(  # noqa: PLR0913 - composition roots keep authority explicit
     registry = ModelRegistry((ModelRegistryEntry(model=model, tier=deps.model_tier),))
     router = TieredRoutingPolicy(
         registry,
-        config=RoutingPolicyConfig(
-            requirements=REPAIR_MODEL_REQUIREMENTS,
-            default_tier=deps.model_tier,
+        config=(
+            deps.routing
+            if deps.routing is not None
+            else RoutingPolicyConfig(
+                requirements=REPAIR_MODEL_REQUIREMENTS,
+                default_tier=deps.model_tier,
+            )
         ),
     )
     runtime = Runtime(
