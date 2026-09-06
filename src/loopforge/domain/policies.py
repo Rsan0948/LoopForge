@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final
 
 from loopforge.domain.context_lifecycle import ContextTokenBudget
@@ -36,7 +37,7 @@ def _is_ascii_alnum(char: str) -> bool:
     return "a" <= char <= "z" or "A" <= char <= "Z" or "0" <= char <= "9"
 
 
-def _is_valid_policy_id(policy_id: str) -> bool:
+def is_valid_policy_id(policy_id: str) -> bool:
     """Safe policy identifier shape (mirrors the eval report-id rules)."""
     return (
         1 <= len(policy_id) <= POLICY_ID_MAX_LENGTH
@@ -55,6 +56,19 @@ fewer workers, never more than the runtime's bounded multi-agent envelope.
 
 class UnknownPolicyError(ValueError):
     """Raised when a policy id/version cannot be resolved — fail closed."""
+
+
+class ShadowDecisionKind(StrEnum):
+    """Closed vocabulary of candidate-policy shadow decision kinds (PACS-017).
+
+    Each kind names one adaptive-surface decision point where a shadowed
+    candidate's choice is journaled as evidence-only
+    ``ShadowDecisionRecorded`` events while the active policy executes.
+    """
+
+    MODEL_ROUTE = "model_route"
+    CONTEXT_BUDGET = "context_budget"
+    VERIFICATION_CADENCE = "verification_cadence"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -204,7 +218,7 @@ class ExecutionPolicy:
     worker_count: int | None = None
 
     def __post_init__(self) -> None:
-        if not isinstance(self.policy_id, str) or not _is_valid_policy_id(  # pyright: ignore[reportUnnecessaryIsInstance]
+        if not isinstance(self.policy_id, str) or not is_valid_policy_id(  # pyright: ignore[reportUnnecessaryIsInstance]
             self.policy_id
         ):
             msg = "policy_id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"

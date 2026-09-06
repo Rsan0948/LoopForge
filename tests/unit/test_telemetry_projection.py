@@ -27,6 +27,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -37,6 +38,7 @@ from loopforge.domain.events import (
     WorkerStopped,
 )
 from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
+from loopforge.domain.policies import ShadowDecisionKind
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.telemetry import (
     REDACTION_PLACEHOLDER,
@@ -489,6 +491,14 @@ def _catalog_examples() -> dict[type[Event], Event]:
             provider="ollama",
             model="devstral-small-2:latest",
             action_id=ACTION_ID,
+        ),
+        ShadowDecisionRecorded: ShadowDecisionRecorded(
+            **_event_fields(25),
+            policy_id="adaptive-context",
+            policy_version=1,
+            kind=ShadowDecisionKind.CONTEXT_BUDGET,
+            decision="max_tokens=1536 reserve_tokens=256",
+            basis="dropped_over_budget=True utilization_fraction=0.970",
         ),
         ApprovalRequested: ApprovalRequested(
             **_event_fields(17), action_id=ACTION_ID, reason="risky"

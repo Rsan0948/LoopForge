@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from uuid import uuid4
@@ -26,6 +27,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -68,6 +70,7 @@ from loopforge.ports.model import (
     ModelTurnError,
 )
 from loopforge.ports.routing import RoutingDecision, RoutingPolicyPort, RoutingSignals
+from loopforge.ports.shadow import ShadowAdvice, ShadowPolicyPort
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.telemetry import TelemetryPort
 from loopforge.ports.tools import (
@@ -152,6 +155,14 @@ class Runtime:
     # escalation on consecutive_no_progress triggers later for
     # exploration-heavy runs.
     verify_read_only_turns: bool = False
+    # Evidence-only shadow-policy advisor (PACS-017). When wired, the runtime
+    # consults the shadowed candidate at its own decision points (routing,
+    # context budgeting, verification cadence) and durably journals the
+    # candidate's choice as ShadowDecisionRecorded evidence — NEVER enacted:
+    # the active run's decisions and state transitions are byte-identical
+    # with or without a shadow (AGENTS.md rule 12). Shadow failures are
+    # honest absence (a telemetry warning, no record), never a disturbance.
+    shadow: ShadowPolicyPort | None = None
     _telemetry: RuntimeTelemetry = field(init=False, repr=False)
     _drive_states: dict[RunId, _DriveState] = field(init=False, repr=False)
 
@@ -471,7 +482,7 @@ class Runtime:
             return state.current_proposal
         return None
 
-    def _propose_turn(self, run_id: RunId, drive: _DriveState) -> ActionProposal | None:  # noqa: PLR0915 - the proposal path is intentionally one flat orchestration; span instrumentation pushes it over the thresholds
+    def _propose_turn(self, run_id: RunId, drive: _DriveState) -> ActionProposal | None:  # noqa: PLR0912, PLR0915 - the proposal path is intentionally one flat orchestration; span instrumentation pushes it over the thresholds
         """Run the routing/context/model/proposal half of one drive cycle.
 
         Returns the durably proposed action, or ``None`` when the run was
@@ -539,6 +550,12 @@ class Runtime:
                 ),
             ),
         )
+        shadow_context = self.shadow
+        if shadow_context is not None:
+            # Evidence-only (PACS-017): the candidate allocator's budget for
+            # this turn is journaled, never enacted — the active build above
+            # used the active policy's budget.
+            self._record_shadow(run_id, lambda: shadow_context.advise_context_budget(current))
 
         turn_model = drive.active_model if drive.active_model is not None else self.model
         try:
@@ -659,6 +676,48 @@ class Runtime:
         )
         return action
 
+    def _record_shadow(self, run_id: RunId, advise: Callable[[], ShadowAdvice]) -> None:
+        """Journal one candidate-policy decision as evidence; never enact it.
+
+        Shadow failure is honest absence: any advisor defect — including
+        contract violations and persistence hiccups on the evidence append —
+        yields a telemetry warning and no durable record. The active run is
+        never disturbed by its shadow: the store stays consistent (failed
+        appends do not persist) and active appends always recompute their
+        expected version, so a failed evidence append cannot poison the
+        stream (the FailSafeTelemetry precedent applied to evidence).
+        """
+        shadow = self.shadow
+        if shadow is None:
+            return
+        try:
+            advice = advise()
+            if not isinstance(advice, ShadowAdvice):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg = f"shadow advisor returned {type(advice).__name__}, expected ShadowAdvice"
+                raise TypeError(msg)  # noqa: TRY301 - contract violations take the same honest-absence path
+            policy = shadow.policy
+            self._persist(
+                run_id,
+                lambda event_id, rid, occurred_at, sequence: ShadowDecisionRecorded(
+                    event_id=event_id,
+                    run_id=rid,
+                    occurred_at=occurred_at,
+                    sequence=sequence,
+                    policy_id=policy.policy_id,
+                    policy_version=policy.version,
+                    kind=advice.kind,
+                    decision=advice.decision,
+                    basis=advice.basis,
+                ),
+            )
+        except Exception as error:
+            policy_id = "unknown"
+            with suppress(Exception):
+                policy_id = shadow.policy.policy_id
+            self._telemetry.emit_shadow_failure(
+                run_id, policy_id=policy_id, error_type=type(error).__name__
+            )
+
     def _route(
         self,
         run_id: RunId,
@@ -736,6 +795,11 @@ class Runtime:
                 ),
             )
             return None
+        shadow = self.shadow
+        if shadow is not None:
+            # Evidence-only (PACS-017): the candidate's route for this turn is
+            # journaled, never enacted — the active decision above stands.
+            self._record_shadow(run_id, lambda: shadow.advise_route(state, signals=signals))
         return decision.model
 
     def _budget_remaining_fraction(self, state: RunState) -> float | None:
@@ -887,6 +951,12 @@ class Runtime:
         state = self.state_for(run_id)
         if state.status is not RunStatus.VERIFYING:
             return
+        shadow = self.shadow
+        if shadow is not None:
+            # Evidence-only (PACS-017): the candidate's cadence choice for this
+            # turn is journaled, never enacted — the active cadence below
+            # decides what actually happens.
+            self._record_shadow(run_id, lambda: shadow.advise_verification_cadence(state))
         if self._skips_read_only_verification(state):
             # Read-only cadence skip (PACS-016 M8): no verification event is
             # recorded — honest absence, explicable from the stream's

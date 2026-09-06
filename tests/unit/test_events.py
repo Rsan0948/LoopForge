@@ -34,6 +34,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -44,6 +45,7 @@ from loopforge.domain.events import (
     WorkerStopped,
 )
 from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
+from loopforge.domain.policies import ShadowDecisionKind
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
@@ -87,6 +89,7 @@ ALL_EVENT_CLASSES: tuple[type[DomainEvent], ...] = (
     ArtifactRecorded,
     BudgetDebited,
     ModelTurnRecorded,
+    ShadowDecisionRecorded,
     ApprovalRequested,
     ApprovalGranted,
     ApprovalRejected,
@@ -286,6 +289,17 @@ def _all_events() -> tuple[Event, ...]:
             provider="ollama",
             model="devstral-small-2:latest",
             action_id=ActionId("a1"),
+        ),
+        ShadowDecisionRecorded(
+            event_id=EventId("e13s"),
+            run_id=RUN,
+            occurred_at=NOW,
+            sequence=13,
+            policy_id="adaptive-context",
+            policy_version=1,
+            kind=ShadowDecisionKind.CONTEXT_BUDGET,
+            decision="max_tokens=1536 reserve_tokens=256",
+            basis="dropped_over_budget=True utilization_fraction=0.970",
         ),
         ApprovalRequested(
             event_id=EventId("e14"),

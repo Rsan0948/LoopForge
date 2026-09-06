@@ -18,6 +18,7 @@ from loopforge.domain.orchestration import (
     validate_worker_id,
     validate_worker_text,
 )
+from loopforge.domain.policies import ShadowDecisionKind, is_valid_policy_id
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.tooling import ToolMetadata
 from loopforge.domain.types import (
@@ -268,6 +269,63 @@ class ApprovalGranted(DomainEvent):
     action_id: ActionId
 
 
+_MAX_SHADOW_TEXT = 512
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ShadowDecisionRecorded(DomainEvent):
+    """Evidence-only record of what a candidate policy WOULD have decided (PACS-017).
+
+    While the active policy executes, a shadowed candidate's routing,
+    context-budget, or verification-cadence decision is journaled for audit
+    and later comparison — but NEVER enacted: the reducer projects the record
+    without any control-state effect, and the active run's decisions are
+    byte-identical with or without a shadow wired (AGENTS.md rule 12). The
+    kind vocabulary is code-owned and closed, and the policy identity comes
+    from the code-owned ``ExecutionPolicy`` — never from model output.
+    """
+
+    policy_id: str
+    policy_version: int
+    kind: ShadowDecisionKind
+    decision: str
+    basis: str
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if not isinstance(self.policy_id, str) or not is_valid_policy_id(  # pyright: ignore[reportUnnecessaryIsInstance]
+            self.policy_id
+        ):
+            msg_16 = "shadow policy_id must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}"
+            raise ValueError(msg_16)
+        if not isinstance(self.policy_version, int) or isinstance(  # pyright: ignore[reportUnnecessaryIsInstance]
+            self.policy_version, bool
+        ):
+            msg_17 = "shadow policy_version must be an integer"
+            raise ValueError(msg_17)  # noqa: TRY004
+        if self.policy_version < 1:
+            msg_18 = "shadow policy_version must be positive"
+            raise ValueError(msg_18)
+        if not isinstance(self.kind, ShadowDecisionKind):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_19 = "shadow decision kind must be a ShadowDecisionKind"
+            raise TypeError(msg_19)
+        _validate_shadow_text(self.decision, "shadow decision")
+        _validate_shadow_text(self.basis, "shadow decision basis")
+
+
+def _validate_shadow_text(value: str, field: str) -> None:
+    """Bound and sanitize code-owned shadow decision text for the durable stream."""
+    if not value.strip():
+        msg = f"{field} cannot be empty"
+        raise ValueError(msg)
+    if len(value) > _MAX_SHADOW_TEXT:
+        msg_2 = f"{field} exceeds {_MAX_SHADOW_TEXT} characters"
+        raise ValueError(msg_2)
+    if any((ord(char) < 0x20 and char not in "\n\t") or ord(char) == 0x7F for char in value):
+        msg_3 = f"{field} must not contain control characters"
+        raise ValueError(msg_3)
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ApprovalRejected(DomainEvent):
     """Durable operator denial of a pending approval-gated action.
@@ -421,6 +479,7 @@ Event = (
     | ArtifactRecorded
     | BudgetDebited
     | ModelTurnRecorded
+    | ShadowDecisionRecorded
     | ApprovalRequested
     | ApprovalGranted
     | ApprovalRejected

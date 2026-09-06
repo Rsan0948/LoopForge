@@ -32,6 +32,7 @@ class ProvenanceNodeKind(StrEnum):
     BUDGET = "budget"
     APPROVAL = "approval"
     OPERATOR_INSTRUCTION = "operator_instruction"
+    SHADOW_DECISION = "shadow_decision"
     WORKER = "worker"
     STOP = "stop"
 

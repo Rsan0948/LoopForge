@@ -30,6 +30,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -40,6 +41,7 @@ from loopforge.domain.events import (
     WorkerStopped,
 )
 from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
+from loopforge.domain.policies import ShadowDecisionKind
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
@@ -85,6 +87,7 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         ArtifactRecorded,
         BudgetDebited,
         ModelTurnRecorded,
+        ShadowDecisionRecorded,
         ApprovalRequested,
         ApprovalGranted,
         ApprovalRejected,
@@ -444,6 +447,17 @@ def _construct_model_turn_recorded(base: dict[str, Any], data: dict[str, Any]) -
     )
 
 
+def _construct_shadow_decision_recorded(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ShadowDecisionRecorded(
+        **base,
+        policy_id=_required_str(data, "policy_id"),
+        policy_version=_required_int(data, "policy_version"),
+        kind=ShadowDecisionKind(_required_str(data, "kind")),
+        decision=_required_str(data, "decision"),
+        basis=_required_str(data, "basis"),
+    )
+
+
 _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]]] = {
     "RunStarted": _construct_run_started,
     "PlanCreated": _construct_plan_created,
@@ -462,6 +476,7 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "ArtifactRecorded": _construct_artifact_recorded,
     "BudgetDebited": _construct_budget_debited,
     "ModelTurnRecorded": _construct_model_turn_recorded,
+    "ShadowDecisionRecorded": _construct_shadow_decision_recorded,
     "ApprovalRequested": _construct_approval_requested,
     "ApprovalGranted": _construct_approval_granted,
     "ApprovalRejected": _construct_approval_rejected,

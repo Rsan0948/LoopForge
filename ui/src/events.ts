@@ -123,6 +123,13 @@ export interface ModelTurnRecordedPayload extends EventBase {
   model: string;
   action_id: string;
 }
+export interface ShadowDecisionRecordedPayload extends EventBase {
+  policy_id: string;
+  policy_version: number;
+  kind: "model_route" | "context_budget" | "verification_cadence";
+  decision: string;
+  basis: string;
+}
 export interface ApprovalRequestedPayload extends EventBase {
   action_id: string;
   reason: string;
@@ -179,6 +186,7 @@ export type EventPayload =
   | ArtifactRecordedPayload
   | BudgetDebitedPayload
   | ModelTurnRecordedPayload
+  | ShadowDecisionRecordedPayload
   | ApprovalRequestedPayload
   | ApprovalGrantedPayload
   | ApprovalRejectedPayload
@@ -279,6 +287,13 @@ export function describeEvent(envelope: EventEnvelope): { label: string; summary
     case "ModelTurnRecorded": {
       const p = e as ModelTurnRecordedPayload;
       return { label: "Model turn", summary: `${p.provider}/${p.model}` };
+    }
+    case "ShadowDecisionRecorded": {
+      const p = e as ShadowDecisionRecordedPayload;
+      return {
+        label: "Shadow decision",
+        summary: `${p.policy_id} v${p.policy_version} · ${p.kind} → ${truncate(p.decision, 100)}`,
+      };
     }
     case "ApprovalRequested": {
       const p = e as ApprovalRequestedPayload;

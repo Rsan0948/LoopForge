@@ -39,6 +39,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -49,6 +50,7 @@ from loopforge.domain.events import (
     WorkerStopped,
 )
 from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
+from loopforge.domain.policies import ShadowDecisionKind
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
@@ -380,6 +382,18 @@ EXAMPLES: tuple[Event, ...] = (
         model="devstral-small-2:latest",
         action_id=ActionId("a1"),
     ),
+    ShadowDecisionRecorded(
+        event_id=EventId("e30"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=30,
+        caused_by=EventId("e14"),
+        policy_id="adaptive-context",
+        policy_version=1,
+        kind=ShadowDecisionKind.MODEL_ROUTE,
+        decision="ollama/devstral-small-2:latest tier=economy",
+        basis="reason_code=ROUTE_INITIAL_SELECTION",
+    ),
     # Nullable-field variant exercising the PACS-015 lineage link.
     RunStarted(
         event_id=EventId("e29"),
@@ -420,6 +434,7 @@ EXAMPLES: tuple[Event, ...] = (
     APPROVAL_REJECTED,
     OPERATOR_INSTRUCTION,
     MODEL_TURN_RECORDED,
+    SHADOW_DECISION_RECORDED,
     RUN_STARTED_WITH_PARENT,
 ) = EXAMPLES
 
@@ -462,7 +477,7 @@ def _legacy_tool_failed_payload(retryable: Any) -> str:
 
 def test_examples_cover_every_registered_event_type() -> None:
     assert {type(event).__name__ for event in EXAMPLES} == set(_EVENT_TYPES)
-    assert len(_EVENT_TYPES) == 25
+    assert len(_EVENT_TYPES) == 26
 
 
 @pytest.mark.parametrize(

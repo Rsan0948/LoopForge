@@ -24,6 +24,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -148,6 +149,10 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
         RunStatus.REFLECTING,
     },
     ModelTurnRecorded: {RunStatus.READY},
+    # Evidence-only shadow records (PACS-017): routing/context-budget advice
+    # is journaled while the run is READY (the propose-turn decision points);
+    # cadence advice is journaled from VERIFYING. No control-state effect.
+    ShadowDecisionRecorded: {RunStatus.READY, RunStatus.VERIFYING},
     ApprovalRequested: {RunStatus.READY},
     ApprovalGranted: {RunStatus.WAITING_FOR_APPROVAL},
     ApprovalRejected: {RunStatus.WAITING_FOR_APPROVAL},
@@ -452,6 +457,12 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             # graph attributes the turn's action to this provider/model. No
             # control-state effect; the payload stays in the event stream.
             return base
+        case ShadowDecisionRecorded():
+            # Evidence-only candidate-policy record (PACS-017): shadow advice
+            # is journaled for audit/comparison and NEVER enacted — replaying
+            # it changes nothing, so active-run replay is byte-identical with
+            # or without a shadow wired.
+            return base
         case ApprovalRequested():
             return replace(base, status=RunStatus.WAITING_FOR_APPROVAL)
         case ApprovalGranted(action_id=action_id):
@@ -543,9 +554,9 @@ _TERMINAL_STATUS_BY_REASON: dict[StopReason, RunStatus] = {
 # Deterministic post-status for events whose reducer arm always lands in one
 # status. Events absent from this table leave the run status unchanged
 # (BudgetDebited, ArtifactRecorded, CircuitOpened, OperatorInstruction,
-# ModelTurnRecorded, WorkerStopped, WorkerMerged); RunStopped is reason-dependent
-# and handled by
-# status_after_event. The reducer above remains the authority — store adapters
+# ModelTurnRecorded, ShadowDecisionRecorded, WorkerStopped, WorkerMerged);
+# RunStopped is reason-dependent and handled by status_after_event. The
+# reducer above remains the authority — store adapters
 # use this projection only to maintain their runs index, and a conformance
 # suite pins it equal to full replay.
 _STATUS_AFTER_EVENT: dict[type[Event], RunStatus] = {

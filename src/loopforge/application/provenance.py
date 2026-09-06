@@ -37,6 +37,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -117,6 +118,19 @@ def _node_for(event: Event) -> ProvenanceNode:  # noqa: PLR0912, PLR0915 - the f
             kind = ProvenanceNodeKind.MODEL_TURN
             summary = f"{provider}/{model}"
             attributes = _attributes(provider=provider, model=model, action_id=str(action_id))
+        case ShadowDecisionRecorded(
+            policy_id=policy_id,
+            policy_version=policy_version,
+            kind=shadow_kind,
+            decision=decision,
+        ):
+            kind = ProvenanceNodeKind.SHADOW_DECISION
+            summary = f"shadow {shadow_kind.value}: {_truncate(decision, 80)}"
+            attributes = _attributes(
+                policy_id=policy_id,
+                policy_version=policy_version,
+                shadow_kind=shadow_kind.value,
+            )
         case ActionProposed(proposal=proposal):
             kind = ProvenanceNodeKind.ACTION
             summary = f"proposed {proposal.tool_name}"
@@ -371,6 +385,11 @@ def build_provenance_graph(events: tuple[Event, ...]) -> ProvenanceGraph:  # noq
                 last_worker_node_of[key] = node.node_id
             case BudgetDebited():
                 pass  # Backbone-only evidence: cost attribution stays in the stream.
+            case ShadowDecisionRecorded():
+                # Backbone-only evidence (PACS-017): shadow advice is never
+                # enacted, so no causal edge to the active run's decisions is
+                # honest — the SEQUENCE backbone is the whole story.
+                pass
 
     ordered_edges = sorted(
         edges,

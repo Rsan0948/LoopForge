@@ -24,6 +24,7 @@ from loopforge.domain.events import (
     RetryScheduled,
     RunStarted,
     RunStopped,
+    ShadowDecisionRecorded,
     ToolExecutionStarted,
     ToolFailed,
     ToolSucceeded,
@@ -227,6 +228,26 @@ class RuntimeTelemetry:
                 status=status,
                 attributes=dict(attributes),
                 correlation=self._correlation(run_id),
+            )
+        )
+
+    def emit_shadow_failure(self, run_id: RunId, *, policy_id: str, error_type: str) -> None:
+        """Warn that an evidence-only shadow advisor failed (honest absence, PACS-017).
+
+        A shadow failure never disturbs the active run: the failure is logged
+        and the candidate decision is simply absent from the durable stream.
+        """
+        self._sink.emit(
+            LogRecord(
+                message="shadow advisor failure",
+                occurred_at=self._clock.now(),
+                severity=LogSeverity.WARN,
+                trace_id=self.trace_id_for(run_id),
+                correlation=self._correlation(run_id),
+                attributes={
+                    "loopforge.shadow.policy_id": policy_id,
+                    "loopforge.shadow.error_type": error_type,
+                },
             )
         )
 
@@ -510,6 +531,29 @@ class RuntimeTelemetry:
                     attributes={
                         "loopforge.model.provider": provider,
                         "loopforge.model.name": model,
+                    },
+                )
+            case ShadowDecisionRecorded(
+                policy_id=policy_id,
+                policy_version=policy_version,
+                kind=kind,
+                decision=decision,
+                basis=basis,
+            ):
+                # Evidence-only candidate-policy record (PACS-017): the payload
+                # is code-owned bounded text (reason codes, budgets, tiers), so
+                # it projects directly — the record is auditable through
+                # telemetry exactly as through the authoritative stream.
+                self._log(
+                    event,
+                    LogSeverity.INFO,
+                    "shadow decision recorded",
+                    attributes={
+                        "loopforge.shadow.policy_id": policy_id,
+                        "loopforge.shadow.policy_version": policy_version,
+                        "loopforge.shadow.kind": kind.value,
+                        "loopforge.shadow.decision": SensitiveText(decision),
+                        "loopforge.shadow.basis": SensitiveText(basis),
                     },
                 )
             case ApprovalRequested(action_id=action_id, reason=reason):
