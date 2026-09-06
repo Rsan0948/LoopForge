@@ -38,6 +38,7 @@ from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.application.provenance import build_provenance_graph, explain_provenance
 from loopforge.application.runtime import UnknownRunError
 from loopforge.domain.events import ApprovalRequested, ArtifactRecorded, Event
+from loopforge.domain.policies import PolicyLifecycle
 from loopforge.domain.provenance import ProvenanceNode, UnknownProvenanceNodeError
 from loopforge.domain.state import InvalidTransitionError
 from loopforge.domain.types import RunId, RunStatus
@@ -46,6 +47,13 @@ from loopforge.entrypoints.eval import (
     EvalReportStoreError,
     UnknownEvalReportError,
     report_to_dict,
+)
+from loopforge.entrypoints.policy import (
+    PolicyRegistryConflictError,
+    PolicyRegistryError,
+    PolicyRegistryStore,
+    UnknownPolicyRecordError,
+    policy_record_to_dict,
 )
 from loopforge.entrypoints.profile import ProfileError
 from loopforge.entrypoints.sessions import (
@@ -118,11 +126,24 @@ class ServerSettings:
     detail route 404s — the server only READS these artifacts; creating them
     stays with the CLI (M6).
     """
+    policies_dir: Path | None = None
+    """Operator-owned candidate policy registry (``loopforge policy``).
+
+    ``None`` resolves to ``data_dir / "policies"``. The serving plane READS
+    the registry (list/detail) and performs exactly one write: the
+    confirm-gated promote route — the same explicit operator action the CLI
+    offers, never a runtime-initiated transition.
+    """
 
 
 def data_dir_evals(settings: ServerSettings) -> Path:
     """The default eval report store: ``data_dir / "evals"`` (see ServerSettings)."""
     return settings.data_dir / "evals"
+
+
+def data_dir_policies(settings: ServerSettings) -> Path:
+    """The default policy registry: ``data_dir / "policies"`` (see ServerSettings)."""
+    return settings.data_dir / "policies"
 
 
 # -- Request models -------------------------------------------------------------
@@ -225,6 +246,27 @@ class ForceReleaseRequest(BaseModel):
     def _require_explicit_confirmation(self) -> ForceReleaseRequest:
         if not self.confirm:
             msg = "force-release stops the run WITHOUT replay checks; pass confirm=true"
+            raise ValueError(msg)
+        return self
+
+
+class PromotePolicyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # The referenced evidence basis for promotion (rule 16): a benchmark
+    # report id, a shadowed run reference, or an operator note. Blank is
+    # rejected by the domain (PolicyRecord) as a 422.
+    evidence_basis: str
+    note: str = ""
+    version: int | None = None
+    """Record version to promote; ``None`` promotes the latest registered."""
+    # StrictBool: only a literal JSON true confirms — never 1, "true", "yes".
+    confirm: StrictBool = False
+
+    @model_validator(mode="after")
+    def _require_explicit_confirmation(self) -> PromotePolicyRequest:
+        if not self.confirm:
+            msg = "promotion is an explicit operator action; pass confirm=true"
             raise ValueError(msg)
         return self
 
@@ -377,6 +419,15 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     # family — never a bare traceback, never a silent skip.
     app.add_exception_handler(UnknownEvalReportError, unknown_run_handler)
     app.add_exception_handler(EvalReportStoreError, registry_error_handler)
+    # Policy registry (PACS-017 M6): unknown record ids are 404s; registry
+    # conflicts (duplicate registration — a CLI-side operation) are 409s;
+    # an illegal lifecycle transition is a domain ValueError (422); a
+    # tampered or drifted registry file is server-side corruption (500).
+    # Subclass handlers register before the PolicyRegistryError base so
+    # specificity wins.
+    app.add_exception_handler(UnknownPolicyRecordError, unknown_run_handler)
+    app.add_exception_handler(PolicyRegistryConflictError, conflict_handler)
+    app.add_exception_handler(PolicyRegistryError, registry_error_handler)
 
     # -- REST: sessions ---------------------------------------------------------
 
@@ -655,6 +706,43 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_route("/api/benchmark/suite", benchmark_suite_route, methods=["GET"])
     app.add_api_route("/api/evals", list_evals_route, methods=["GET"])
     app.add_api_route("/api/evals/{report_id}", eval_detail_route, methods=["GET"])
+
+    # -- REST: candidate policy registry (PACS-017 M6) ----------------------------
+    #
+    # The registry is operator-owned state. The serving plane reads it
+    # (list/detail) and exposes exactly one write: the confirm-gated promote
+    # route — the same explicit operator action as ``loopforge policy
+    # --promote``, never a runtime-initiated transition. A candidate can
+    # never self-promote: no other write path exists.
+
+    policies_dir = (
+        settings.policies_dir if settings.policies_dir is not None else data_dir_policies(settings)
+    )
+    policy_registry = PolicyRegistryStore(policies_dir)
+
+    def list_policies_route() -> dict[str, object]:
+        """Every registered record, serialized exactly as the artifact saves it."""
+        return {"policies": [policy_record_to_dict(record) for record in policy_registry.list()]}
+
+    def policy_detail_route(policy_id: str) -> dict[str, object]:
+        """The latest registered record for ``policy_id`` (404 when absent)."""
+        return policy_record_to_dict(policy_registry.get(policy_id))
+
+    def promote_policy_route(policy_id: str, request: PromotePolicyRequest) -> dict[str, object]:
+        """Promote one record to PROMOTED — confirm-gated, evidence-referenced."""
+        record = policy_registry.get(policy_id, version=request.version)
+        updated = policy_registry.transition(
+            record.policy.policy_id,
+            record.policy.version,
+            PolicyLifecycle.PROMOTED,
+            evidence_basis=request.evidence_basis,
+            note=request.note or None,
+        )
+        return policy_record_to_dict(updated)
+
+    app.add_api_route("/api/policies", list_policies_route, methods=["GET"])
+    app.add_api_route("/api/policies/{policy_id}", policy_detail_route, methods=["GET"])
+    app.add_api_route("/api/policies/{policy_id}/promote", promote_policy_route, methods=["POST"])
 
     # -- WebSocket: live event stream --------------------------------------------
 

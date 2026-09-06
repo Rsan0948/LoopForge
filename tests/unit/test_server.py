@@ -37,6 +37,12 @@ from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.benchmarks import BenchmarkReport, ConfigReport
 from loopforge.domain.events import OperatorInstruction
+from loopforge.domain.policies import (
+    ContextAllocationBounds,
+    ExecutionPolicy,
+    PolicyLifecycle,
+    PolicyRecord,
+)
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.security import SandboxCapabilities
@@ -59,6 +65,7 @@ from loopforge.domain.types import (
 from loopforge.domain.workspace import WorkspaceStatus
 from loopforge.entrypoints.cli import main
 from loopforge.entrypoints.eval import EvalReportStore, report_to_dict
+from loopforge.entrypoints.policy import PolicyRegistryStore, policy_record_to_dict
 from loopforge.entrypoints.repair import RepairRuntimeBundle
 from loopforge.entrypoints.server import ServerSettings, create_app
 from loopforge.entrypoints.sessions import SessionManager, SessionWiring
@@ -273,19 +280,21 @@ def _inline_body(repo: Path) -> dict[str, Any]:
     }
 
 
-def _client(
+def _client(  # noqa: PLR0913 - test client helper keeps every setting explicit
     tmp_path: Path,
     factory: FakeBundleFactory,
     *,
     data_dir: Path | None = None,
     sqlite_path: Path | None = None,
     evals_dir: Path | None = None,
+    policies_dir: Path | None = None,
 ) -> TestClient:
     settings = ServerSettings(
         store_kind="sqlite",
         sqlite_path=str(sqlite_path or tmp_path / "events.db"),
         data_dir=data_dir or tmp_path / "data",
         evals_dir=evals_dir,
+        policies_dir=policies_dir,
     )
     return TestClient(create_app(settings, bundle_factory=factory))
 
@@ -1623,3 +1632,196 @@ def test_eval_routes_are_read_only(tmp_path: Path) -> None:
         assert client.post("/api/evals").status_code == 405
         assert client.delete("/api/evals/eval-report-1").status_code == 405
         assert client.post("/api/benchmark/suite").status_code == 405
+
+
+# --- Candidate policy registry exposure (PACS-017 M6) --------------------------
+
+
+def _register_policy(
+    registry_dir: Path, policy_id: str = "candidate-x", version: int = 1
+) -> PolicyRecord:
+    store = PolicyRegistryStore(registry_dir, clock=FixedClock(NOW))
+    return store.register(
+        ExecutionPolicy(
+            policy_id=policy_id,
+            version=version,
+            context_allocation=ContextAllocationBounds(floor_tokens=1024, ceiling_tokens=4096),
+        ),
+        evidence_basis=f"registered {policy_id} v{version}",
+    )
+
+
+def test_policies_list_is_empty_out_of_the_box(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/policies")
+        assert response.status_code == 200, response.text
+        assert response.json() == {"policies": []}
+
+
+def test_policies_list_and_detail_use_the_artifact_projection(tmp_path: Path) -> None:
+    policies_dir = tmp_path / "policies"
+    record = _register_policy(policies_dir)
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        listing = client.get("/api/policies")
+        assert listing.status_code == 200, listing.text
+        assert listing.json() == {"policies": [policy_record_to_dict(record)]}
+
+        detail = client.get("/api/policies/candidate-x")
+        assert detail.status_code == 200, detail.text
+        assert detail.json() == policy_record_to_dict(record)
+
+
+def test_policy_detail_unknown_id_is_404_without_a_path_leak(tmp_path: Path) -> None:
+    policies_dir = tmp_path / "policies"
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        response = client.get("/api/policies/no-such-policy")
+
+        assert response.status_code == 404, response.text
+        assert "unknown registered policy" in response.json()["detail"]
+        assert str(policies_dir) not in response.json()["detail"]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"evidence_basis": "eval-report-7"},
+        {"evidence_basis": "eval-report-7", "confirm": "true"},
+        {"evidence_basis": "eval-report-7", "confirm": 1},
+        {"evidence_basis": "eval-report-7", "confirm": True, "unexpected": 1},
+    ],
+    ids=["empty", "no-confirm", "string-confirm", "int-confirm", "extra-key"],
+)
+def test_policy_promote_rejects_unconfirmed_or_malformed_bodies(
+    tmp_path: Path, body: dict[str, object]
+) -> None:
+    # The pydantic 422 family: only a literal JSON true confirms, and the
+    # request shape is closed (extra="forbid").
+    policies_dir = tmp_path / "policies"
+    _register_policy(policies_dir)
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        response = client.post("/api/policies/candidate-x/promote", json=body)
+
+        assert response.status_code == 422, response.text
+
+
+def test_policy_promote_without_an_evidence_basis_is_denied(tmp_path: Path) -> None:
+    # Rule 16: a blank basis is rejected by the domain as a 422 even when the
+    # operator confirmed and the record is otherwise promotable.
+    policies_dir = tmp_path / "policies"
+    _register_policy(policies_dir)
+    PolicyRegistryStore(policies_dir).transition(
+        "candidate-x", 1, PolicyLifecycle.BENCHMARKED, evidence_basis="eval-report-6"
+    )
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        response = client.post(
+            "/api/policies/candidate-x/promote",
+            json={"evidence_basis": "   ", "confirm": True},
+        )
+
+        assert response.status_code == 422, response.text
+        assert "evidence_basis" in response.json()["detail"]
+
+
+def test_policy_promote_a_fresh_candidate_is_denied(tmp_path: Path) -> None:
+    # Promotion always passes through an evidence-gathering state first:
+    # CANDIDATE -> PROMOTED is not in the domain transition table, so even a
+    # confirmed, evidenced request is denied (domain ValueError -> 422).
+    policies_dir = tmp_path / "policies"
+    _register_policy(policies_dir)
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        response = client.post(
+            "/api/policies/candidate-x/promote",
+            json={"evidence_basis": "eval-report-7", "confirm": True},
+        )
+
+        assert response.status_code == 422, response.text
+        assert "is not legal" in response.json()["detail"]
+        # The denied request left the record untouched.
+        assert client.get("/api/policies/candidate-x").json()["lifecycle"] == "candidate"
+
+
+def test_policy_promote_a_benchmarked_candidate_succeeds(tmp_path: Path) -> None:
+    policies_dir = tmp_path / "policies"
+    _register_policy(policies_dir)
+    PolicyRegistryStore(policies_dir).transition(
+        "candidate-x", 1, PolicyLifecycle.BENCHMARKED, evidence_basis="eval-report-6"
+    )
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        response = client.post(
+            "/api/policies/candidate-x/promote",
+            json={"evidence_basis": "eval-report-7", "confirm": True, "note": "clean"},
+        )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["lifecycle"] == "promoted"
+        assert body["evidence_basis"] == "eval-report-7"
+        assert body["note"] == "clean"
+        # The promotion persisted to the operator-owned artifact.
+        reloaded = PolicyRegistryStore(policies_dir).get("candidate-x")
+        assert reloaded.lifecycle is PolicyLifecycle.PROMOTED
+
+
+def test_policy_promote_unknown_id_is_404(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.post(
+            "/api/policies/no-such/promote",
+            json={"evidence_basis": "eval-report-7", "confirm": True},
+        )
+
+        assert response.status_code == 404, response.text
+        assert "unknown registered policy" in response.json()["detail"]
+        assert str(tmp_path) not in response.json()["detail"]
+
+
+def test_policy_promote_selects_the_latest_version_by_default(tmp_path: Path) -> None:
+    policies_dir = tmp_path / "policies"
+    _register_policy(policies_dir, version=1)
+    _register_policy(policies_dir, version=2)
+    store = PolicyRegistryStore(policies_dir)
+    store.transition("candidate-x", 2, PolicyLifecycle.SHADOWED, evidence_basis="run-1")
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        response = client.post(
+            "/api/policies/candidate-x/promote",
+            json={"evidence_basis": "eval-report-7", "confirm": True},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["policy"]["version"] == 2
+
+
+def test_policies_routes_fail_closed_500_on_a_tampered_registry(tmp_path: Path) -> None:
+    # A hand-edited lifecycle outside the closed vocabulary fails domain
+    # revalidation: server-side corruption in the 500 {"detail"} family.
+    policies_dir = tmp_path / "policies"
+    _register_policy(policies_dir)
+    path = policies_dir / "candidate-x--v1.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["record"]["lifecycle"] = "enshrined"
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    with _client(tmp_path, _plain_factory(), policies_dir=policies_dir) as client:
+        listing = client.get("/api/policies")
+        assert listing.status_code == 500, listing.text
+        assert "revalidation" in listing.json()["detail"]
+
+
+def test_policies_dir_defaults_under_the_server_data_dir(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    record = _register_policy(data_dir / "policies")
+
+    with _client(tmp_path, _plain_factory(), data_dir=data_dir) as client:
+        detail = client.get("/api/policies/candidate-x")
+        assert detail.status_code == 200, detail.text
+        assert detail.json() == policy_record_to_dict(record)
+
+
+def test_policy_registry_has_no_other_write_surface(tmp_path: Path) -> None:
+    # The confirm-gated promote route is the ONLY write: no register, no
+    # delete — a candidate can never self-promote because no runtime or
+    # generic-REST path can create or mutate records.
+    with _client(tmp_path, _plain_factory()) as client:
+        assert client.post("/api/policies").status_code == 405
+        assert client.delete("/api/policies/candidate-x").status_code == 405
+        assert client.put("/api/policies/candidate-x").status_code == 405

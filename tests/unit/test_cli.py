@@ -26,6 +26,11 @@ from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.benchmarks import BenchmarkReport, ConfigReport
 from loopforge.domain.context_lifecycle import ContextTokenBudget
+from loopforge.domain.policies import (
+    ContextAllocationBounds,
+    ExecutionPolicy,
+    PolicyLifecycle,
+)
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -40,6 +45,7 @@ from loopforge.domain.tooling import (
 from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel
 from loopforge.entrypoints.cli import build_ollama_model, main
 from loopforge.entrypoints.eval import EvalReportStore
+from loopforge.entrypoints.policy import PolicyRegistryStore
 from loopforge.ports.tools import ToolResult
 from loopforge.workloads.fixtures import adder_repair_task
 
@@ -942,3 +948,191 @@ def test_replay_requires_sqlite_run_id_and_prefix(
     assert main() == 2
 
     assert "error: replay requires" in capsys.readouterr().out
+
+
+# --- policy command: operator-owned registry (PACS-017 M6) -------------------
+
+
+def _register_policy(registry_dir: Path, policy_id: str = "candidate-x", version: int = 1):
+    store = PolicyRegistryStore(registry_dir)
+    return store.register(
+        ExecutionPolicy(
+            policy_id=policy_id,
+            version=version,
+            context_allocation=ContextAllocationBounds(floor_tokens=1024, ceiling_tokens=4096),
+        ),
+        evidence_basis=f"registered {policy_id} v{version}",
+    )
+
+
+def test_policy_list_on_an_empty_registry(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "policy", "--list", "--registry-dir", str(tmp_path))
+
+    assert main() == 0
+
+    assert f"no registered policies in {tmp_path}" in capsys.readouterr().out
+
+
+def test_policy_list_prints_registered_records(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path, version=1)
+    _register_policy(tmp_path, version=2)
+    _argv(monkeypatch, "policy", "--list", "--registry-dir", str(tmp_path))
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "candidate-x" in out
+    assert "candidate" in out
+    assert "registered candidate-x v1" in out
+    assert "registered candidate-x v2" in out
+
+
+def test_policy_show_prints_the_full_record(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path)
+    _argv(monkeypatch, "policy", "--show", "candidate-x", "--registry-dir", str(tmp_path))
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "policy=candidate-x version=1 lifecycle=candidate" in out
+    assert "evidence basis: registered candidate-x v1" in out
+    assert "context allocation: floor=1024" in out
+    assert "routing: default-tier=standard" in out
+
+
+def test_policy_show_unknown_id_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "policy", "--show", "no-such", "--registry-dir", str(tmp_path))
+
+    assert main() == 1
+
+    assert "unknown registered policy 'no-such'" in capsys.readouterr().out
+
+
+def test_policy_requires_an_action(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(monkeypatch, "policy", "--registry-dir", str(tmp_path))
+
+    assert main() == 2
+
+    assert "error: policy requires one of" in capsys.readouterr().out
+
+
+def test_policy_promote_requires_evidence(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--promote",
+        "candidate-x",
+        "--confirm",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 2
+
+    assert "requires --evidence" in capsys.readouterr().out
+
+
+def test_policy_promote_requires_confirm(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--promote",
+        "candidate-x",
+        "--evidence",
+        "eval-report-7",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 2
+
+    assert "requires --confirm" in capsys.readouterr().out
+
+
+def test_policy_promote_a_fresh_candidate_is_denied(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    # The operator-facing pin of "promotion requires evidence-gathering
+    # first": even with --confirm and an evidence string, a CANDIDATE cannot
+    # jump straight to PROMOTED.
+    _register_policy(tmp_path)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--promote",
+        "candidate-x",
+        "--evidence",
+        "eval-report-7",
+        "--confirm",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 1
+
+    assert "is not legal" in capsys.readouterr().out
+
+
+def test_policy_promote_a_benchmarked_candidate_succeeds(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _register_policy(tmp_path)
+    PolicyRegistryStore(tmp_path).transition(
+        "candidate-x", 1, PolicyLifecycle.BENCHMARKED, evidence_basis="eval-report-6"
+    )
+    _argv(
+        monkeypatch,
+        "policy",
+        "--promote",
+        "candidate-x",
+        "--evidence",
+        "eval-report-7",
+        "--confirm",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "lifecycle=promoted" in out
+    assert "promoted" in out
+    record = PolicyRegistryStore(tmp_path).get("candidate-x")
+    assert record.lifecycle is PolicyLifecycle.PROMOTED
+    assert record.evidence_basis == "eval-report-7"
+
+
+def test_policy_promote_unknown_id_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(
+        monkeypatch,
+        "policy",
+        "--promote",
+        "no-such",
+        "--evidence",
+        "eval-report-7",
+        "--confirm",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 1
+
+    assert "unknown registered policy 'no-such'" in capsys.readouterr().out

@@ -15,14 +15,18 @@ from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.policies import (
     ADAPTIVE_CONTEXT_POLICY,
     BASELINE_POLICY,
+    MAX_POLICY_TEXT,
     MAX_POLICY_WORKERS,
     PATIENT_ROUTER_POLICY,
     ContextAllocationBounds,
     ExecutionPolicy,
+    PolicyLifecycle,
+    PolicyRecord,
     PolicyRoutingKnobs,
     UnknownPolicyError,
     builtin_policies,
     resolve_policy,
+    transition_policy_record,
 )
 from loopforge.domain.routing import ModelRequirements, ModelTier, RoutingPolicyConfig
 
@@ -272,3 +276,127 @@ def test_resolve_policy_fails_closed_on_unknown_id() -> None:
 def test_resolve_policy_fails_closed_on_unknown_version() -> None:
     with pytest.raises(UnknownPolicyError, match="unknown version"):
         resolve_policy("baseline", version=99)
+
+
+# --- Policy registry lifecycle vocabulary (PACS-017 M6) ----------------------
+
+
+def _record(**overrides: object) -> PolicyRecord:
+    base: dict[str, object] = {
+        "policy": _policy(),
+        "lifecycle": PolicyLifecycle.CANDIDATE,
+        "evidence_basis": "registered by operator",
+    }
+    base.update(overrides)
+    return PolicyRecord(**base)  # pyright: ignore[reportArgumentType]
+
+
+def test_lifecycle_vocabulary_is_closed() -> None:
+    assert {state.value for state in PolicyLifecycle} == {
+        "candidate",
+        "shadowed",
+        "benchmarked",
+        "promoted",
+        "retired",
+    }
+
+
+def test_record_constructs_with_a_referenced_basis() -> None:
+    record = _record(note="first cut")
+    assert record.lifecycle is PolicyLifecycle.CANDIDATE
+    assert record.evidence_basis == "registered by operator"
+    assert record.note == "first cut"
+
+
+def test_record_note_defaults_to_empty() -> None:
+    assert _record().note == ""
+
+
+@pytest.mark.parametrize("basis", ["", "   "])
+def test_record_rejects_a_blank_evidence_basis(basis: str) -> None:
+    with pytest.raises(ValueError, match="evidence_basis cannot be empty"):
+        _record(evidence_basis=basis)
+
+
+@pytest.mark.parametrize("field_name", ["evidence_basis", "note"])
+def test_record_text_is_bounded(field_name: str) -> None:
+    with pytest.raises(ValueError, match=rf"{field_name} must be at most {MAX_POLICY_TEXT}"):
+        _record(**{field_name: "x" * (MAX_POLICY_TEXT + 1)})
+
+
+@pytest.mark.parametrize("field_name", ["evidence_basis", "note"])
+def test_record_text_rejects_control_characters(field_name: str) -> None:
+    with pytest.raises(ValueError, match=rf"{field_name} must not contain control characters"):
+        _record(**{field_name: "basis\nwith newline"})
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        (PolicyLifecycle.CANDIDATE, PolicyLifecycle.SHADOWED),
+        (PolicyLifecycle.CANDIDATE, PolicyLifecycle.BENCHMARKED),
+        (PolicyLifecycle.CANDIDATE, PolicyLifecycle.RETIRED),
+        (PolicyLifecycle.SHADOWED, PolicyLifecycle.BENCHMARKED),
+        (PolicyLifecycle.SHADOWED, PolicyLifecycle.PROMOTED),
+        (PolicyLifecycle.SHADOWED, PolicyLifecycle.RETIRED),
+        (PolicyLifecycle.BENCHMARKED, PolicyLifecycle.PROMOTED),
+        (PolicyLifecycle.BENCHMARKED, PolicyLifecycle.RETIRED),
+    ],
+)
+def test_legal_transitions_move_the_record(
+    source: PolicyLifecycle, target: PolicyLifecycle
+) -> None:
+    record = _record(lifecycle=source)
+    updated = transition_policy_record(record, target, evidence_basis="eval-report-7")
+    assert updated.lifecycle is target
+    assert updated.evidence_basis == "eval-report-7"
+    assert updated.policy == record.policy
+    # Pure: the source record is untouched.
+    assert record.lifecycle is source
+
+
+@pytest.mark.parametrize(
+    ("source", "target"),
+    [
+        # A fresh candidate can never jump straight to PROMOTED: promotion
+        # always passes through an evidence-gathering state first (rule 16).
+        (PolicyLifecycle.CANDIDATE, PolicyLifecycle.PROMOTED),
+        # Terminal states never mutate: supersession is re-registration of
+        # a NEW version, never a silent flip of a promoted/retired record.
+        (PolicyLifecycle.PROMOTED, PolicyLifecycle.CANDIDATE),
+        (PolicyLifecycle.PROMOTED, PolicyLifecycle.RETIRED),
+        (PolicyLifecycle.RETIRED, PolicyLifecycle.CANDIDATE),
+        (PolicyLifecycle.RETIRED, PolicyLifecycle.PROMOTED),
+        # No backward or lateral moves outside the table.
+        (PolicyLifecycle.SHADOWED, PolicyLifecycle.CANDIDATE),
+        (PolicyLifecycle.BENCHMARKED, PolicyLifecycle.SHADOWED),
+        (PolicyLifecycle.BENCHMARKED, PolicyLifecycle.CANDIDATE),
+    ],
+)
+def test_illegal_transitions_fail_closed(source: PolicyLifecycle, target: PolicyLifecycle) -> None:
+    with pytest.raises(ValueError, match=r"lifecycle transition .* is not legal"):
+        transition_policy_record(_record(lifecycle=source), target, evidence_basis="eval-report-7")
+
+
+def test_transition_requires_a_fresh_evidence_basis() -> None:
+    with pytest.raises(ValueError, match="evidence_basis cannot be empty"):
+        transition_policy_record(_record(), PolicyLifecycle.SHADOWED, evidence_basis="   ")
+
+
+def test_transition_carries_the_note_unless_replaced() -> None:
+    record = _record(note="keep me")
+    carried = transition_policy_record(record, PolicyLifecycle.SHADOWED, evidence_basis="run-3")
+    assert carried.note == "keep me"
+    replaced = transition_policy_record(
+        record, PolicyLifecycle.SHADOWED, evidence_basis="run-3", note="new note"
+    )
+    assert replaced.note == "new note"
+
+
+def test_no_self_promotion_path_exists_in_the_domain() -> None:
+    # Structural pin: a record can only reach PROMOTED through an explicit
+    # operator transition call carrying a fresh evidence basis — the record
+    # itself is frozen, so no in-place mutation path exists at all.
+    record = _record(lifecycle=PolicyLifecycle.SHADOWED)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        record.lifecycle = PolicyLifecycle.PROMOTED  # type: ignore[misc]

@@ -308,3 +308,119 @@ def resolve_policy(policy_id: str, *, version: int | None = None) -> ExecutionPo
             return policy
     msg_2 = f"unknown version {version} for policy {policy_id!r}"
     raise UnknownPolicyError(msg_2)
+
+
+# --- Operator-owned lifecycle vocabulary (PACS-017 M6) -----------------------------
+#
+# The registry of candidate policies is operator-owned state, but its
+# vocabulary and legal transitions are code-owned domain rules: a
+# candidate can never self-promote (nothing in the runtime performs
+# lifecycle transitions — only operator entrypoints do), and every
+# transition requires an explicit evidence basis (rule 16).
+
+MAX_POLICY_TEXT: Final[int] = 256
+
+
+class PolicyLifecycle(StrEnum):
+    """Closed lifecycle of a registered candidate policy.
+
+    ``CANDIDATE`` is the entry state; evidence-gathering states are
+    ``SHADOWED`` (evidence-only shadow decisions recorded) and
+    ``BENCHMARKED`` (locked-suite laboratory evidence recorded); the only
+    terminal states are ``PROMOTED`` and ``RETIRED``.
+    """
+
+    CANDIDATE = "candidate"
+    SHADOWED = "shadowed"
+    BENCHMARKED = "benchmarked"
+    PROMOTED = "promoted"
+    RETIRED = "retired"
+
+
+_LEGAL_TRANSITIONS: Final[dict[PolicyLifecycle, frozenset[PolicyLifecycle]]] = {
+    PolicyLifecycle.CANDIDATE: frozenset(
+        {PolicyLifecycle.SHADOWED, PolicyLifecycle.BENCHMARKED, PolicyLifecycle.RETIRED}
+    ),
+    PolicyLifecycle.SHADOWED: frozenset(
+        {PolicyLifecycle.BENCHMARKED, PolicyLifecycle.PROMOTED, PolicyLifecycle.RETIRED}
+    ),
+    PolicyLifecycle.BENCHMARKED: frozenset({PolicyLifecycle.PROMOTED, PolicyLifecycle.RETIRED}),
+    # PROMOTED and RETIRED are terminal: supersession is an explicit
+    # operator re-registration of a NEW version, never a silent mutation.
+    PolicyLifecycle.PROMOTED: frozenset(),
+    PolicyLifecycle.RETIRED: frozenset(),
+}
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class PolicyRecord:
+    """One operator-owned registry entry: a versioned policy and its lifecycle.
+
+    ``evidence_basis`` references the auditable basis for the current
+    lifecycle state (a benchmark report id, a shadowed run reference, or
+    an operator note) — required for every state, so no record can exist
+    without an explicable provenance. ``note`` is optional bounded
+    operator commentary.
+    """
+
+    policy: ExecutionPolicy
+    lifecycle: PolicyLifecycle
+    evidence_basis: str
+    note: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.policy, ExecutionPolicy):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "policy must be an ExecutionPolicy"
+            raise TypeError(msg)
+        if not isinstance(self.lifecycle, PolicyLifecycle):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg_2 = "lifecycle must be a PolicyLifecycle"
+            raise TypeError(msg_2)
+        for field_name, value in (
+            ("evidence_basis", self.evidence_basis),
+            ("note", self.note),
+        ):
+            if not isinstance(value, str):  # pyright: ignore[reportUnnecessaryIsInstance]
+                msg_3 = f"{field_name} must be a string"
+                raise TypeError(msg_3)
+            if len(value) > MAX_POLICY_TEXT:
+                msg_4 = f"{field_name} must be at most {MAX_POLICY_TEXT} characters"
+                raise ValueError(msg_4)
+            if any(ord(char) < 32 or ord(char) == 127 for char in value):
+                msg_5 = f"{field_name} must not contain control characters"
+                raise ValueError(msg_5)
+        if not self.evidence_basis.strip():
+            msg_6 = "evidence_basis cannot be empty — every lifecycle state needs a basis"
+            raise ValueError(msg_6)
+
+
+def transition_policy_record(
+    record: PolicyRecord,
+    to: PolicyLifecycle,
+    *,
+    evidence_basis: str,
+    note: str | None = None,
+) -> PolicyRecord:
+    """Move a record along the closed transition table; fail closed otherwise.
+
+    Every transition requires a fresh evidence basis naming why the state
+    changed — promotion without referenced evidence is unrepresentable.
+    The function is pure: persistence is the operator-owned store's job.
+    """
+    if not isinstance(record, PolicyRecord):  # pyright: ignore[reportUnnecessaryIsInstance]
+        msg = "record must be a PolicyRecord"
+        raise TypeError(msg)
+    if not isinstance(to, PolicyLifecycle):  # pyright: ignore[reportUnnecessaryIsInstance]
+        msg_2 = "target lifecycle must be a PolicyLifecycle"
+        raise TypeError(msg_2)
+    if to not in _LEGAL_TRANSITIONS[record.lifecycle]:
+        legal = ", ".join(sorted(state.value for state in _LEGAL_TRANSITIONS[record.lifecycle]))
+        msg_3 = f"lifecycle transition {record.lifecycle.value} -> {to.value} is not legal" + (
+            f" (legal: {legal})" if legal else " (terminal state)"
+        )
+        raise ValueError(msg_3)
+    return PolicyRecord(
+        policy=record.policy,
+        lifecycle=to,
+        evidence_basis=evidence_basis,
+        note=record.note if note is None else note,
+    )

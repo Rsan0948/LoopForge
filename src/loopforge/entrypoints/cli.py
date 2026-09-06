@@ -32,7 +32,12 @@ from loopforge.domain.benchmarks import (
 )
 from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.events import ArtifactRecorded, RunStopped
-from loopforge.domain.policies import UnknownPolicyError, resolve_policy
+from loopforge.domain.policies import (
+    PolicyLifecycle,
+    PolicyRecord,
+    UnknownPolicyError,
+    resolve_policy,
+)
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
@@ -61,6 +66,12 @@ from loopforge.entrypoints.eval import (
     resolve_configurations,
 )
 from loopforge.entrypoints.orchestrated import build_orchestrated_repair_runtime
+from loopforge.entrypoints.policy import (
+    PolicyRegistryConflictError,
+    PolicyRegistryError,
+    PolicyRegistryStore,
+    UnknownPolicyRecordError,
+)
 from loopforge.entrypoints.profile import LoopProfile, ProfileError, load_profile
 from loopforge.entrypoints.repair import (
     RepairRuntimeDeps,
@@ -894,6 +905,84 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
     return 0
 
 
+def _print_policy_record(record: PolicyRecord) -> None:
+    policy = record.policy
+    print(f"policy={policy.policy_id} version={policy.version} lifecycle={record.lifecycle.value}")
+    print(f"evidence basis: {record.evidence_basis}")
+    if record.note:
+        print(f"note: {record.note}")
+    allocation = policy.context_allocation
+    print(
+        f"context allocation: floor={allocation.floor_tokens} "
+        f"ceiling={allocation.ceiling_tokens} reserve={allocation.reserve_tokens} "
+        f"step={allocation.step_tokens} low-util={allocation.low_utilization_fraction}"
+    )
+    routing = policy.routing
+    print(
+        f"routing: default-tier={routing.default_tier.value} "
+        f"stall-threshold={routing.stall_escalation_threshold} "
+        f"budget-pressure={routing.budget_pressure_remaining_fraction}"
+    )
+    print(
+        f"verify read-only turns: {policy.verify_read_only_turns} "
+        f"worker count: {policy.worker_count}"
+    )
+
+
+def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps one return per outcome
+    """Operator-owned candidate policy registry (PACS-017 M6).
+
+    Local-file only, mirroring ``eval --list/--show``: the registry under
+    --registry-dir is operator-owned state. ``--promote`` moves one record
+    to PROMOTED and requires both a referenced evidence basis (rule 16)
+    and the explicit ``--confirm`` flag — promotion is never implicit, and
+    no runtime path performs it.
+    """
+    store = PolicyRegistryStore(Path(args.registry_dir))
+    try:
+        if args.list:
+            records = store.list()
+            if not records:
+                print(f"no registered policies in {args.registry_dir}")
+                return 0
+            print(f"{'policy':<28} {'ver':>3} {'lifecycle':<12} evidence basis")
+            for record in records:
+                print(
+                    f"{record.policy.policy_id:<28} {record.policy.version:>3} "
+                    f"{record.lifecycle.value:<12} {record.evidence_basis}"
+                )
+            return 0
+        if args.show is not None:
+            _print_policy_record(store.get(args.show, version=args.version))
+            return 0
+        if args.promote is not None:
+            if not args.evidence:
+                print("error: policy --promote requires --evidence TEXT (the referenced basis)")
+                return 2
+            if not args.confirm:
+                print("error: policy --promote requires --confirm (explicit operator action)")
+                return 2
+            record = store.get(args.promote, version=args.version)
+            updated = store.transition(
+                record.policy.policy_id,
+                record.policy.version,
+                PolicyLifecycle.PROMOTED,
+                evidence_basis=args.evidence,
+                note=args.note,
+            )
+            _print_policy_record(updated)
+            print("promoted")
+            return 0
+    except (UnknownPolicyRecordError, PolicyRegistryConflictError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+    except PolicyRegistryError as exc:
+        print(f"error: {exc}")
+        return 1
+    print("error: policy requires one of --list, --show ID, or --promote ID")
+    return 2
+
+
 def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
     parser = argparse.ArgumentParser(prog="loopforge", epilog="legacy commands: {demo,repair-demo}")
     parser.add_argument(
@@ -907,6 +996,7 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
             "serve",
             "eval",
             "replay",
+            "policy",
         ],
     )
     parser.add_argument(
@@ -989,13 +1079,14 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
     parser.add_argument(
         "--list",
         action="store_true",
-        help="eval only: list stored eval reports in --results-dir and exit",
+        help="eval/policy only: list stored reports (eval) or registered policies "
+        "(policy) and exit",
     )
     parser.add_argument(
         "--show",
-        metavar="REPORT_ID",
+        metavar="ID",
         default=None,
-        help="eval only: reprint the stored eval report REPORT_ID and exit",
+        help="eval/policy only: reprint the stored report or registered policy ID and exit",
     )
     parser.add_argument(
         "--host",
@@ -1073,6 +1164,42 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         help="serve only: operator-owned eval report store the /api/evals routes read "
         "(default: DATA-DIR/evals)",
     )
+    parser.add_argument(
+        "--registry-dir",
+        metavar="DIR",
+        default=".loopforge/policies",
+        help="policy only: operator-owned policy registry directory",
+    )
+    parser.add_argument(
+        "--promote",
+        metavar="ID",
+        default=None,
+        help="policy only: promote the registered policy ID (requires --evidence and --confirm)",
+    )
+    parser.add_argument(
+        "--version",
+        metavar="N",
+        type=int,
+        default=None,
+        help="policy only: record version for --show/--promote (default: latest)",
+    )
+    parser.add_argument(
+        "--evidence",
+        metavar="TEXT",
+        default=None,
+        help="policy only: referenced evidence basis for --promote (rule 16)",
+    )
+    parser.add_argument(
+        "--note",
+        metavar="TEXT",
+        default=None,
+        help="policy only: optional operator note recorded with --promote",
+    )
+    parser.add_argument(
+        "--confirm",
+        action="store_true",
+        help="policy only: explicit confirmation token required by --promote",
+    )
     args = parser.parse_args()
     if args.profile is not None and args.command != "loop":
         parser.error(f"unrecognized arguments: {args.profile}")
@@ -1109,6 +1236,8 @@ def main() -> int:  # noqa: PLR0911 - CLI dispatch keeps one return per command
         return _eval(args)
     if args.command == "replay":
         return _replay(args)
+    if args.command == "policy":
+        return _policy(args)
     if args.command == "serve":
         return _serve(
             host=args.host,
