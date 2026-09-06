@@ -23,6 +23,10 @@ from loopforge.application.counterfactual import (
     counterfactual_redrive,
 )
 from loopforge.application.eval_runner import run_trials
+from loopforge.application.policy_heuristics import (
+    HeuristicDerivationError,
+    derive_candidate_policy,
+)
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.benchmarks import (
@@ -71,6 +75,7 @@ from loopforge.entrypoints.policy import (
     PolicyRegistryError,
     PolicyRegistryStore,
     UnknownPolicyRecordError,
+    shadow_budget_samples,
 )
 from loopforge.entrypoints.profile import LoopProfile, ProfileError, load_profile
 from loopforge.entrypoints.repair import (
@@ -985,7 +990,61 @@ def _policy(args: argparse.Namespace) -> int:  # noqa: PLR0911 - CLI flow keeps 
     return 2
 
 
-def main() -> int:  # noqa: PLR0911, PLR0915 - CLI dispatch keeps one return per command
+def _derive_policy(args: argparse.Namespace) -> int:
+    """Derive a suggested candidate from stored eval evidence (PACS-017 M8).
+
+    Reads every report in --results-dir (plus shadowed context-budget
+    samples from --sqlite when given), reduces them through the bounded,
+    deterministic heuristics, and registers the suggestion as a
+    CANDIDATE with its evidence basis. Never applied, never promoted —
+    the suggestion is operator-reviewed like any hand-authored candidate.
+    """
+    eval_reports = EvalReportStore(Path(args.results_dir))
+    try:
+        summaries = eval_reports.list()
+        if not summaries:
+            print(f"error: no eval reports in {args.results_dir} to derive from")
+            return 1
+        reports = tuple(eval_reports.load(summary.report_id) for summary in summaries)
+        shadow_samples: tuple[int, ...] = ()
+        if args.sqlite is not None:
+            event_store = SQLiteEventStore(Path(args.sqlite), codec=JsonEventCodec())
+            shadow_samples = shadow_budget_samples(event_store)
+        registry = PolicyRegistryStore(Path(args.registry_dir))
+        if args.version is not None:
+            version = args.version
+        else:
+            existing = [
+                record.policy.version
+                for record in registry.list()
+                if record.policy.policy_id == args.derive
+            ]
+            version = max(existing, default=0) + 1
+        suggestion = derive_candidate_policy(
+            reports,
+            policy_id=args.derive,
+            version=version,
+            shadow_budget_tokens=shadow_samples,
+        )
+        record = registry.register(suggestion.policy, evidence_basis=suggestion.evidence_basis)
+    except HeuristicDerivationError as exc:
+        print(f"error: {exc}")
+        return 1
+    except (EvalReportStoreError, PolicyRegistryError) as exc:
+        print(f"error: {exc}")
+        return 1
+    except ValueError as exc:
+        # Domain validation of the requested id/version: a usage error.
+        print(f"error: {exc}")
+        return 2
+    for line in suggestion.rationale:
+        print(f"rationale: {line}")
+    _print_policy_record(record)
+    print("registered as CANDIDATE — review the evidence, then promote explicitly")
+    return 0
+
+
+def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one return per command
     parser = argparse.ArgumentParser(prog="loopforge", epilog="legacy commands: {demo,repair-demo}")
     parser.add_argument(
         "command",
@@ -1111,7 +1170,8 @@ def main() -> int:  # noqa: PLR0911, PLR0915 - CLI dispatch keeps one return per
         "--sqlite",
         metavar="PATH",
         default=None,
-        help="serve/replay: use a SQLite event store at PATH instead of Postgres",
+        help="serve/replay/policy: use a SQLite event store at PATH instead of Postgres "
+        "(policy --derive reads shadow evidence from it)",
     )
     parser.add_argument(
         "--run-id",
@@ -1209,6 +1269,14 @@ def main() -> int:  # noqa: PLR0911, PLR0915 - CLI dispatch keeps one return per
         action="store_true",
         help="policy only: explicit confirmation token required by --promote",
     )
+    parser.add_argument(
+        "--derive",
+        metavar="ID",
+        default=None,
+        help="policy only: derive a suggested candidate ID from the eval reports in "
+        "--results-dir (plus shadow evidence from --sqlite when given) and register "
+        "it as CANDIDATE with its evidence basis",
+    )
     args = parser.parse_args()
     if args.profile is not None and args.command != "loop":
         parser.error(f"unrecognized arguments: {args.profile}")
@@ -1246,6 +1314,11 @@ def main() -> int:  # noqa: PLR0911, PLR0915 - CLI dispatch keeps one return per
     if args.command == "replay":
         return _replay(args)
     if args.command == "policy":
+        if args.derive is not None:
+            if args.list or args.show is not None or args.promote is not None:
+                print("error: policy --derive cannot be combined with --list/--show/--promote")
+                return 2
+            return _derive_policy(args)
         return _policy(args)
     if args.command == "serve":
         return _serve(

@@ -26,10 +26,12 @@ from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.benchmarks import BenchmarkReport, ConfigReport
 from loopforge.domain.context_lifecycle import ContextTokenBudget
+from loopforge.domain.events import PlanCreated, RunStarted, ShadowDecisionRecorded
 from loopforge.domain.policies import (
     ContextAllocationBounds,
     ExecutionPolicy,
     PolicyLifecycle,
+    ShadowDecisionKind,
 )
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import default_controller_template
@@ -42,7 +44,7 @@ from loopforge.domain.tooling import (
     SideEffectClass,
     ToolMetadata,
 )
-from loopforge.domain.types import ActionId, BudgetLimit, Permission, RiskLevel
+from loopforge.domain.types import ActionId, BudgetLimit, EventId, Permission, RiskLevel, RunId
 from loopforge.entrypoints.cli import build_ollama_model, main
 from loopforge.entrypoints.eval import EvalReportStore
 from loopforge.entrypoints.policy import PolicyRegistryStore
@@ -1136,3 +1138,181 @@ def test_policy_promote_unknown_id_fails_closed(
     assert main() == 1
 
     assert "unknown registered policy 'no-such'" in capsys.readouterr().out
+
+
+# --- policy --derive: statistical heuristics (PACS-017 M8) ----------------------
+
+_DERIVE_LOCK = "abcdef0123456789" * 4
+
+
+def _seed_eval_report(results_dir: Path, report_id: str = "eval-seed") -> None:
+    store = EvalReportStore(results_dir)
+    store.save(
+        BenchmarkReport(
+            report_id=report_id,
+            suite_version="1.0.0",
+            lock_hash=_DERIVE_LOCK,
+            config_reports=(
+                ConfigReport(
+                    config_id="baseline",
+                    task_id="bench-transient-api",
+                    trials=2,
+                    successes=2,
+                    false_successes=0,
+                    success_rate=1.0,
+                    false_success_rate=0.0,
+                    mean_cost_usd=0.02,
+                    mean_latency_seconds=1.0,
+                    mean_total_tokens=240.0,
+                    mean_human_interventions=0.0,
+                    mean_context_tokens_used=2000.0,
+                    mean_context_items_dropped=0.0,
+                    mean_recovery_events=0.6,
+                ),
+            ),
+            pareto_config_ids=("baseline",),
+        )
+    )
+
+
+def test_policy_derive_without_eval_reports_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(
+        monkeypatch,
+        "policy",
+        "--derive",
+        "derived-candidate",
+        "--results-dir",
+        str(tmp_path / "evals"),
+        "--registry-dir",
+        str(tmp_path / "policies"),
+    )
+
+    assert main() == 1
+
+    assert "no eval reports" in capsys.readouterr().out
+
+
+def test_policy_derive_registers_a_candidate_with_its_evidence_basis(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    results_dir = tmp_path / "evals"
+    registry_dir = tmp_path / "policies"
+    _seed_eval_report(results_dir)
+    _argv(
+        monkeypatch,
+        "policy",
+        "--derive",
+        "derived-candidate",
+        "--results-dir",
+        str(results_dir),
+        "--registry-dir",
+        str(registry_dir),
+    )
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    assert "rationale: context ceiling 2048" in out
+    # mean recovery 0.6 crosses the patience bound → threshold 3.
+    assert "rationale: stall escalation threshold 3" in out
+    assert "lifecycle=candidate" in out
+    assert "registered as CANDIDATE" in out
+    record = PolicyRegistryStore(registry_dir).get("derived-candidate")
+    assert record.lifecycle is PolicyLifecycle.CANDIDATE
+    assert record.evidence_basis == "heuristic derivation from eval reports: eval-seed"
+    assert record.policy.context_allocation.ceiling_tokens == 2048
+
+
+def test_policy_derive_defaults_to_the_next_free_version(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    results_dir = tmp_path / "evals"
+    registry_dir = tmp_path / "policies"
+    _seed_eval_report(results_dir)
+    for expected_version in (1, 2):
+        _argv(
+            monkeypatch,
+            "policy",
+            "--derive",
+            "derived-candidate",
+            "--results-dir",
+            str(results_dir),
+            "--registry-dir",
+            str(registry_dir),
+        )
+        assert main() == 0
+        assert f"version={expected_version}" in capsys.readouterr().out
+
+
+def test_policy_derive_reads_shadow_evidence_from_sqlite(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    results_dir = tmp_path / "evals"
+    registry_dir = tmp_path / "policies"
+    _seed_eval_report(results_dir)
+    now = datetime(2026, 9, 6, tzinfo=UTC)
+    run_id = RunId("run_derive_shadow")
+    event_store = SQLiteEventStore(tmp_path / "events.db", codec=JsonEventCodec())
+    event_store.append(
+        RunStarted(
+            event_id=EventId("e1"), run_id=run_id, occurred_at=now, sequence=1, objective="probe"
+        ),
+        expected_version=0,
+    )
+    event_store.append(
+        PlanCreated(event_id=EventId("e2"), run_id=run_id, occurred_at=now, sequence=2, plan="p"),
+        expected_version=1,
+    )
+    event_store.append(
+        ShadowDecisionRecorded(
+            event_id=EventId("e3"),
+            run_id=run_id,
+            occurred_at=now,
+            sequence=3,
+            policy_id="candidate-shadow",
+            policy_version=2,
+            kind=ShadowDecisionKind.CONTEXT_BUDGET,
+            decision="max_tokens=8192 reserve_tokens=256",
+            basis="dropped_over_budget=False utilization_fraction=0.9",
+        ),
+        expected_version=2,
+    )
+    _argv(
+        monkeypatch,
+        "policy",
+        "--derive",
+        "derived-candidate",
+        "--results-dir",
+        str(results_dir),
+        "--registry-dir",
+        str(registry_dir),
+        "--sqlite",
+        str(tmp_path / "events.db"),
+    )
+
+    assert main() == 0
+
+    out = capsys.readouterr().out
+    # p90 of [2000, 8192] is 8192 — the shadow sample moved the suggestion.
+    assert "context ceiling 8192" in out
+    assert "(+1 shadow samples)" in out
+
+
+def test_policy_derive_cannot_combine_with_other_actions(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], tmp_path: Path
+) -> None:
+    _argv(
+        monkeypatch,
+        "policy",
+        "--derive",
+        "derived-candidate",
+        "--list",
+        "--registry-dir",
+        str(tmp_path),
+    )
+
+    assert main() == 2
+
+    assert "cannot be combined" in capsys.readouterr().out

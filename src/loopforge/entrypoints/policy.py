@@ -24,16 +24,19 @@ from pathlib import Path
 from typing import Final, cast
 
 from loopforge.adapters.system_time import SystemClock
+from loopforge.domain.events import ShadowDecisionRecorded
 from loopforge.domain.policies import (
     ContextAllocationBounds,
     ExecutionPolicy,
     PolicyLifecycle,
     PolicyRecord,
     PolicyRoutingKnobs,
+    ShadowDecisionKind,
     transition_policy_record,
 )
 from loopforge.domain.routing import ModelTier
 from loopforge.ports.clock import ClockPort
+from loopforge.ports.state_store import StateStorePort
 
 REGISTRY_SCHEMA_VERSION: Final = 1
 
@@ -284,3 +287,26 @@ class PolicyRegistryStore:
         return tuple(
             record for record in self.list() if record.lifecycle is PolicyLifecycle.PROMOTED
         )
+
+
+def shadow_budget_samples(store: StateStorePort) -> tuple[int, ...]:
+    """Context-budget max_tokens values from journaled shadow decisions.
+
+    Shadow evidence for the M8 heuristics: every ``max_tokens=N`` a
+    shadowed candidate advised across every run in the store. Unparseable
+    decisions are skipped honestly (the shadow payload format is
+    code-owned but evidence-only); the samples inform — never apply — a
+    derived candidate.
+    """
+    samples: list[int] = []
+    for record in store.list_runs():
+        for event in store.events_for(record.run_id):
+            if (
+                isinstance(event, ShadowDecisionRecorded)
+                and event.kind is ShadowDecisionKind.CONTEXT_BUDGET
+            ):
+                first, _, _ = event.decision.partition(" ")
+                name, _, value = first.partition("=")
+                if name == "max_tokens" and value.isdigit():
+                    samples.append(int(value))
+    return tuple(samples)
