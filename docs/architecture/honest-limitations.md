@@ -94,6 +94,11 @@ honestly").
 - **UI evidence links resolve by name, not by hash.** A basis naming a
   stored report links to it; the console does not verify the report's
   content is what the basis author saw.
+- **The packaged console is the same unauthenticated server.**
+  `loopforge console` (pipx/PyPI install) serves the prebuilt UI shipped in
+  the wheel over a SQLite store under `~/.loopforge/console`, bound to a
+  free loopback port. It inherits every limitation above — loopback-only,
+  no auth, read-mostly with confirm-gated writes.
 
 ## Engineering boundaries
 

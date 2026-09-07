@@ -73,7 +73,26 @@ The domain package cannot depend on provider SDKs, databases, Git, HTTP, CLI fra
 
 See `docs/architecture/overview.md` and the ADRs for rationale. The full product capability/dependency map lives in `docs/product/master-build-map.md`; development PACS cycles are explicitly manual and documented in `docs/process/manual-pacs.md`.
 
-## Quick start
+## Install (no clone needed)
+
+Requires Python 3.12+. With [pipx](https://pipx.pypa.io):
+
+```bash
+pipx install loopforge-console
+loopforge console
+```
+
+`loopforge console` serves the prebuilt console UI that ships inside the
+package — no npm, no Postgres, no flags. It picks a free loopback port, stores
+state under `~/.loopforge/console` (SQLite), and opens your browser.
+
+One-line installer (checks Python, installs pipx if missing, then the package):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Rsan0948/LoopForge/main/install.sh | bash
+```
+
+## Quick start (development)
 
 ```bash
 python -m venv .venv
@@ -102,7 +121,10 @@ cd ui && npm ci && npm run build && cd ..
 
 The server binds 127.0.0.1 only and has no authentication — it is a
 trusted-operator local tool. `--sqlite PATH` swaps the store for a local
-SQLite file with identical semantics. See `ui/README.md` and
+SQLite file with identical semantics. When `--static-dir` is omitted, `serve`
+mounts the packaged console assets (or a checkout's `ui/dist`); from a
+pipx/PyPI install, `loopforge console` is the zero-flags equivalent.
+See `ui/README.md` and
 `docs/process/cycles/PACS-014-operator-command-center.md`.
 
 The Postgres integration suite never touches the server's database: it runs

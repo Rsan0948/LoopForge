@@ -12,3 +12,6 @@ build/
 .loopforge/
 .DS_Store
 output/
+
+# local playwright-cli artifacts
+.playwright-cli/

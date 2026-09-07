@@ -911,17 +911,31 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
 
     _warn_unless_loopback(host, port)
 
+    from loopforge.entrypoints.console import console_static_dir  # noqa: PLC0415
+
+    resolved_static = Path(static_dir) if static_dir else console_static_dir()
     settings = ServerSettings(
         store_kind="sqlite" if sqlite is not None else "postgres",
         dsn=dsn,
         sqlite_path=sqlite if sqlite is not None else ".loopforge/server/events.db",
         data_dir=Path(data_dir),
-        static_dir=Path(static_dir) if static_dir else None,
+        static_dir=resolved_static,
         evals_dir=Path(evals_dir) if evals_dir else None,
         policies_dir=Path(policies_dir) if policies_dir else None,
     )
     uvicorn.run(create_app(settings), host=host, port=port)
     return 0
+
+
+def _console(*, port: int | None, open_browser: bool) -> int:
+    """Launch the zero-flags console: packaged UI, local SQLite store, free port.
+
+    The friendly front door for ``pipx install loopforge-console`` users: no
+    npm, no Postgres, no flags. State lives under ``~/.loopforge/console``.
+    """
+    from loopforge.entrypoints.console import run_console  # noqa: PLC0415
+
+    return run_console(port=port, open_browser=open_browser)
 
 
 def _print_policy_record(record: PolicyRecord) -> None:
@@ -1104,6 +1118,7 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
             "civicml-loop",
             "loop",
             "serve",
+            "console",
             "eval",
             "replay",
             "policy",
@@ -1206,8 +1221,14 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
     parser.add_argument(
         "--port",
         type=int,
-        default=8123,
-        help="serve only: bind port (default: 8123)",
+        default=None,
+        help="serve only: bind port (default: 8123); console only: bind port "
+        "(default: a free port chosen by the OS)",
+    )
+    parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="console only: do not open a browser tab on start",
     )
     parser.add_argument(
         "--dsn",
@@ -1266,7 +1287,8 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
         "--static-dir",
         metavar="DIR",
         default=None,
-        help="serve only: built UI directory (for example ui/dist) mounted at /",
+        help="serve only: built UI directory (for example ui/dist) mounted at / "
+        "(default: the packaged console assets, or a checkout's ui/dist)",
     )
     parser.add_argument(
         "--evals-dir",
@@ -1391,10 +1413,12 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
                 return 2
             return _derive_policy(args)
         return _policy(args)
+    if args.command == "console":
+        return _console(port=args.port, open_browser=not args.no_browser)
     if args.command == "serve":
         return _serve(
             host=args.host,
-            port=args.port,
+            port=args.port if args.port is not None else 8123,
             dsn=args.dsn,
             sqlite=args.sqlite,
             data_dir=args.data_dir,
