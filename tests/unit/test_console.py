@@ -1,8 +1,9 @@
 """Unit tests for the zero-friction console launcher (entrypoints/console.py).
 
 Rule 10 pairing: allow-paths (asset resolution order, free port, settings
-wiring, browser open) and deny-paths (missing assets refuse to start, no
-server/browser side effects on the denial).
+wiring, browser open only after readiness, port retry) and deny-paths
+(missing assets refuse to start; a server that never becomes ready exits 1
+with no browser side effects).
 """
 
 from __future__ import annotations
@@ -21,6 +22,41 @@ def _make_ui(root: Path) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     (root / "index.html").write_text("<html></html>", encoding="utf-8")
     return root
+
+
+def _fake_uvicorn(monkeypatch: pytest.MonkeyPatch, *, fail_starts: int = 0) -> list[dict[str, Any]]:
+    """Patch uvicorn.Config/Server with in-process fakes; return captured configs.
+
+    The first ``fail_starts`` server instances never reach ``started`` (their
+    ``run`` exits immediately), simulating a lost bind race; later instances
+    start successfully.
+    """
+    configs: list[dict[str, Any]] = []
+    starts = {"seen": 0}
+
+    class FakeConfig:
+        def __init__(self, app: object, **kwargs: object) -> None:
+            configs.append({"app": app, **kwargs})
+
+    class FakeServer:
+        def __init__(self, config: FakeConfig) -> None:
+            self.config = config
+            self.started = False
+            self.should_exit = False
+
+        def run(self) -> None:
+            starts["seen"] += 1
+            if starts["seen"] > fail_starts:
+                self.started = True
+
+    monkeypatch.setattr("uvicorn.Config", FakeConfig)
+    monkeypatch.setattr("uvicorn.Server", FakeServer)
+    return configs
+
+
+def _fast_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(console, "_STARTUP_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(console, "_STARTUP_POLL_S", 0.01)
 
 
 class TestConsoleStaticDir:
@@ -56,9 +92,9 @@ class TestFindFreePort:
 
 
 class TestRunConsole:
-    def test_serves_packaged_ui_over_local_sqlite(
+    def _isolate(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    ) -> tuple[Path, dict[str, Any], list[str]]:
         static = _make_ui(tmp_path / "pkg")
         monkeypatch.setattr(console, "_PACKAGE_STATIC", static)
         monkeypatch.setattr(console, "_REPO_STATIC", tmp_path / "missing-repo")
@@ -66,22 +102,23 @@ class TestRunConsole:
 
         captured: dict[str, Any] = {}
 
-        def fake_create_app(settings: server_module.ServerSettings) -> object:
+        def _create_app(settings: server_module.ServerSettings) -> object:
             captured["settings"] = settings
             return object()
-
-        def fake_run(app: object, **kwargs: object) -> None:
-            captured["app"] = app
-            captured["kwargs"] = kwargs
-
-        opened: list[str] = []
 
         def _open(url: str) -> None:
             opened.append(url)
 
-        monkeypatch.setattr(server_module, "create_app", fake_create_app)
-        monkeypatch.setattr("uvicorn.run", fake_run)
+        opened: list[str] = []
+        monkeypatch.setattr(server_module, "create_app", _create_app)
         monkeypatch.setattr(console.webbrowser, "open", _open)
+        return static, captured, opened
+
+    def test_serves_packaged_ui_over_local_sqlite_after_ready(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        static, captured, opened = self._isolate(tmp_path, monkeypatch)
+        configs = _fake_uvicorn(monkeypatch)
 
         assert console.run_console() == 0
 
@@ -91,9 +128,9 @@ class TestRunConsole:
         assert settings.sqlite_path == str(tmp_path / "state" / "events.db")
         assert settings.data_dir == tmp_path / "state"
         assert settings.static_dir == static
-        kwargs = captured["kwargs"]
-        assert kwargs["host"] == "127.0.0.1"
-        port = kwargs["port"]
+        assert len(configs) == 1
+        assert configs[0]["host"] == "127.0.0.1"
+        port = configs[0]["port"]
         assert isinstance(port, int)
         assert 1024 <= port <= 65535
         assert opened == [f"http://127.0.0.1:{port}/"]
@@ -101,28 +138,47 @@ class TestRunConsole:
     def test_explicit_port_and_no_browser(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        static = _make_ui(tmp_path / "pkg")
-        monkeypatch.setattr(console, "_PACKAGE_STATIC", static)
-        monkeypatch.setattr(console, "_REPO_STATIC", tmp_path / "missing-repo")
-        monkeypatch.setattr(console, "console_data_dir", lambda: tmp_path / "state")
-
-        captured: dict[str, Any] = {}
-
-        def fake_run(app: object, **kwargs: object) -> None:
-            captured["kwargs"] = kwargs
-
-        def fail_open(url: str) -> None:
-            pytest.fail(f"browser must not open: {url}")
-
-        def _create_app(settings: server_module.ServerSettings) -> object:
-            return object()
-
-        monkeypatch.setattr(server_module, "create_app", _create_app)
-        monkeypatch.setattr("uvicorn.run", fake_run)
-        monkeypatch.setattr(console.webbrowser, "open", fail_open)
+        _, _, opened = self._isolate(tmp_path, monkeypatch)
+        configs = _fake_uvicorn(monkeypatch)
 
         assert console.run_console(port=9876, open_browser=False) == 0
-        assert captured["kwargs"]["port"] == 9876
+        assert configs[0]["port"] == 9876
+        assert opened == []
+
+    def test_retries_a_fresh_port_when_the_first_loses_the_race(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, _, opened = self._isolate(tmp_path, monkeypatch)
+        _fast_timeout(monkeypatch)
+        configs = _fake_uvicorn(monkeypatch, fail_starts=1)
+
+        assert console.run_console() == 0
+        assert len(configs) == 2
+        assert configs[0]["port"] != configs[1]["port"]
+        assert opened == [f"http://127.0.0.1:{configs[1]['port']}/"]
+
+    def test_exits_1_without_opening_a_browser_when_startup_never_readies(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _, _, opened = self._isolate(tmp_path, monkeypatch)
+        _fast_timeout(monkeypatch)
+        configs = _fake_uvicorn(monkeypatch, fail_starts=99)
+
+        assert console.run_console() == 1
+        assert len(configs) == console.MAX_START_ATTEMPTS
+        assert opened == []
+        assert "could not start" in capsys.readouterr().err
+
+    def test_explicit_port_failure_does_not_retry(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _, _, opened = self._isolate(tmp_path, monkeypatch)
+        _fast_timeout(monkeypatch)
+        configs = _fake_uvicorn(monkeypatch, fail_starts=99)
+
+        assert console.run_console(port=9876) == 1
+        assert len(configs) == 1
+        assert opened == []
 
     def test_missing_assets_refuse_to_start(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
@@ -130,13 +186,9 @@ class TestRunConsole:
         monkeypatch.setattr(console, "_PACKAGE_STATIC", tmp_path / "missing-pkg")
         monkeypatch.setattr(console, "_REPO_STATIC", tmp_path / "missing-repo")
 
-        def fail_run(app: object, **kwargs: object) -> None:
-            pytest.fail("server must not start without console assets")
-
         def fail_open(url: str) -> None:
             pytest.fail(f"browser must not open: {url}")
 
-        monkeypatch.setattr("uvicorn.run", fail_run)
         monkeypatch.setattr(console.webbrowser, "open", fail_open)
 
         assert console.run_console() == 2
