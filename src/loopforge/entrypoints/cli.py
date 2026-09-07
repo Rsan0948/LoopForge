@@ -1135,7 +1135,11 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
         action="store_true",
         help="loop only: print the resolved profile without running the model or sandbox",
     )
-    parser.add_argument("--repository", default="/Users/rubensanchez/Developer/civicml-loopforge")
+    parser.add_argument(
+        "--repository",
+        default=".",
+        help="civicml-loop only: repository to repair (default: current directory)",
+    )
     parser.add_argument("--container-image", default="civicml-loopforge:integration")
     parser.add_argument(
         "--container",

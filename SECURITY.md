@@ -35,4 +35,10 @@ isolation before LoopForge claims that security property.
 See `docs/security/threat-model.md` and `docs/architecture/sandbox-contract.md` for the full threat
 model and capability contract.
 
-Please report security issues privately rather than opening a public issue.
+## Reporting a vulnerability
+
+Please report security issues privately rather than opening a public issue:
+use GitHub's [private vulnerability reporting](https://github.com/Rsan0948/LoopForge/security/advisories/new)
+("Report a vulnerability" on the repository's Security tab). Include the
+affected version, reproduction steps, and which trust boundary you believe is
+crossed. You can expect an acknowledgement within a few days.

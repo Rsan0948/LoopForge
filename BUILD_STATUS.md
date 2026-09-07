@@ -1,4 +1,11 @@
-# Build status — PACS-016 complete
+# Build status — v1.0 closed (PACS-001…PACS-017)
+
+Open-source readiness re-verified 2026-09-07 on macOS: `uv run pytest -q` —
+**2465 passed, 46 skipped, 0 failed** (skips are the macOS `RLIMIT_AS` platform
+gates and one non-UTF-8-filesystem gate); operator console served end-to-end
+from the seeded demo data (`bash console.sh`).
+
+Historical milestone record (PACS-016):
 
 PACS-016 adds the locked benchmark and multi-trial evaluation laboratory:
 runtime policy is now evaluated scientifically — no judging success from
