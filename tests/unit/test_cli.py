@@ -66,11 +66,14 @@ def _rlimit_as_supported() -> bool:
     return completed.returncode == 0
 
 
+# Only the eval entrypoint still requires full rlimit support: its trusted
+# platform preflight refuses degraded hosts by design. The repair demos run
+# everywhere now that the local sandbox degrades per-limit.
 _REQUIRES_RLIMIT_AS = pytest.mark.skipif(
     not _rlimit_as_supported(),
     reason=(
-        "platform rejects setrlimit(RLIMIT_AS); local sandbox launcher cannot apply "
-        "resource limits, so the trusted repair demo fails closed"
+        "platform rejects setrlimit(RLIMIT_AS); the eval entrypoint's trusted-platform "
+        "preflight refuses degraded hosts"
     ),
 )
 _REQUIRES_GIT = pytest.mark.skipif(
@@ -199,7 +202,6 @@ def test_extra_arguments_exit_with_usage_error(
     assert "unrecognized arguments: extra" in captured.err
 
 
-@_REQUIRES_RLIMIT_AS
 def test_repair_demo_repairs_fixture_and_prints_exact_patch_evidence(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -212,7 +214,9 @@ def test_repair_demo_repairs_fixture_and_prints_exact_patch_evidence(
     lines = captured.out.splitlines()
     assert lines[0].startswith("run=run_")
     assert "status=succeeded" in lines[0]
-    assert "command:run_tests: passed (exit_code=0)" in captured.out
+    # Prefix match: platforms that skip a resource limit append an honest
+    # "; resource limits not enforced ..." note before the closing paren.
+    assert "command:run_tests: passed (exit_code=0" in captured.out
     # PACS-016 M8: the demo's read turn skips verification under the tuned
     # default, so only the workspace-changing write records patch evidence.
     assert "evidence artifacts recorded: 1" in captured.out
@@ -280,7 +284,6 @@ def test_module_main_guard_runs_demo_and_exits_zero(
 # --- PACS-013: orchestrated-repair-demo pins ---
 
 
-@_REQUIRES_RLIMIT_AS
 def test_orchestrated_repair_demo_repairs_calculator_fixture_with_two_workers(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -297,7 +300,9 @@ def test_orchestrated_repair_demo_repairs_calculator_fixture_with_two_workers(
     assert "worker=adder" in captured.out
     assert "worker=greeter" in captured.out
     assert captured.out.count("outcome=succeeded merge=merged") == 2
-    assert "command:run_tests: passed (exit_code=0)" in captured.out
+    # Prefix match: platforms that skip a resource limit append an honest
+    # "; resource limits not enforced ..." note before the closing paren.
+    assert "command:run_tests: passed (exit_code=0" in captured.out
     assert "evidence artifacts recorded: 1" in captured.out
 
 

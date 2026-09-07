@@ -13,7 +13,11 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import BinaryIO, Final
 
-from loopforge.adapters._sandbox_exec import LAUNCHER_ERROR_EXIT, LAUNCHER_ERROR_MARKER
+from loopforge.adapters._sandbox_exec import (
+    LAUNCHER_ERROR_EXIT,
+    LAUNCHER_ERROR_MARKER,
+    LAUNCHER_LIMITS_MARKER,
+)
 from loopforge.domain.security import SandboxCapabilities
 from loopforge.ports.sandbox import (
     SandboxCommandResult,
@@ -24,6 +28,32 @@ from loopforge.ports.sandbox import (
 )
 
 _GIT_DIR_NAME: Final = ".git"
+
+_STATUS_HEADROOM: Final = 256
+"""Extra bytes beyond the workload output budget reserved for the launcher's
+limits-status line: added to RLIMIT_FSIZE (so the status write never trips
+the file-size limit) and to the stderr read (so the line is never truncated).
+The workload-visible stderr budget stays exactly ``max_output_bytes``."""
+
+
+def _extract_launcher_status(stderr: bytes) -> tuple[bytes, tuple[str, ...]]:
+    """Split the launcher's leading limits-status line off the workload's stderr.
+
+    The launcher always prints exactly one ``LAUNCHER_LIMITS_MARKER`` line
+    BEFORE exec, so only the first line can be its status — any marker line a
+    workload prints lands later and stays in the observed stderr untouched.
+    Returns ``(workload_stderr_bytes, skipped_limit_names)``.
+    """
+    marker = LAUNCHER_LIMITS_MARKER.encode()
+    first_line, separator, rest = stderr.partition(b"\n")
+    if not separator or not first_line.startswith(marker):
+        return stderr, ()
+    skipped_text = first_line[len(marker) :].decode("utf-8", errors="replace").strip()
+    skipped_text = skipped_text.removeprefix("skipped=").strip()
+    if skipped_text == "none":
+        return rest, ()
+    skipped = tuple(name for name in skipped_text.split(",") if name)
+    return rest, skipped
 
 
 def _has_unsafe_characters(value: str) -> bool:
@@ -85,6 +115,11 @@ class ConstrainedLocalSandbox:
     This adapter deliberately does not claim network or kernel isolation. It is useful for trusted
     developer workloads and contract testing; hostile-code execution requires a later container/VM
     adapter whose capability flags truthfully report stronger isolation.
+
+    Resource limits are best-effort per platform: each rlimit is applied independently, and a
+    platform rejection (macOS rejects ``RLIMIT_AS``) skips only that limit instead of failing the
+    command. Skipped limits are reported on ``SandboxCommandResult.resource_limits_skipped`` so
+    the degradation is always recorded, never silent.
     """
 
     _CAPABILITIES = SandboxCapabilities(
@@ -212,7 +247,10 @@ class ConstrainedLocalSandbox:
                 str(spec.cpu_seconds),
                 str(self._limits.max_memory_bytes),
                 str(self._limits.max_open_files),
-                str(self._limits.max_output_bytes),
+                # RLIMIT_FSIZE guards the capture files; the launcher's own
+                # limits-status line travels in the headroom so it can never
+                # eat the workload's output budget (or die on SIGXFSZ).
+                str(self._limits.max_output_bytes + _STATUS_HEADROOM),
                 "--",
                 *spec.argv,
             )
@@ -236,7 +274,7 @@ class ConstrainedLocalSandbox:
                 raise SandboxTimeoutError(msg_21) from exc
 
             stdout = self._read_output(stdout_file)
-            stderr = self._read_output(stderr_file)
+            stderr, limits_skipped = self._read_stderr(stderr_file)
             if process.returncode == LAUNCHER_ERROR_EXIT and stderr.startswith(
                 LAUNCHER_ERROR_MARKER
             ):
@@ -247,6 +285,7 @@ class ConstrainedLocalSandbox:
                 stdout=stdout,
                 stderr=stderr,
                 succeeded=process.returncode in spec.allowed_exit_codes,
+                resource_limits_skipped=limits_skipped,
             )
 
     def _safe_path(self, relative_path: str, *, allow_missing: bool) -> Path:
@@ -298,3 +337,16 @@ class ConstrainedLocalSandbox:
         if len(data) > self._limits.max_output_bytes:
             data = data[: self._limits.max_output_bytes]
         return data.decode("utf-8", errors="replace")
+
+    def _read_stderr(self, handle: BinaryIO) -> tuple[str, tuple[str, ...]]:
+        """Read stderr, separating the launcher status line from workload output.
+
+        The workload's stderr is still bounded to ``max_output_bytes`` — the
+        status line travels in the extra headroom, never in the budget.
+        """
+        handle.seek(0)
+        data = handle.read(self._limits.max_output_bytes + 1 + _STATUS_HEADROOM)
+        workload, skipped = _extract_launcher_status(data)
+        if len(workload) > self._limits.max_output_bytes:
+            workload = workload[: self._limits.max_output_bytes]
+        return workload.decode("utf-8", errors="replace"), skipped

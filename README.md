@@ -134,11 +134,15 @@ name does not end in `_test`.
 
 ## Operator usability (PACS-014b)
 
-- **macOS**: the local sandbox fails closed on macOS (the platform rejects
-  RLIMIT_AS), so inline sessions cannot execute checks there. Use container
-  mode: set `sandbox.container_image` in the inline form (or
-  `[sandbox] container_image` in a TOML profile) and write check argv with
-  in-container paths (`{python}` is not substituted in container mode).
+- **macOS**: the local sandbox cannot enforce the memory rlimit there (the
+  platform rejects `RLIMIT_AS`), so the launcher skips only that limit and
+  runs checks anyway; the skip is recorded honestly in the verification
+  detail ("resource limits not enforced by this platform: RLIMIT_AS"). CPU,
+  file-size, open-file, and wall-clock limits still apply. Use container mode
+  for untrusted repositories: set `sandbox.container_image` in the inline
+  form (or `[sandbox] container_image` in a TOML profile) and write check
+  argv with in-container paths (`{python}` is not substituted in container
+  mode).
 - **Stall threshold**: runs stop after 3 consecutive verifications without
   score progress (`STOP_STALLED_NO_PROGRESS`). Small local models that read
   files for several turns before their first edit need headroom — set

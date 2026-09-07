@@ -288,10 +288,14 @@ class RepairVerifier:
                 passed=False,
                 detail=f"sandbox error: {_bounded(str(exc))}",
             )
+        detail = f"exit_code={result.exit_code}"
+        if result.resource_limits_skipped:
+            skipped = ", ".join(result.resource_limits_skipped)
+            detail += f"; resource limits not enforced by this platform: {skipped}"
         return CheckOutcome(
             name=f"command:{name}",
             passed=result.succeeded,
-            detail=f"exit_code={result.exit_code}",
+            detail=detail,
         )
 
     def _patch_outcome(self) -> CheckOutcome:

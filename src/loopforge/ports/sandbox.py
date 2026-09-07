@@ -28,6 +28,10 @@ class SandboxCommandResult:
     stdout: str
     stderr: str
     succeeded: bool
+    resource_limits_skipped: tuple[str, ...] = ()
+    """Resource limits the platform rejected before exec (e.g. ``("RLIMIT_AS",)``
+    on macOS). Empty when every requested limit was enforced. The workload can
+    never spoof this: the launcher emits it ahead of any workload output."""
 
 
 class SandboxPort(Protocol):

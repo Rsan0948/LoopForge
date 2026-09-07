@@ -102,10 +102,17 @@ honestly").
 
 ## Engineering boundaries
 
-- **Platform-gated tests skip with reason codes.** Suites that need
-  `setrlimit(RLIMIT_AS)`, git, or Docker skip where those are unavailable
-  (notably the local-sandbox launcher on this development platform); the
-  skipped paths run in CI environments that provide the capability.
+- **Platform-gated tests skip with reason codes.** Suites that need git or
+  Docker skip where those are unavailable; the skipped paths run in CI
+  environments that provide the capability.
+- **The local sandbox degrades per-limit, honestly.** The launcher applies
+  each rlimit independently; a platform that rejects one (macOS rejects
+  `RLIMIT_AS`) skips only that limit and still runs the command. Every skip
+  is recorded on `SandboxCommandResult.resource_limits_skipped` and surfaced
+  in verification details ("resource limits not enforced by this platform"),
+  so a weaker-than-requested sandbox is always visible in the durable record
+  — never silent. Hostile-code execution still requires the container path;
+  the eval benchmark harness refuses degraded platforms outright.
 - **Local-only repository.** The project ships as a reference
   implementation; there is no hosted service, and release evidence is
   generated locally per the build map.

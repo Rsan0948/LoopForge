@@ -109,8 +109,8 @@ _REQUIRES_GIT = pytest.mark.skipif(
 _REQUIRES_RLIMIT_AS = pytest.mark.skipif(
     not _rlimit_as_supported(),
     reason=(
-        "platform rejects setrlimit(RLIMIT_AS); local sandbox launcher cannot apply "
-        "resource limits, so command execution fails closed"
+        "platform rejects setrlimit(RLIMIT_AS); the eval trusted-platform preflight "
+        "refuses degraded hosts"
     ),
 )
 

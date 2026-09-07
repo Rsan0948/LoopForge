@@ -101,6 +101,29 @@ def _state() -> RunState:
     return RunState(run_id=RunId("run-verifier"))
 
 
+def test_verifier_surfaces_platform_skipped_resource_limits_in_the_detail() -> None:
+    degraded = SandboxCommandResult(
+        exit_code=0,
+        stdout="",
+        stderr="",
+        succeeded=True,
+        resource_limits_skipped=("RLIMIT_AS",),
+    )
+    verifier = RepairVerifier(
+        StubSandbox({"run_tests": degraded}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(allowed_prefixes=("adder.py",), max_changed_files=1),
+    )
+
+    result = verifier.verify(_state())
+
+    assert result.passed
+    assert (
+        "command:run_tests: passed (exit_code=0; "
+        "resource limits not enforced by this platform: RLIMIT_AS)"
+    ) in result.summary
+
+
 def test_verifier_passes_only_when_commands_and_patch_constraints_hold() -> None:
     verifier = RepairVerifier(
         StubSandbox({"run_tests": _result(0)}),

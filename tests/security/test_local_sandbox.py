@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import resource
 import subprocess
 import sys
 import tempfile
@@ -10,6 +11,7 @@ import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
+from loopforge.adapters import _sandbox_exec
 from loopforge.adapters.local_sandbox import (
     CommandSpec,
     ConstrainedLocalSandbox,
@@ -33,13 +35,10 @@ def _rlimit_as_supported() -> bool:
     return completed.returncode == 0
 
 
-# Every successful `run()` spawns `_sandbox_exec.py`, which unconditionally applies
-# RLIMIT_AS. On this macOS kernel the kernel rejects that call with EINVAL, so
-# process-execution behavior is exercised only where the platform supports it.
-_REQUIRES_RLIMIT_AS = pytest.mark.skipif(
-    not _rlimit_as_supported(),
-    reason="platform rejects setrlimit(RLIMIT_AS); launcher cannot apply resource limits",
-)
+# The launcher applies each rlimit independently and skips (honestly, on the
+# result) any limit the platform rejects, so process-execution behavior runs
+# everywhere; the probe only drives platform-conditional assertions.
+_RLIMIT_AS_SUPPORTED = _rlimit_as_supported()
 
 
 def _command(
@@ -274,7 +273,6 @@ def test_run_rejects_unknown_command(tmp_path: Path) -> None:
         sandbox.run("rm-everything")
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_maps_disallowed_exit_code_to_failure(tmp_path: Path) -> None:
     sandbox = _sandbox(
         tmp_path,
@@ -293,7 +291,6 @@ def test_run_maps_disallowed_exit_code_to_failure(tmp_path: Path) -> None:
     assert failure.succeeded is False
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_honors_configured_allowed_exit_codes(tmp_path: Path) -> None:
     sandbox = _sandbox(
         tmp_path,
@@ -304,7 +301,6 @@ def test_run_honors_configured_allowed_exit_codes(tmp_path: Path) -> None:
     assert result.succeeded is True
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_executes_argv_without_shell_interpretation(tmp_path: Path) -> None:
     marker_name = "literal;$(touch pwned).txt"
     (tmp_path / marker_name).write_text("payload", encoding="utf-8")
@@ -318,7 +314,6 @@ def test_run_executes_argv_without_shell_interpretation(tmp_path: Path) -> None:
     assert not (tmp_path / "pwned").exists()
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_executes_in_sandbox_root(tmp_path: Path) -> None:
     (tmp_path / "data.txt").write_text("from-root", encoding="utf-8")
     sandbox = _sandbox(tmp_path, commands=[_sh("/bin/cat data.txt")])
@@ -329,7 +324,6 @@ def test_run_executes_in_sandbox_root(tmp_path: Path) -> None:
     assert result.stdout == "from-root"
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_filters_environment_and_does_not_inherit_host(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -348,7 +342,6 @@ def test_run_filters_environment_and_does_not_inherit_host(
     assert result.stdout == "unset|sandbox-only"
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_without_configured_environment_exposes_no_host_variables(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -361,7 +354,6 @@ def test_run_without_configured_environment_exposes_no_host_variables(
     assert result.stdout == "[unset]"
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_kills_command_exceeding_wall_clock_timeout(tmp_path: Path) -> None:
     sandbox = _sandbox(
         tmp_path,
@@ -381,7 +373,6 @@ def test_run_rejects_non_positive_timeout_override(tmp_path: Path) -> None:
         sandbox.run("sh", timeout_seconds=0)
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_bounds_stdout_capture(tmp_path: Path) -> None:
     (tmp_path / "big.txt").write_text("a" * 64 + "b" * 192, encoding="utf-8")
     sandbox = _sandbox(
@@ -396,7 +387,6 @@ def test_run_bounds_stdout_capture(tmp_path: Path) -> None:
     assert "b" not in result.stdout
 
 
-@_REQUIRES_RLIMIT_AS
 def test_run_bounds_stderr_capture(tmp_path: Path) -> None:
     (tmp_path / "big.txt").write_text("e" * 128, encoding="utf-8")
     sandbox = _sandbox(
@@ -413,7 +403,6 @@ def test_run_bounds_stderr_capture(tmp_path: Path) -> None:
 
 def test_capabilities_report_no_strong_isolation(tmp_path: Path) -> None:
     capabilities = _sandbox(tmp_path).capabilities
-
     assert capabilities.file_api_confined is True
     assert capabilities.symlink_protected is True
     assert capabilities.environment_filtered is True
@@ -429,6 +418,140 @@ def test_capabilities_report_no_strong_isolation(tmp_path: Path) -> None:
         capabilities.require(SandboxRequirements(network_isolated=True))
     with pytest.raises(ValueError, match="kernel_isolated"):
         capabilities.require(SandboxRequirements(kernel_isolated=True))
+
+
+# --- resource-limit degradation (launcher applies limits independently) ----------
+
+
+def test_run_reports_skipped_resource_limits_honestly(tmp_path: Path) -> None:
+    sandbox = _sandbox(tmp_path, commands=[_sh("/usr/bin/true")])
+
+    result = sandbox.run("sh")
+
+    assert result.succeeded is True
+    if _RLIMIT_AS_SUPPORTED:
+        assert result.resource_limits_skipped == ()
+    else:
+        assert "RLIMIT_AS" in result.resource_limits_skipped
+
+
+def test_launcher_status_line_never_leaks_into_observed_stderr(tmp_path: Path) -> None:
+    sandbox = _sandbox(tmp_path, commands=[_sh("/bin/echo workload-err >&2")])
+
+    result = sandbox.run("sh")
+
+    assert result.stderr == "workload-err\n"
+    assert "loopforge-sandbox-launcher" not in result.stderr
+
+
+def test_workload_cannot_spoof_the_limits_status_line(tmp_path: Path) -> None:
+    fake_line = "loopforge-sandbox-launcher-limits: skipped=RLIMIT_CPU,RLIMIT_NOFILE"
+    sandbox = _sandbox(tmp_path, commands=[_sh(f"/bin/echo '{fake_line}' >&2")])
+
+    result = sandbox.run("sh")
+
+    # The workload's own marker line is ordinary output: preserved, not parsed.
+    assert fake_line in result.stderr
+    if _RLIMIT_AS_SUPPORTED:
+        assert result.resource_limits_skipped == ()
+    else:
+        assert result.resource_limits_skipped == ("RLIMIT_AS",)
+
+
+def test_stderr_budget_applies_to_workload_output_not_the_status_line(tmp_path: Path) -> None:
+    (tmp_path / "big.txt").write_text("e" * 128, encoding="utf-8")
+    sandbox = _sandbox(
+        tmp_path,
+        limits=SandboxLimits(max_output_bytes=32),
+        commands=[_sh("/bin/cat big.txt >&2")],
+    )
+
+    result = sandbox.run("sh")
+
+    assert result.stderr == "e" * 32
+    if not _RLIMIT_AS_SUPPORTED:
+        assert "RLIMIT_AS" in result.resource_limits_skipped
+
+
+# --- launcher unit tests (in-process: setrlimit/execve patched) -------------------
+
+
+def _launcher_args(*values: str) -> list[str]:
+    return [values[0], values[1], values[2], values[3], "--", "/usr/bin/true"]
+
+
+def test_launcher_applies_all_limits_and_execs_when_platform_accepts(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    applied: list[str] = []
+    names = {
+        resource.RLIMIT_CPU: "RLIMIT_CPU",
+        resource.RLIMIT_AS: "RLIMIT_AS",
+        resource.RLIMIT_NOFILE: "RLIMIT_NOFILE",
+        resource.RLIMIT_FSIZE: "RLIMIT_FSIZE",
+    }
+
+    def _setrlimit(limit_resource: int, limits_pair: tuple[int, int]) -> None:
+        applied.append(names[limit_resource])
+
+    def _execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        applied.append(f"exec:{path}")
+
+    monkeypatch.setattr(_sandbox_exec.resource, "setrlimit", _setrlimit)
+    monkeypatch.setattr(_sandbox_exec.os, "execve", _execve)
+
+    assert _sandbox_exec.main(_launcher_args("10", "1024", "128", "2048")) == 70
+    assert applied == [
+        "RLIMIT_CPU",
+        "RLIMIT_AS",
+        "RLIMIT_NOFILE",
+        "RLIMIT_FSIZE",
+        "exec:/usr/bin/true",
+    ]
+    assert "skipped=none" in capsys.readouterr().err
+
+
+def test_launcher_skips_only_the_rejected_limit_and_still_execs(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    execved: list[str] = []
+
+    def _setrlimit(limit_resource: int, limits_pair: tuple[int, int]) -> None:
+        if limit_resource == resource.RLIMIT_AS:
+            msg = "current limit exceeds maximum limit"
+            raise ValueError(msg)
+
+    def _execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        execved.append(path)
+
+    monkeypatch.setattr(_sandbox_exec.resource, "setrlimit", _setrlimit)
+    monkeypatch.setattr(_sandbox_exec.os, "execve", _execve)
+
+    assert _sandbox_exec.main(_launcher_args("10", "1024", "128", "2048")) == 70
+    assert execved == ["/usr/bin/true"]
+    err = capsys.readouterr().err
+    assert "skipped=RLIMIT_AS" in err
+    assert "launcher-error" not in err
+
+
+def test_launcher_exec_failure_still_fails_closed_with_error_marker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def _execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        msg = "no such file"
+        raise OSError(msg)
+
+    def _ignore_limits(*_args: object) -> None:
+        return None
+
+    monkeypatch.setattr(_sandbox_exec.resource, "setrlimit", _ignore_limits)
+    monkeypatch.setattr(_sandbox_exec.os, "execve", _execve)
+
+    assert _sandbox_exec.main(_launcher_args("10", "1024", "128", "2048")) == 97
+    err = capsys.readouterr().err
+    assert "loopforge-sandbox-launcher-error: exec failed" in err
+    # The limits status line precedes the error so the parent can still parse it.
+    assert err.index("launcher-limits:") < err.index("launcher-error:")
 
 
 @example(name="note.txt", content="plain deterministic example")

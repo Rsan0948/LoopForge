@@ -6,8 +6,10 @@ the runtime core stays workload-agnostic. Two honest execution paths exist:
 - the *trusted development* path binds repair command tools with empty
   sandbox requirements against ``ConstrainedLocalSandbox`` — code-defined
   fixtures only, with the local adapter's honest capability report. Where the
-  platform rejects the local launcher's resource limits, command execution
-  fails closed (AGENTS.md rules 13-15) rather than degrading enforcement;
+  platform rejects a specific resource limit (macOS rejects ``RLIMIT_AS``),
+  the launcher skips only that limit and still executes the command; the
+  rejection is recorded honestly on the result and surfaced in verification
+  details (AGENTS.md rules 13-15 cover the remaining contract);
 - the *untrusted* path binds the same tools with
   ``UNTRUSTED_REPAIR_REQUIREMENTS`` (process-filesystem and network
   isolation) against ``ContainerSandbox``, which fails closed anywhere the

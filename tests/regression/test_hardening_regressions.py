@@ -317,22 +317,32 @@ def test_launcher_rejects_malformed_args() -> None:
     assert _sandbox_exec.main(["x", "2", "3", "4", "--", "/usr/bin/true"]) == 64
 
 
-def test_launcher_rlimit_failure_exits_with_marker(
+def test_launcher_rlimit_rejection_degrades_to_skipped_limits(
     capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # The rejection is simulated: a literal negative rlimit is RLIM_INFINITY on
-    # Linux (only macOS raises for it), so a real negative value would let the
-    # call through and then apply the 1024-byte RLIMIT_AS to the pytest
-    # process itself. Patching the rejection exercises the same failure path
-    # safely on every platform.
+    # The rejection is simulated: really calling setrlimit here would apply
+    # limits to the pytest process itself, and a real execve would replace it.
+    # Patching both exercises the degradation path safely on every platform.
     def _rejected(*_args: object) -> None:
         msg = "resource limits rejected"
         raise OSError(msg)
 
+    execved: list[str] = []
+
+    def _execve(path: str, argv: list[str], env: dict[str, str]) -> None:
+        execved.append(path)
+
     monkeypatch.setattr(_sandbox_exec.resource, "setrlimit", _rejected)
-    exit_code = _sandbox_exec.main(["-1", "1024", "128", "1024", "--", "/usr/bin/true"])
-    assert exit_code == 97
-    assert capsys.readouterr().err.startswith(_sandbox_exec.LAUNCHER_ERROR_MARKER)
+    monkeypatch.setattr(_sandbox_exec.os, "execve", _execve)
+    exit_code = _sandbox_exec.main(["10", "1024", "128", "1024", "--", "/usr/bin/true"])
+    # Degraded, not failed: the command still execs; the status line records
+    # every skipped limit ahead of any workload output.
+    assert exit_code == 70
+    assert execved == ["/usr/bin/true"]
+    err = capsys.readouterr().err
+    assert err.startswith(_sandbox_exec.LAUNCHER_LIMITS_MARKER)
+    assert "skipped=RLIMIT_CPU,RLIMIT_AS,RLIMIT_NOFILE,RLIMIT_FSIZE" in err
+    assert _sandbox_exec.LAUNCHER_ERROR_MARKER not in err
 
 
 class _FakeFailedLauncher:

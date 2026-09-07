@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "loopforge-console"
-version = "0.1.1"
+version = "0.2.0"
 description = "A bounded, replayable, observable runtime for autonomous software-engineering agents."
 readme = "README.md"
 requires-python = ">=3.12"

@@ -4,8 +4,16 @@ This module is executed in a dedicated child process. It applies rlimits before 
 with the configured allowlisted executable, avoiding `preexec_fn` in the potentially
 threaded parent.
 
-Launcher failures (rlimit rejection, exec failure) exit with LAUNCHER_ERROR_EXIT and a
-marker line on stderr so the parent can never confuse them with workload results.
+Resource limits are applied individually: platforms that reject a specific limit (macOS rejects
+RLIMIT_AS outright) skip ONLY that limit and still run the command — failing closed there would
+make every trusted-local check impossible on an entire OS. The launcher always prints exactly
+one status line as the FIRST line of stderr (`LAUNCHER_LIMITS_MARKER`) naming any skipped
+limits, so the parent can record the degradation honestly and strip the line before workload
+output is observed. Because the launcher line is always first, workload output can never spoof
+it.
+
+Exec failures exit with LAUNCHER_ERROR_EXIT and LAUNCHER_ERROR_MARKER on stderr so the parent
+can never confuse them with workload results.
 """
 
 from __future__ import annotations
@@ -16,6 +24,26 @@ import sys
 
 LAUNCHER_ERROR_EXIT: int = 97
 LAUNCHER_ERROR_MARKER: str = "loopforge-sandbox-launcher-error:"
+LAUNCHER_LIMITS_MARKER: str = "loopforge-sandbox-launcher-limits:"
+
+
+def _apply_limits(
+    cpu_seconds: int, memory_bytes: int, open_files: int, file_bytes: int
+) -> list[str]:
+    """Apply each rlimit independently; return the names of any the platform rejected."""
+    requested = (
+        ("RLIMIT_CPU", resource.RLIMIT_CPU, cpu_seconds),
+        ("RLIMIT_AS", resource.RLIMIT_AS, memory_bytes),
+        ("RLIMIT_NOFILE", resource.RLIMIT_NOFILE, open_files),
+        ("RLIMIT_FSIZE", resource.RLIMIT_FSIZE, file_bytes),
+    )
+    skipped: list[str] = []
+    for name, limit_resource, value in requested:
+        try:
+            resource.setrlimit(limit_resource, (value, value))
+        except (OSError, ValueError):
+            skipped.append(name)
+    return skipped
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -35,14 +63,9 @@ def main(argv: list[str] | None = None) -> int:
         return 64
     target = args[separator + 1 :]
 
-    try:
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds))
-        resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (open_files, open_files))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (file_bytes, file_bytes))
-    except (OSError, ValueError) as exc:
-        print(f"{LAUNCHER_ERROR_MARKER} resource limits rejected: {exc}", file=sys.stderr)
-        return LAUNCHER_ERROR_EXIT
+    skipped = _apply_limits(cpu_seconds, memory_bytes, open_files, file_bytes)
+    skipped_text = ",".join(skipped) if skipped else "none"
+    print(f"{LAUNCHER_LIMITS_MARKER} skipped={skipped_text}", file=sys.stderr, flush=True)
     try:
         os.execve(target[0], target, os.environ)
     except OSError as exc:
