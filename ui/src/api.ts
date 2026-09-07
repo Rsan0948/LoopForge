@@ -497,6 +497,53 @@ export function promotePolicy(
   });
 }
 
+// -- Filesystem browse + harness detect (read-only) ----------------------------
+// Session-creation aids: directory names and repo marker files only. Every
+// result is a DRAFT suggestion — the server re-validates through load_profile
+// on creation, so a suggestion can never widen authority.
+
+export interface FsBrowseEntry {
+  name: string;
+  is_git_worktree: boolean;
+  is_hidden: boolean;
+}
+
+export interface FsBrowseResult {
+  path: string;
+  parent: string | null;
+  is_git_worktree: boolean;
+  entries: FsBrowseEntry[];
+  truncated: boolean;
+  shortcuts: string[];
+  notes: string[];
+}
+
+export interface FsDetectedCheck {
+  name: string;
+  kind: string;
+  argv: string[];
+  timeout_seconds: number;
+}
+
+export interface FsDetectResult {
+  is_git_worktree: boolean;
+  checks: FsDetectedCheck[];
+  required: string[];
+  allowed_prefixes: string[];
+  notes: string[];
+}
+
+/** Subdirectory listing for the repo picker (default: the user's home). */
+export function browseDirectories(path?: string): Promise<FsBrowseResult> {
+  const query = path === undefined ? "" : `?path=${encodeURIComponent(path)}`;
+  return request<FsBrowseResult>(`/api/fs/browse${query}`);
+}
+
+/** Test-harness suggestion derived from a repository's marker files. */
+export function detectHarness(path: string): Promise<FsDetectResult> {
+  return request<FsDetectResult>(`/api/fs/detect?path=${encodeURIComponent(path)}`);
+}
+
 export function sessionWsUrl(runId: string): string {
   const scheme = window.location.protocol === "https:" ? "wss" : "ws";
   return `${scheme}://${window.location.host}/ws/sessions/${encodeURIComponent(runId)}`;

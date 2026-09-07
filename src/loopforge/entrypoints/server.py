@@ -48,6 +48,11 @@ from loopforge.entrypoints.eval import (
     UnknownEvalReportError,
     report_to_dict,
 )
+from loopforge.entrypoints.fsbrowse import (
+    UnknownFsPathError,
+    browse_directories,
+    detect_harness,
+)
 from loopforge.entrypoints.policy import (
     PolicyRegistryConflictError,
     PolicyRegistryError,
@@ -428,6 +433,10 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_exception_handler(UnknownPolicyRecordError, unknown_run_handler)
     app.add_exception_handler(PolicyRegistryConflictError, conflict_handler)
     app.add_exception_handler(PolicyRegistryError, registry_error_handler)
+    # Filesystem browse/detect: a path that does not name an existing
+    # directory is a 404 (the addressed resource is absent); a non-absolute
+    # path is a ValueError → 422 via the generic handler above.
+    app.add_exception_handler(UnknownFsPathError, unknown_run_handler)
 
     # -- REST: sessions ---------------------------------------------------------
 
@@ -743,6 +752,28 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_route("/api/policies", list_policies_route, methods=["GET"])
     app.add_api_route("/api/policies/{policy_id}", policy_detail_route, methods=["GET"])
     app.add_api_route("/api/policies/{policy_id}/promote", promote_policy_route, methods=["POST"])
+
+    # -- REST: filesystem browse + harness detect (read-only) ---------------------
+    #
+    # Session-creation aids for the console: directory names and repository
+    # marker files ONLY (never arbitrary file contents, and no write sibling
+    # exists). Unjailed by design (D10 trusted-local, loopback-only, single
+    # operator) so the picker behaves like an open-folder dialog. Everything
+    # returned is a DRAFT suggestion — session creation still validates
+    # through ``load_profile``'s fail-closed contract. An unknown path is a
+    # 404 (the addressed resource does not exist); a non-absolute path is a
+    # client addressing error (ValueError → 422).
+
+    def fs_browse_route(path: str | None = Query(default=None)) -> dict[str, object]:
+        """Subdirectory listing for the repo picker (default: the user's home)."""
+        return browse_directories(path)
+
+    def fs_detect_route(path: str = Query(min_length=1)) -> dict[str, object]:
+        """Test-harness suggestion derived from the repository's marker files."""
+        return detect_harness(path)
+
+    app.add_api_route("/api/fs/browse", fs_browse_route, methods=["GET"])
+    app.add_api_route("/api/fs/detect", fs_detect_route, methods=["GET"])
 
     # -- WebSocket: live event stream --------------------------------------------
 

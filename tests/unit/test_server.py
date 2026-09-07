@@ -63,6 +63,7 @@ from loopforge.domain.types import (
     WorkspaceId,
 )
 from loopforge.domain.workspace import WorkspaceStatus
+from loopforge.entrypoints import fsbrowse
 from loopforge.entrypoints.cli import main
 from loopforge.entrypoints.eval import EvalReportStore, report_to_dict
 from loopforge.entrypoints.policy import PolicyRegistryStore, policy_record_to_dict
@@ -1862,3 +1863,204 @@ def test_policy_registry_has_no_other_write_surface(tmp_path: Path) -> None:
         assert client.post("/api/policies").status_code == 405
         assert client.delete("/api/policies/candidate-x").status_code == 405
         assert client.put("/api/policies/candidate-x").status_code == 405
+
+
+# --- Filesystem browse + harness detect (read-only) ----------------------------
+
+
+def _which(mapping: dict[str, str]) -> Callable[[str], str | None]:
+    """A typed ``shutil.which`` stand-in for harness-detection tests."""
+
+    def resolve(name: str) -> str | None:
+        return mapping.get(name)
+
+    return resolve
+
+
+def test_fs_browse_lists_subdirectories_with_worktree_flags(tmp_path: Path) -> None:
+    root = tmp_path / "browse-root"
+    repo = _repo(root / "repo")
+    (root / "plain").mkdir(parents=True)
+    (root / ".hidden").mkdir()
+    (root / "a-file.txt").touch()
+
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/fs/browse", params={"path": str(root)})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["path"] == str(root)
+        assert body["parent"] == str(root.parent)
+        assert body["is_git_worktree"] is False
+        assert body["truncated"] is False
+        assert body["notes"] == []
+        entries = {entry["name"]: entry for entry in body["entries"]}
+        # Directories only — the plain file never appears in the listing.
+        assert set(entries) == {repo.name, "plain", ".hidden"}
+        assert entries[repo.name]["is_git_worktree"] is True
+        assert entries[repo.name]["is_hidden"] is False
+        assert entries["plain"]["is_git_worktree"] is False
+        assert entries[".hidden"]["is_hidden"] is True
+        # Quick-jump shortcuts: home and filesystem root are always offered.
+        assert str(Path.home()) in body["shortcuts"]
+        assert "/" in body["shortcuts"]
+
+
+def test_fs_browse_defaults_to_home_and_the_root_is_parentless(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        defaulted = client.get("/api/fs/browse")
+        assert defaulted.status_code == 200, defaulted.text
+        assert defaulted.json()["path"] == str(Path.home())
+
+        root = client.get("/api/fs/browse", params={"path": "/"})
+        assert root.status_code == 200, root.text
+        assert root.json()["path"] == "/"
+        assert root.json()["parent"] is None
+
+
+def test_fs_browse_denies_relative_missing_and_non_directory_paths(tmp_path: Path) -> None:
+    a_file = tmp_path / "a-file.txt"
+    a_file.touch()
+
+    with _client(tmp_path, _plain_factory()) as client:
+        relative = client.get("/api/fs/browse", params={"path": "some/relative/dir"})
+        assert relative.status_code == 422, relative.text
+        assert "absolute" in relative.json()["detail"]
+
+        missing = client.get("/api/fs/browse", params={"path": str(tmp_path / "nope")})
+        assert missing.status_code == 404, missing.text
+        assert "no such directory" in missing.json()["detail"]
+
+        not_a_dir = client.get("/api/fs/browse", params={"path": str(a_file)})
+        assert not_a_dir.status_code == 404, not_a_dir.text
+        assert "no such directory" in not_a_dir.json()["detail"]
+
+
+def test_fs_detect_suggests_pytest_for_python_marker_files(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    (repo / "pyproject.toml").touch()
+    (repo / "src").mkdir()
+    (repo / "tests").mkdir()
+
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.get("/api/fs/detect", params={"path": str(repo)})
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        assert body["is_git_worktree"] is True
+        assert body["checks"] == [
+            {
+                "name": "tests",
+                "kind": "TEST",
+                "argv": ["{python}", "-m", "pytest", "-q"],
+                "timeout_seconds": 120,
+            }
+        ]
+        assert body["required"] == ["tests"]
+        assert body["allowed_prefixes"] == ["src", "tests"]
+        # .venv/bin/python exists (via _repo), so there is nothing to warn about.
+        assert body["notes"] == []
+
+
+def test_fs_detect_notes_a_missing_local_python_for_the_token(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / "pyproject.toml").touch()
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(repo)}).json()
+
+        assert body["checks"][0]["argv"][0] == "{python}"
+        assert any(".venv/bin/python" in note for note in body["notes"])
+
+
+def test_fs_detect_npm_suggestion_uses_an_absolute_executable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    (repo / "package.json").write_text(json.dumps({"scripts": {"test": "node --test"}}))
+    monkeypatch.setattr(fsbrowse.shutil, "which", _which({"npm": "/usr/local/bin/npm"}))
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(repo)}).json()
+
+        assert body["checks"] == [
+            {
+                "name": "tests",
+                "kind": "TEST",
+                "argv": ["/usr/local/bin/npm", "test"],
+                "timeout_seconds": 120,
+            }
+        ]
+
+
+def test_fs_detect_npm_without_npm_on_path_is_a_note_not_a_guess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    (repo / "package.json").write_text(json.dumps({"scripts": {"test": "node --test"}}))
+    monkeypatch.setattr(fsbrowse.shutil, "which", _which({}))
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(repo)}).json()
+
+        assert body["checks"] == []
+        assert any("npm is not on PATH" in note for note in body["notes"])
+
+
+def test_fs_detect_makefile_test_target(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    repo = _repo(tmp_path / "repo")
+    (repo / "Makefile").write_text("test:\n\tpytest -q\n")
+    monkeypatch.setattr(fsbrowse.shutil, "which", _which({"make": "/usr/bin/make"}))
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(repo)}).json()
+
+        assert body["checks"][0]["argv"] == ["/usr/bin/make", "test"]
+
+
+def test_fs_detect_an_unrecognized_repo_is_honest_about_absence(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")  # git worktree with no marker files at all
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(repo)}).json()
+
+        assert body["checks"] == []
+        assert body["required"] == []
+        assert "no test harness detected" in body["notes"]
+        # No conventional source dirs either — the form field stays operator-owned.
+        assert body["allowed_prefixes"] == []
+        assert any("allowed_prefixes" in note for note in body["notes"])
+
+
+def test_fs_detect_flags_a_non_git_directory(tmp_path: Path) -> None:
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "pyproject.toml").touch()
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(plain)}).json()
+
+        assert body["is_git_worktree"] is False
+        assert any("not a git worktree" in note for note in body["notes"])
+
+
+def test_fs_detect_denies_relative_and_missing_paths(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        relative = client.get("/api/fs/detect", params={"path": "some/relative/dir"})
+        assert relative.status_code == 422, relative.text
+
+        missing = client.get("/api/fs/detect", params={"path": str(tmp_path / "nope")})
+        assert missing.status_code == 404, missing.text
+        assert "no such directory" in missing.json()["detail"]
+
+        # The query parameter is required for detect.
+        assert client.get("/api/fs/detect").status_code == 422
+
+
+def test_fs_routes_are_read_only(tmp_path: Path) -> None:
+    with _client(tmp_path, _plain_factory()) as client:
+        assert client.post("/api/fs/browse").status_code == 405
+        assert client.post("/api/fs/detect").status_code == 405
+        assert client.delete("/api/fs/browse").status_code == 405
+        assert client.put("/api/fs/detect").status_code == 405

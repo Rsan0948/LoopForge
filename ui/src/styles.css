@@ -57,6 +57,9 @@ h2 {
 }
 
 .app-header {
+  display: flex;
+  align-items: center;
+  gap: 20px;
   padding: 10px 20px;
   border-bottom: 1px solid var(--border);
   background: var(--bg-panel);
@@ -66,6 +69,27 @@ h2 {
   font-family: var(--mono);
   font-size: 14px;
   color: var(--text);
+}
+
+.app-nav {
+  display: flex;
+  gap: 14px;
+}
+
+.app-nav a {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--text-muted);
+}
+
+.app-nav a:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.app-nav a.active {
+  color: var(--accent);
+  border-bottom: 1px solid var(--accent);
 }
 
 .app-main {
@@ -709,6 +733,191 @@ textarea:focus {
 .lineage-links {
   display: flex;
   gap: 10px;
+}
+
+/* -- info pills ---------------------------------------------------------------- */
+
+.info-pill-wrap {
+  position: relative;
+}
+
+.info-pill {
+  background: none;
+  border: none;
+  padding: 0 2px;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.info-pill:hover {
+  color: var(--accent);
+}
+
+.info-pill-text {
+  display: block;
+  margin: 3px 0 2px;
+  padding: 6px 8px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text-muted);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1.45;
+  max-width: 460px;
+}
+
+.field-note {
+  margin: 3px 0 0;
+  font-size: 12px;
+}
+
+/* -- repo browser (VS Code open-folder style picker) ---------------------------- */
+
+.repo-browser {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-inset);
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.repo-shortcuts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 10px;
+}
+
+.repo-path-form {
+  display: flex;
+  gap: 6px;
+}
+
+.repo-path-form input {
+  flex: 1;
+}
+
+.repo-input-row {
+  display: flex;
+  gap: 6px;
+}
+
+.repo-input-row input {
+  flex: 1;
+}
+
+.repo-list {
+  max-height: 220px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 2px;
+}
+
+.repo-row {
+  display: flex;
+  width: 100%;
+  gap: 8px;
+  align-items: center;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  padding: 2px 6px;
+  font-size: 12.5px;
+  text-align: left;
+}
+
+.repo-row:hover {
+  background: rgba(88, 166, 255, 0.08);
+}
+
+.repo-name {
+  overflow-wrap: anywhere;
+}
+
+.repo-note {
+  margin: 0;
+  font-size: 12px;
+}
+
+.repo-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.repo-footer-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-left: auto;
+}
+
+/* -- flags, meters, filters ------------------------------------------------------ */
+
+.flags {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.meter {
+  margin-top: 3px;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.meter-fill {
+  height: 100%;
+  background: var(--accent);
+}
+
+.meter-fill.meter-hot {
+  background: var(--red);
+}
+
+.detail-grid .detail-wide {
+  grid-column: 1 / -1;
+}
+
+.filter-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.filter-row input {
+  flex: 1;
+}
+
+.sessions-table tr.row-link {
+  cursor: pointer;
+}
+
+.sessions-table tr.row-link:hover td {
+  background: rgba(88, 166, 255, 0.05);
+}
+
+.recent-repos {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  align-items: center;
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.controls-hint {
+  margin: 8px 0 0;
+  font-size: 12px;
 }
 
 /* -- evals (PACS-016) ---------------------------------------------------------- */

@@ -81,6 +81,23 @@ export default function App(): ReactElement {
         <a className="app-title" href="#/sessions">
           ⬡ loopforge operator console
         </a>
+        <nav className="app-nav">
+          <a
+            href="#/sessions"
+            className={route.kind === "sessions" || route.kind === "session" ? "active" : ""}
+          >
+            sessions
+          </a>
+          <a href="#/evals" className={route.kind === "evals" || route.kind === "eval" ? "active" : ""}>
+            evals
+          </a>
+          <a
+            href="#/policies"
+            className={route.kind === "policies" || route.kind === "policy" ? "active" : ""}
+          >
+            policies
+          </a>
+        </nav>
       </header>
       <main className="app-main">
         {route.kind === "sessions" ? (

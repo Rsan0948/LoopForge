@@ -36,7 +36,21 @@ import {
   type ShadowDecisionRecordedPayload,
 } from "../events";
 import { formatClock, formatCost, formatTime } from "../format";
-import { ErrorBanner, StatusBadge } from "../widgets";
+import { ErrorBanner, RunFlags, StatusBadge } from "../widgets";
+
+/** Thin budget-consumption bar: a direct rendering of used/limit, shown
+ *  only when the corresponding hard budget exists. */
+function Meter({ used, limit }: { used: number; limit: number }): ReactElement {
+  const fraction = limit > 0 ? Math.min(1, used / limit) : 0;
+  return (
+    <div className="meter" title={`${(fraction * 100).toFixed(0)}% of budget used`}>
+      <div
+        className={`meter-fill${fraction >= 0.9 ? " meter-hot" : ""}`}
+        style={{ width: `${fraction * 100}%` }}
+      />
+    </div>
+  );
+}
 
 type WsState = "connecting" | "open" | "reconnecting" | "closed";
 
@@ -151,6 +165,8 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
   const [instruction, setInstruction] = useState("");
+  const [typeFilter, setTypeFilter] = useState("");
+  const [textFilter, setTextFilter] = useState("");
 
   const streamRef = useRef<HTMLDivElement | null>(null);
   // Monotonic guard against out-of-order REST responses: two in-flight
@@ -323,7 +339,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
     if (follow && node !== null) {
       node.scrollTop = node.scrollHeight;
     }
-  }, [events, follow]);
+  }, [events, follow, typeFilter, textFilter]);
 
   // -- transient error toast -----------------------------------------------------
 
@@ -434,6 +450,17 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
 
   const budget = detail?.budget ?? null;
 
+  // Event-stream projection filter (client-side only — the underlying list
+  // is untouched; the header honestly reports "N of M" while filtering).
+  const eventTypes = [...new Set(events.map((envelope) => envelope.event_type))].sort();
+  const needle = textFilter.trim().toLowerCase();
+  const filteredEvents = events.filter((envelope) => {
+    if (typeFilter !== "" && envelope.event_type !== typeFilter) return false;
+    if (needle === "") return true;
+    const { label, summary } = describeEvent(envelope);
+    return `${envelope.event_type} ${label} ${summary}`.toLowerCase().includes(needle);
+  });
+
   // Shadow-decision panel projection: candidate decisions recorded by the
   // optional shadow advisor, paired with what the active run enacted.
   const shadowPairs: ShadowPair[] = events
@@ -478,6 +505,9 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
                 <dd>
                   {detail.iteration}
                   {budget !== null ? ` / ${budget.max_iterations}` : ""}
+                  {budget !== null && (
+                    <Meter used={detail.iteration} limit={budget.max_iterations} />
+                  )}
                 </dd>
               </div>
               <div>
@@ -485,6 +515,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
                 <dd>
                   {formatCost(detail.cost_usd)}
                   {budget !== null ? ` / ${formatCost(budget.max_cost_usd)}` : ""}
+                  {budget !== null && <Meter used={detail.cost_usd} limit={budget.max_cost_usd} />}
                 </dd>
               </div>
               <div>
@@ -493,6 +524,9 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
                   {detail.total_tokens.toLocaleString()} ({detail.input_tokens.toLocaleString()} in /{" "}
                   {detail.output_tokens.toLocaleString()} out)
                   {budget?.max_total_tokens != null ? ` / ${budget.max_total_tokens.toLocaleString()}` : ""}
+                  {budget?.max_total_tokens != null && (
+                    <Meter used={detail.total_tokens} limit={budget.max_total_tokens} />
+                  )}
                 </dd>
               </div>
               <div>
@@ -506,8 +540,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
               <div>
                 <dt>flags</dt>
                 <dd>
-                  {detail.driving ? "driving " : ""}
-                  {detail.managed ? "managed" : "unmanaged"}
+                  <RunFlags driving={detail.driving} managed={detail.managed} />
                   {detail.stop_reason !== null ? ` · stop: ${detail.stop_reason}` : ""}
                 </dd>
               </div>
@@ -547,7 +580,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
                   )}
                 </dd>
               </div>
-              <div>
+              <div className="detail-wide">
                 <dt>last verification</dt>
                 <dd>
                   {detail.last_verification === null
@@ -587,7 +620,13 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
             </>
           )}
           {rejectOpen ? (
-            <form onSubmit={onReject} className="inline-form">
+            <form
+              onSubmit={onReject}
+              className="inline-form"
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setRejectOpen(false);
+              }}
+            >
               <input
                 autoFocus
                 value={rejectReason}
@@ -744,17 +783,38 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
 
       <section className="panel">
         <div className="controls-row">
-          <button type="button" disabled={!canStart} onClick={() => runCommand(() => startSession(runId))}>
+          <button
+            type="button"
+            disabled={!canStart}
+            title="drive this run (available when managed, non-terminal, and not already driving)"
+            onClick={() => runCommand(() => startSession(runId))}
+          >
             start
           </button>
-          <button type="button" disabled={!canPause} onClick={() => runCommand(() => pauseSession(runId))}>
+          <button
+            type="button"
+            disabled={!canPause}
+            title="pause the driver (available while the server is driving)"
+            onClick={() => runCommand(() => pauseSession(runId))}
+          >
             pause
           </button>
-          <button type="button" disabled={!canResume} onClick={() => runCommand(() => resumeSession(runId))}>
+          <button
+            type="button"
+            disabled={!canResume}
+            title="resume driving (available when managed, non-terminal, and paused)"
+            onClick={() => runCommand(() => resumeSession(runId))}
+          >
             resume
           </button>
           {stopOpen ? (
-            <form onSubmit={onStop} className="inline-form">
+            <form
+              onSubmit={onStop}
+              className="inline-form"
+              onKeyDown={(e) => {
+                if (e.key === "Escape") setStopOpen(false);
+              }}
+            >
               <input
                 autoFocus
                 value={stopSummary}
@@ -774,7 +834,16 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
             </button>
           )}
           {forceOpen ? (
-            <form onSubmit={onForceRelease} className="inline-form">
+            <form
+              onSubmit={onForceRelease}
+              className="inline-form"
+              onKeyDown={(e) => {
+                if (e.key === "Escape") {
+                  setForceOpen(false);
+                  setForceChecked(false);
+                }
+              }}
+            >
               <input
                 autoFocus
                 value={forceSummary}
@@ -844,8 +913,27 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
             </button>
           )}
         </div>
+        {detail !== null && (
+          <p className="muted controls-hint">
+            {terminal
+              ? detail.managed
+                ? "run is terminal — controls are closed; follow up → seeds a successor session"
+                : "run is terminal — controls are closed"
+              : !detail.managed
+                ? "unmanaged run — this server did not create it and will not drive it; use the CLI (stop… and force release… still work here)"
+                : detail.driving
+                  ? "driving — pause or stop… to intervene"
+                  : "quiescent — start/resume drives the run"}
+          </p>
+        )}
         {amendOpen && detail !== null && (
-          <form onSubmit={onAmend} className="amend-panel">
+          <form
+            onSubmit={onAmend}
+            className="amend-panel"
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setAmendOpen(false);
+            }}
+          >
             <p className="muted">
               This durably <strong>replaces</strong> the run&apos;s objective (an{" "}
               <span className="mono">OperatorInstruction</span> with{" "}
@@ -880,17 +968,55 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
       <div className="columns">
         <section className="panel panel-grow">
           <div className="panel-header">
-            <h2>event stream ({events.length})</h2>
+            <h2>
+              event stream ({filteredEvents.length}
+              {filteredEvents.length !== events.length ? ` of ${events.length}` : ""})
+            </h2>
             <label className="follow-toggle">
               <input type="checkbox" checked={follow} onChange={(e) => setFollow(e.target.checked)} />
               follow
             </label>
           </div>
+          <div className="filter-row">
+            <select
+              value={typeFilter}
+              onChange={(e) => setTypeFilter(e.target.value)}
+              title="show only one event type"
+            >
+              <option value="">all types</option>
+              {eventTypes.map((eventType) => (
+                <option key={eventType} value={eventType}>
+                  {eventType}
+                </option>
+              ))}
+            </select>
+            <input
+              value={textFilter}
+              onChange={(e) => setTextFilter(e.target.value)}
+              placeholder="filter summaries…"
+            />
+            {(typeFilter !== "" || textFilter !== "") && (
+              <button
+                type="button"
+                className="link-button"
+                onClick={() => {
+                  setTypeFilter("");
+                  setTextFilter("");
+                }}
+              >
+                clear
+              </button>
+            )}
+          </div>
           <div className="event-stream" ref={streamRef}>
-            {events.length === 0 ? (
-              <p className="muted">no events yet</p>
+            {filteredEvents.length === 0 ? (
+              <p className="muted">
+                {events.length === 0 ? "no events yet" : "no events match the filter"}
+              </p>
             ) : (
-              events.map((envelope) => <EventRow key={envelope.event.event_id} envelope={envelope} />)
+              filteredEvents.map((envelope) => (
+                <EventRow key={envelope.event.event_id} envelope={envelope} />
+              ))
             )}
           </div>
         </section>

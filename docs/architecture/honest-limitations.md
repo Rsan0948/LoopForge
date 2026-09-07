@@ -81,6 +81,16 @@ honestly").
 - **The console is an operator tool on a trusted local network.** The
   serving plane has no authentication; it reads operator-owned stores and
   exposes one confirm-gated write (policy promotion). Do not expose it.
+- **The serving plane can browse the local filesystem, read-only.** The
+  session-creation aids (`GET /api/fs/browse`, `GET /api/fs/detect`) list
+  subdirectory names and read repository marker files (`pyproject.toml`,
+  `package.json`, `Makefile`) anywhere on the machine — unjailed,
+  open-folder-dialog style, by explicit operator decision. They never
+  return arbitrary file contents and have no write sibling, but anyone
+  who can reach the port can map the operator's directory layout — one
+  more reason the loopback-only rule above is load-bearing. Harness
+  suggestions are operator-reviewed drafts: session creation still
+  validates through `load_profile`'s fail-closed contract.
 - **UI evidence links resolve by name, not by hash.** A basis naming a
   stored report links to it; the console does not verify the report's
   content is what the basis author saw.

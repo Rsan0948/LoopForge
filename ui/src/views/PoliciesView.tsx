@@ -8,6 +8,8 @@ import { ErrorBanner, LifecycleBadge } from "../widgets";
 // exactly one write — the checkbox-gated promote dialog on the detail view;
 // a candidate can never self-promote because no other write path exists.
 
+const REFRESH_MS = 10000;
+
 function PolicyRow({ record }: { record: PolicyRecordInfo }): ReactElement {
   return (
     <tr>
@@ -48,6 +50,10 @@ export default function PoliciesView(): ReactElement {
 
   useEffect(() => {
     void refresh();
+    // Poll like the sessions view: registrations/promotions happen via the
+    // CLI, so the registry would otherwise go stale until a manual Refresh.
+    const id = window.setInterval(() => void refresh(), REFRESH_MS);
+    return () => window.clearInterval(id);
   }, [refresh]);
 
   return (

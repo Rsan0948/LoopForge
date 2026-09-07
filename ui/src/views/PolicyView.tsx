@@ -95,7 +95,13 @@ function PromoteControl({
     );
   }
   return (
-    <form onSubmit={onSubmit} className="inline-form">
+    <form
+      onSubmit={onSubmit}
+      className="inline-form"
+      onKeyDown={(event) => {
+        if (event.key === "Escape") reset();
+      }}
+    >
       <input
         autoFocus
         value={basis}

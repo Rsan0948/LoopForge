@@ -3,6 +3,7 @@ import {
   ApiError,
   createSessionByProfile,
   createSessionInline,
+  detectHarness,
   listProfiles,
   listSessions,
   type InlineProfile,
@@ -11,7 +12,8 @@ import {
 } from "../api";
 import { navigateToEvals, navigateToPolicies, navigateToSession } from "../App";
 import { formatAge, formatCost, formatTime, shortRunId, truncate } from "../format";
-import { ErrorBanner, StatusBadge } from "../widgets";
+import RepoBrowser from "../RepoBrowser";
+import { ErrorBanner, InfoPill, RunFlags, StatusBadge } from "../widgets";
 
 const REFRESH_MS = 5000;
 
@@ -50,8 +52,10 @@ function defaultInlineForm(): InlineForm {
     repository: "",
     objective: "",
     checks: [{ name: "tests", kind: "test", argv: "{python} -m pytest", timeout_seconds: "120" }],
+    // No trailing slashes: the domain patch-constraint contract rejects
+    // empty path segments, so "src/ tests/" would 422 on creation.
     required: "tests",
-    allowedPrefixes: "src/ tests/",
+    allowedPrefixes: "src tests",
     requireChange: false,
     gateFileWrites: false,
     provider: "scripted",
@@ -154,6 +158,20 @@ function buildInlineProfile(form: InlineForm): { error: string } | { profile: In
   };
 }
 
+const RECENT_REPOS_KEY = "loopforge.recentRepositories";
+const RECENT_REPOS_MAX = 5;
+
+function loadRecentRepos(): string[] {
+  try {
+    const raw = window.localStorage.getItem(RECENT_REPOS_KEY);
+    if (raw === null) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === "string") : [];
+  } catch {
+    return []; // storage unavailable or corrupted — recents are a convenience only
+  }
+}
+
 function NewSessionPanel(): ReactElement {
   const [mode, setMode] = useState<"profile" | "inline">("profile");
   const [profiles, setProfiles] = useState<ProfileInfo[]>([]);
@@ -161,6 +179,61 @@ function NewSessionPanel(): ReactElement {
   const [form, setForm] = useState<InlineForm>(defaultInlineForm);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [browseOpen, setBrowseOpen] = useState(false);
+  const [detectNotes, setDetectNotes] = useState<string[]>([]);
+  const [recentRepos, setRecentRepos] = useState<string[]>(loadRecentRepos);
+
+  const rememberRepo = useCallback((path: string): void => {
+    setRecentRepos((prev) => {
+      const next = [path, ...prev.filter((item) => item !== path)].slice(0, RECENT_REPOS_MAX);
+      try {
+        window.localStorage.setItem(RECENT_REPOS_KEY, JSON.stringify(next));
+      } catch {
+        // Storage full/unavailable — the in-memory list still works this session.
+      }
+      return next;
+    });
+  }, []);
+
+  // Harness detection (read-only): prefill only fields the operator has not
+  // touched (still at their defaults) — a suggestion never clobbers an edit,
+  // and the server re-validates everything on creation regardless.
+  const runDetect = useCallback(
+    (path: string): void => {
+      detectHarness(path)
+        .then((result) => {
+          setDetectNotes(result.notes);
+          rememberRepo(path);
+          setForm((prev) => {
+            const defaults = defaultInlineForm();
+            const next = { ...prev };
+            if (
+              result.checks.length > 0 &&
+              JSON.stringify(prev.checks) === JSON.stringify(defaults.checks)
+            ) {
+              next.checks = result.checks.map((check) => ({
+                name: check.name,
+                kind: check.kind.toLowerCase(),
+                argv: check.argv.join(" "),
+                timeout_seconds: String(check.timeout_seconds),
+              }));
+            }
+            if (result.required.length > 0 && prev.required === defaults.required) {
+              next.required = result.required.join(" ");
+            }
+            if (
+              result.allowed_prefixes.length > 0 &&
+              prev.allowedPrefixes === defaults.allowedPrefixes
+            ) {
+              next.allowedPrefixes = result.allowed_prefixes.join(" ");
+            }
+            return next;
+          });
+        })
+        .catch(() => setDetectNotes([])); // manual entry always still works
+    },
+    [rememberRepo],
+  );
 
   useEffect(() => {
     listProfiles()
@@ -249,16 +322,65 @@ function NewSessionPanel(): ReactElement {
           </label>
         ) : (
           <>
-            <label className="field">
-              <span>repository</span>
-              <input
-                value={form.repository}
-                onChange={(e) => patch({ repository: e.target.value })}
-                placeholder="/absolute/path/to/repo"
+            <div className="field">
+              <span>
+                repository{" "}
+                <InfoPill text="Absolute path to the git worktree the agent will repair. It must contain a .git directory — use browse… to pick it from your filesystem instead of typing." />
+              </span>
+              <div className="repo-input-row">
+                <input
+                  value={form.repository}
+                  onChange={(e) => patch({ repository: e.target.value })}
+                  onBlur={() => {
+                    const value = form.repository.trim();
+                    if (value.startsWith("/")) runDetect(value);
+                  }}
+                  placeholder="/absolute/path/to/repo"
+                />
+                <button type="button" onClick={() => setBrowseOpen((open) => !open)}>
+                  {browseOpen ? "hide browser" : "browse…"}
+                </button>
+              </div>
+              {recentRepos.length > 0 && (
+                <div className="recent-repos">
+                  <span className="muted">recent:</span>
+                  {recentRepos.map((path) => (
+                    <button
+                      key={path}
+                      type="button"
+                      className="link-button mono"
+                      title={path}
+                      onClick={() => {
+                        patch({ repository: path });
+                        runDetect(path);
+                      }}
+                    >
+                      {path.split("/").filter(Boolean).pop() ?? path}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {detectNotes.map((note) => (
+                <p key={note} className="muted field-note">
+                  {note}
+                </p>
+              ))}
+            </div>
+            {browseOpen && (
+              <RepoBrowser
+                onSelect={(path) => {
+                  patch({ repository: path });
+                  setBrowseOpen(false);
+                  runDetect(path);
+                }}
+                onClose={() => setBrowseOpen(false)}
               />
-            </label>
+            )}
             <label className="field">
-              <span>objective</span>
+              <span>
+                objective{" "}
+                <InfoPill text="What the agent should accomplish. It is written to the durable event log and the agent cannot change it — only you can, via amend objective." />
+              </span>
               <textarea
                 rows={2}
                 value={form.objective}
@@ -267,7 +389,10 @@ function NewSessionPanel(): ReactElement {
               />
             </label>
             <fieldset className="checks">
-              <legend>checks</legend>
+              <legend>
+                checks{" "}
+                <InfoPill text="The verification commands the deterministic verifier runs — the model's own claim of success means nothing. argv[0] must be absolute or {python} (the repo's .venv/bin/python) in local mode, or an in-container path when a container image is set." />
+              </legend>
               {form.checks.map((row, index) => (
                 <div className="check-row" key={index}>
                   <input
@@ -318,7 +443,10 @@ function NewSessionPanel(): ReactElement {
             </fieldset>
             <div className="field-grid">
               <label className="field">
-                <span>acceptance.required</span>
+                <span>
+                  acceptance.required{" "}
+                  <InfoPill text="The checks that must pass for the verifier to grant success. Space-separated check names from above." />
+                </span>
                 <input
                   value={form.required}
                   onChange={(e) => patch({ required: e.target.value })}
@@ -326,34 +454,43 @@ function NewSessionPanel(): ReactElement {
                 />
               </label>
               <label className="field">
-                <span>acceptance.allowed_prefixes</span>
+                <span>
+                  acceptance.allowed_prefixes{" "}
+                  <InfoPill text="Path prefixes the agent's patch may touch (e.g. src tests — no trailing slashes). A change anywhere else fails verification — this is the scope boundary, and the agent cannot widen it." />
+                </span>
                 <input
                   value={form.allowedPrefixes}
                   onChange={(e) => patch({ allowedPrefixes: e.target.value })}
-                  placeholder="src/ tests/"
+                  placeholder="src tests"
                 />
               </label>
               <label className="field field-inline">
-                <span>require_change</span>
+                <span>
+                  require_change{" "}
+                  <InfoPill text="When on, verification fails if the workspace did not change — a no-op 'success' cannot pass." />
+                </span>
                 <input
                   type="checkbox"
                   checked={form.requireChange}
                   onChange={(e) => patch({ requireChange: e.target.checked })}
                 />
               </label>
-              <label className="field field-inline" title="write_file/edit_file pause the run for durable operator approval">
-                <span>gate file writes</span>
+              <label className="field field-inline">
+                <span>
+                  gate file writes{" "}
+                  <InfoPill text="When on, write_file/edit_file pause the run for your durable approval before executing (PACS-014). Nothing is written without your explicit grant." />
+                </span>
                 <input
                   type="checkbox"
                   checked={form.gateFileWrites}
                   onChange={(e) => patch({ gateFileWrites: e.target.checked })}
                 />
               </label>
-              <label
-                className="field"
-                title="Container image for check execution (e.g. python:3.12-alpine). When set, check argv must be in-container paths; {python} is not substituted. Required on macOS, where the local sandbox fails closed."
-              >
-                <span>sandbox.container_image</span>
+              <label className="field">
+                <span>
+                  sandbox.container_image{" "}
+                  <InfoPill text="Docker image for check execution (e.g. python:3.12-alpine). When set, check argv must be in-container paths and {python} is not substituted. Required on macOS, where the local sandbox fails closed." />
+                </span>
                 <input
                   value={form.containerImage}
                   onChange={(e) => patch({ containerImage: e.target.value })}
@@ -361,7 +498,10 @@ function NewSessionPanel(): ReactElement {
                 />
               </label>
               <label className="field">
-                <span>model.provider</span>
+                <span>
+                  model.provider{" "}
+                  <InfoPill text="scripted = deterministic offline driver (no credentials, for dry runs). ollama / deepseek = live models." />
+                </span>
                 <select value={form.provider} onChange={(e) => patch({ provider: e.target.value })}>
                   {MODEL_PROVIDERS.map((p) => (
                     <option key={p} value={p}>
@@ -371,7 +511,10 @@ function NewSessionPanel(): ReactElement {
                 </select>
               </label>
               <label className="field">
-                <span>model.name</span>
+                <span>
+                  model.name{" "}
+                  <InfoPill text="The provider's model id, e.g. devstral-small-2:latest. Not needed for the scripted provider." />
+                </span>
                 <input
                   value={form.modelName}
                   onChange={(e) => patch({ modelName: e.target.value })}
@@ -379,7 +522,10 @@ function NewSessionPanel(): ReactElement {
                 />
               </label>
               <label className="field">
-                <span>model.tier</span>
+                <span>
+                  model.tier{" "}
+                  <InfoPill text="Capability class used for routing decisions: economy / standard / advanced." />
+                </span>
                 <select value={form.tier} onChange={(e) => patch({ tier: e.target.value })}>
                   {MODEL_TIERS.map((t) => (
                     <option key={t} value={t}>
@@ -389,18 +535,27 @@ function NewSessionPanel(): ReactElement {
                 </select>
               </label>
               <label className="field">
-                <span>budget.max_cost_usd</span>
+                <span>
+                  budget.max_cost_usd{" "}
+                  <InfoPill text="Hard spending ceiling in USD. The deterministic runtime stops the run when it is exceeded — the model cannot raise its own budget." />
+                </span>
                 <input value={form.maxCostUsd} onChange={(e) => patch({ maxCostUsd: e.target.value })} />
               </label>
               <label className="field">
-                <span>budget.max_iterations</span>
+                <span>
+                  budget.max_iterations{" "}
+                  <InfoPill text="Hard cap on model turns for this run." />
+                </span>
                 <input
                   value={form.maxIterations}
                   onChange={(e) => patch({ maxIterations: e.target.value })}
                 />
               </label>
               <label className="field">
-                <span>budget.max_total_tokens</span>
+                <span>
+                  budget.max_total_tokens{" "}
+                  <InfoPill text="Optional hard cap on total tokens (input + output). Leave empty for no token cap." />
+                </span>
                 <input
                   value={form.maxTotalTokens}
                   onChange={(e) => patch({ maxTotalTokens: e.target.value })}
@@ -408,7 +563,10 @@ function NewSessionPanel(): ReactElement {
                 />
               </label>
               <label className="field">
-                <span>budget.max_elapsed_seconds</span>
+                <span>
+                  budget.max_elapsed_seconds{" "}
+                  <InfoPill text="Optional wall-clock cap for the whole run. Leave empty for no time cap." />
+                </span>
                 <input
                   value={form.maxElapsedSeconds}
                   onChange={(e) => patch({ maxElapsedSeconds: e.target.value })}
@@ -416,7 +574,10 @@ function NewSessionPanel(): ReactElement {
                 />
               </label>
               <label className="field">
-                <span>budget.no_progress_limit</span>
+                <span>
+                  budget.no_progress_limit{" "}
+                  <InfoPill text="Stall threshold: consecutive turns without progress before the run stops as stalled (default 3)." />
+                </span>
                 <input
                   value={form.noProgressLimit}
                   onChange={(e) => patch({ noProgressLimit: e.target.value })}
@@ -508,7 +669,12 @@ export default function SessionsView(): ReactElement {
             </thead>
             <tbody>
               {sessions.map((s) => (
-                <tr key={s.run_id}>
+                <tr
+                  key={s.run_id}
+                  className="row-link"
+                  title="open session"
+                  onClick={() => navigateToSession(s.run_id)}
+                >
                   <td>
                     <a href={`#/sessions/${encodeURIComponent(s.run_id)}`} className="mono">
                       {shortRunId(s.run_id)}
@@ -523,9 +689,8 @@ export default function SessionsView(): ReactElement {
                   <td className="mono">{formatTime(s.started_at)}</td>
                   <td className="mono">{formatAge(s.last_occurred_at, nowMs)}</td>
                   <td className="mono">{formatCost(s.cost_usd)}</td>
-                  <td className="muted mono">
-                    {s.driving ? "driving " : ""}
-                    {s.managed ? "managed" : "unmanaged"}
+                  <td>
+                    <RunFlags driving={s.driving} managed={s.managed} />
                   </td>
                 </tr>
               ))}

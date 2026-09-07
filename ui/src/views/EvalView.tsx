@@ -8,7 +8,7 @@ import {
   type EvalReport,
 } from "../api";
 import { formatCost } from "../format";
-import { ErrorBanner } from "../widgets";
+import { ErrorBanner, InfoPill } from "../widgets";
 
 // Eval report detail (PACS-016): the per-(config, task) outcome table for one
 // operator-owned report. False success is the first-class metric this
@@ -133,14 +133,32 @@ export default function EvalView({ reportId }: { reportId: string }): ReactEleme
                   <th>config</th>
                   <th>task</th>
                   <th>trials</th>
-                  <th>success</th>
-                  <th>false success</th>
+                  <th>
+                    success{" "}
+                    <InfoPill text="Share of trials the independent verifier granted success — the model's own claim means nothing." />
+                  </th>
+                  <th>
+                    false success{" "}
+                    <InfoPill text="Trials that passed the graders while the objective was not met — the first-class failure this laboratory exists to catch. Red when nonzero." />
+                  </th>
                   <th>mean cost</th>
                   <th>mean latency</th>
-                  <th>mean interventions</th>
-                  <th>mean ctx tokens</th>
-                  <th>mean ctx dropped</th>
-                  <th>mean recovery</th>
+                  <th>
+                    mean interventions{" "}
+                    <InfoPill text="Mean operator approvals/instructions per trial (Pareto: lower is better)." />
+                  </th>
+                  <th>
+                    mean ctx tokens{" "}
+                    <InfoPill text="Mean context tokens assembled per turn (Pareto: lower is better)." />
+                  </th>
+                  <th>
+                    mean ctx dropped{" "}
+                    <InfoPill text="Mean context items dropped over budget per turn." />
+                  </th>
+                  <th>
+                    mean recovery{" "}
+                    <InfoPill text="Mean recovery events per trial (Pareto: lower is better)." />
+                  </th>
                 </tr>
               </thead>
               <tbody>

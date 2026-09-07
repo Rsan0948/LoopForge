@@ -10,6 +10,8 @@ import { navigateToEval, navigateToPolicies } from "../App";
 import { formatTime } from "../format";
 import { ErrorBanner } from "../widgets";
 
+const REFRESH_MS = 10000;
+
 // Eval reports (PACS-016): read-only exposure of operator-owned artifacts.
 // The benchmark-suite header carries both lock hashes — the operator-visible
 // proof the benchmark definition the reports were measured against is locked.
@@ -81,6 +83,10 @@ export default function EvalsView(): ReactElement {
 
   useEffect(() => {
     void refresh();
+    // Poll like the sessions view: reports arrive via `loopforge eval` (CLI),
+    // so the console would otherwise go stale until a manual Refresh.
+    const id = window.setInterval(() => void refresh(), REFRESH_MS);
+    return () => window.clearInterval(id);
   }, [refresh]);
 
   // A stored report whose pinned spec lock differs from the LIVE suite lock
