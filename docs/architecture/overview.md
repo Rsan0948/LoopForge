@@ -32,4 +32,23 @@ Tool authority is code-owned. A model proposal contains a tool name and argument
 
 ## Control policy
 
-Safety/authority policy is immutable during a run. Future adaptive policy may choose models, context budgets, or escalation strategies, but may not expand permissions or override hard limits.
+Safety/authority policy is immutable during a run. Adaptive execution
+policy (ADR-0014) may choose models, context budgets, or escalation
+strategies, but may not expand permissions or override hard limits.
+
+## Adaptive execution policy
+
+Since PACS-017, the adaptive surface is a closed, validated vocabulary:
+`ExecutionPolicy` carries routing knobs, context-allocation bounds,
+verification cadence, and worker-count preference — and nothing else. The
+immutable surfaces (permissions, security boundaries, legal transitions,
+hard budgets, HITL requirements, secret handling, authority-expansion
+rules) are **unrepresentable** in the vocabulary, not merely denied at
+runtime. Candidate policies gather evidence by shadowing (advice journaled,
+never enacted; the active path pinned byte-identical) and by locked-suite
+benchmarking (ADR-0012); promotion is operator-owned, evidence-gated, and
+terminal — no runtime path can perform it. Statistical heuristics derive
+candidate *suggestions* from stored evidence, constructed through the same
+domain validation, and registered as CANDIDATEs for operator review. See
+`docs/decisions/ADR-0014-adaptive-execution-policies.md`,
+`benchmark-methodology.md`, and `honest-limitations.md`.

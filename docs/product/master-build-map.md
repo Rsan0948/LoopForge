@@ -410,12 +410,13 @@ Evidence of quality:
 
 **Purpose:** explore genuinely new best practices while keeping authority deterministic.
 
-V1 experimental features:
-1. execution provenance graph
-2. provenance/trust-aware context
-3. adaptive context-budget allocation
-4. trajectory-quality evaluation
-5. shadow policy evaluation
+V1 experimental features (all SHIPPED — PACS-015..017, ADR-0014):
+1. execution provenance graph ✓ (PACS-015)
+2. provenance/trust-aware context ✓ (PACS-006/007)
+3. adaptive context-budget allocation ✓ (PACS-017)
+4. trajectory-quality evaluation ✓ (PACS-016)
+5. shadow policy evaluation ✓ (PACS-017: advice journaled, never enacted,
+   active path pinned byte-identical)
 
 Post-v1 candidates:
 - learned model routing

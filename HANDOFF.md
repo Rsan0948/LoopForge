@@ -37,7 +37,41 @@ The experimental extension is:
 
 ## Current checkpoint
 
-Completed: PACS-001 through PACS-016.
+Completed: PACS-001 through PACS-017 — **v1.0 is closed** (2026-09-07).
+
+PACS-017 (adaptive context and shadow policies / v1.0, 2026-09-07)
+demonstrated bounded adaptation from execution history while preserving
+immutable runtime authority (ADR-0014). The `ExecutionPolicy` vocabulary
+carries only adaptive knobs — routing, context allocation, verification
+cadence, worker-count preference — making the immutable surfaces
+(permissions, security boundaries, legal transitions, hard budgets, HITL,
+secrets, authority expansion) unrepresentable rather than runtime-denied
+(rules 11/12). Candidate policies gather evidence by shadowing (advice
+journaled as catalog-26 `ShadowDecisionRecorded` events at the three
+adaptive decision points, never enacted, the active path pinned
+byte-identical) and by locked-suite benchmarking (report schema v2 adds
+context/recovery axes with an honest v1 shim); counterfactual replay
+re-drives recorded runs deterministically with a closed outcome
+vocabulary; promotion is operator-owned, evidence-gated, and terminal
+(CANDIDATE → PROMOTED illegal, supersession by new version, StrictBool
+confirm, no runtime transition path); bounded deterministic heuristics
+derive candidate *suggestions* from eval + shadow evidence, constructed
+through domain validation and registered as CANDIDATEs. The console
+exposes the policy registry, shadow-decision panels, and v2 eval axes
+(standing UI gate). A two-reviewer adversarial pass closed and pinned
+every actionable finding (lifecycle dead-end, unwired shadow advisor,
+store robustness, evidence-read hygiene). Live validation (Ollama
+`devstral-small-2:latest` + Docker, zero credentials): 12 container
+trials (3 locked tasks × policy-baseline/policy-adaptive-context × 2)
+with zero false successes and a `policy-adaptive-context` Pareto
+frontier, plus a live shadowed container run journaling 6 shadow
+decisions while the verifier-granted active repair landed untouched.
+v1.0 artifacts: ADR-0014, `docs/architecture/benchmark-methodology.md`,
+`docs/architecture/honest-limitations.md`, updated architecture overview,
+cycle record `docs/process/cycles/PACS-017-adaptive-context-and-shadow-policies.md`.
+Cycle commits `a836821`..`446d871` (+ M11 artifacts commit); 2406 tests
+passing with `--ignore=tests/live` (57 platform-gated skips), branch
+coverage ≥ 90, all lint/type/import/UI gates green.
 
 PACS-016 (locked benchmark and multi-trial evaluation laboratory,
 2026-09-03) replaced demo-judgment with scientific evaluation of runtime
@@ -434,13 +468,10 @@ lint/type/import gates green, UI tsc+vite green, and the live 12-trial
 Ollama+Docker eval matrix complete with zero false successes. Both
 remaining PACS-014b-era follow-ons are now closed: the dedicated PG
 test database (PACS-015 M1) and exploration-vs-no-progress (PACS-016
-M8, ADR-0013). PACS-017 (adaptive context + shadow policies / v1.0)
-remains PLANNED, not active; the evaluator + evidence-grounded
-Reflexion remainder of the original PACS-014 scope is also available as
-an explicitly named follow-on. PACS-017 planning inputs now available:
-the locked benchmark suite, the eval runner + Pareto reports
-(configuration comparison axis), and the shadow-policy UI gate
-precedent. The operator may manually initiate the next cycle.
+M8, ADR-0013). PACS-017 (adaptive context + shadow policies) closed
+2026-09-07 — see the current checkpoint above; the evaluator +
+evidence-grounded Reflexion remainder of the original PACS-014 scope
+remains available as an explicitly named follow-on.
 
 PACS-014 (operator command center) closed 2026-09-02 at 1592 tests passing
 (18 platform-gated skips), 95% branch coverage, all lint/type/import gates
@@ -490,7 +521,9 @@ profiles instead of the hardcoded `civicml-loop` wiring.
   adapter's cost accounting uses pro-tier rates, so `deepseek-v4-flash`
   runs overestimate reported spend.
 
-## Planned path to v1.0
+## Path to v1.0 — complete
+
+All cycles below are CLOSED; v1.0 shipped with PACS-017 (2026-09-07).
 
 - PACS-006 Context authority model
 - PACS-007 Context lifecycle + prompt contracts
