@@ -757,6 +757,17 @@ def test_decode_accepts_null_and_numeric_score() -> None:
     assert isinstance(decoded.score, float)
 
 
+def test_decode_defaults_missing_inconclusive_to_false_and_round_trips_true() -> None:
+    legacy = CODEC.decode(_mutated_body(VERIFICATION_FAILED, "inconclusive", _MISSING))
+    assert isinstance(legacy, VerificationFailed)
+    assert legacy.inconclusive is False
+    flagged = CODEC.decode(_mutated_body(VERIFICATION_FAILED, "inconclusive", True))
+    assert isinstance(flagged, VerificationFailed)
+    assert flagged.inconclusive is True
+    with pytest.raises(TypeError, match="inconclusive"):
+        CODEC.decode(_mutated_body(VERIFICATION_FAILED, "inconclusive", "yes"))
+
+
 def test_decode_accepts_null_and_string_expected_observation() -> None:
     decoded = CODEC.decode(
         _mutated_body(ACTION_REJECTED, "expected_observation", None, section="proposal")

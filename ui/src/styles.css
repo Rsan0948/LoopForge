@@ -34,6 +34,27 @@ body {
   color: var(--text-muted);
 }
 
+.warning {
+  color: var(--amber);
+  font-size: 13px;
+  margin: 4px 0 0;
+}
+
+.followup-panel {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.followup-start {
+  display: inline-flex;
+  gap: 4px;
+  align-items: center;
+  color: var(--text-muted);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
 a {
   color: var(--accent);
   text-decoration: none;

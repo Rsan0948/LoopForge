@@ -46,6 +46,7 @@ from loopforge.domain.policies import (
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.security import SandboxCapabilities
+from loopforge.domain.state import RunState
 from loopforge.domain.tooling import (
     ApprovalClass,
     IdempotencyClass,
@@ -73,6 +74,7 @@ from loopforge.entrypoints.sessions import SessionManager, SessionWiring
 from loopforge.ports.sandbox import SandboxCommandResult
 from loopforge.ports.state_store import StateStorePort, StreamVersionConflictError
 from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolError
+from loopforge.ports.verifier import VerificationResult, VerifierPort
 from loopforge.ports.workspace import WorkspaceError
 from loopforge.workloads.benchmarks import (
     BENCHMARK_SUITE_VERSION,
@@ -203,6 +205,7 @@ class FakeBundleFactory:
     actions: list[ActionProposal]
     results: list[ToolResult]
     tools_override: BlockingTools | None = None
+    verifier_override: VerifierPort | None = None
     bundles: list[RepairRuntimeBundle] = field(default_factory=list[RepairRuntimeBundle])
     workspaces: list[FakeWorkspace] = field(default_factory=list[FakeWorkspace])
 
@@ -217,7 +220,11 @@ class FakeBundleFactory:
         runtime = Runtime(
             model=ScriptedModel(list(self.actions)),
             tools=tools,
-            verifier=ObservationContainsVerifier("all tests pass"),
+            verifier=(
+                self.verifier_override
+                if self.verifier_override is not None
+                else ObservationContainsVerifier("all tests pass")
+            ),
             store=store,
             control=ControlPolicy(BudgetLimit(max_cost_usd=1.0, max_iterations=5)),
             permissions=PermissionPolicy(frozenset({Permission.READ, Permission.LOCAL_WRITE})),
@@ -409,6 +416,54 @@ def test_follow_up_creates_a_successor_session(tmp_path: Path) -> None:
         assert detail["objective"].startswith("Fix the failing checks.")
         assert f"Follow-up report from run {run_id}" in detail["objective"]
         assert detail["repository"] == str(repo)
+
+
+def test_follow_up_auto_start_drives_the_successor(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, _plain_factory()) as client:
+        run_id = _create(client, repo)
+        client.post(f"/api/sessions/{run_id}/start")
+        _wait_for_status(client, run_id, "succeeded")
+
+        response = client.post(f"/api/sessions/{run_id}/follow-up", json={"auto_start": True})
+        assert response.status_code == 201, response.text
+        successor_id = response.json()["run_id"]
+        _wait_for_status(client, successor_id, "succeeded")
+
+
+def test_session_detail_flags_an_inconclusive_last_verification(tmp_path: Path) -> None:
+    class _InconclusiveVerifier:
+        def verify(self, state: RunState) -> VerificationResult:
+            del state
+            return VerificationResult(
+                passed=False,
+                summary="command:tests: failed (sandbox error: launcher died)",
+                score=0.0,
+                inconclusive=True,
+            )
+
+    factory = FakeBundleFactory(
+        actions=[_proposal("a1", "probe")],
+        results=[ToolResult(ok=True, observation="still broken")],
+        verifier_override=_InconclusiveVerifier(),
+    )
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, factory) as client:
+        run_id = _create(client, repo)
+        client.post(f"/api/sessions/{run_id}/start")
+        deadline = time.monotonic() + 10.0
+        detail = _detail(client, run_id)
+        while detail["last_verification"] is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+            detail = _detail(client, run_id)
+        assert detail["last_verification_inconclusive"] is True
+
+    repo_b = _repo(tmp_path / "repo-b")
+    with _client(tmp_path, _plain_factory()) as client:
+        plain_id = _create(client, repo_b)
+        client.post(f"/api/sessions/{plain_id}/start")
+        _wait_for_status(client, plain_id, "succeeded")
+        assert _detail(client, plain_id)["last_verification_inconclusive"] is False
 
 
 def test_follow_up_is_denied_for_non_terminal_and_unknown_runs(tmp_path: Path) -> None:
@@ -1958,8 +2013,45 @@ def test_fs_detect_suggests_pytest_for_python_marker_files(tmp_path: Path) -> No
         ]
         assert body["required"] == ["tests"]
         assert body["allowed_prefixes"] == ["src", "tests"]
-        # .venv/bin/python exists (via _repo), so there is nothing to warn about.
-        assert body["notes"] == []
+        # .venv/bin/python exists (via _repo), so there is nothing to warn
+        # about; the platform sandbox note is informational, not a warning.
+        harness_notes = [note for note in body["notes"] if "rlimit" not in note]
+        assert harness_notes == []
+
+
+def test_fs_detect_warns_when_root_sources_fall_outside_suggested_prefixes(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    (repo / "pyproject.toml").touch()
+    (repo / "tests").mkdir()
+    (repo / "game.py").touch()
+    (repo / "cards.py").touch()
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(repo)}).json()
+
+        # The suggestion still covers only conventional directories...
+        assert body["allowed_prefixes"] == ["tests"]
+        # ...but the operator is told that game.py/cards.py edits would be rejected.
+        prefix_note = next(note for note in body["notes"] if "root-level Python files" in note)
+        assert "game.py" in prefix_note
+        assert "cards.py" in prefix_note
+
+
+def test_fs_detect_reports_the_platform_sandbox_limit(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    (repo / "pyproject.toml").touch()
+    (repo / "src").mkdir()
+
+    with _client(tmp_path, _plain_factory()) as client:
+        body = client.get("/api/fs/detect", params={"path": str(repo)}).json()
+
+    rlimit_notes = [note for note in body["notes"] if "rlimit" in note]
+    if fsbrowse.memory_rlimit_supported():
+        assert rlimit_notes == []
+    else:
+        assert any("memory rlimit" in note for note in rlimit_notes)
 
 
 def test_fs_detect_notes_a_missing_local_python_for_the_token(tmp_path: Path) -> None:

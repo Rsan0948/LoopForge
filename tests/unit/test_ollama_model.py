@@ -304,7 +304,7 @@ def test_non_json_response_fails_explicitly() -> None:
     model = _model(_responding("not json at all"))
     with pytest.raises(ModelTurnError, match="not valid JSON") as excinfo:
         model.propose_action(_context())
-    assert excinfo.value.failure_class is ModelFailureClass.PERMANENT
+    assert excinfo.value.failure_class is ModelFailureClass.TRANSIENT
     assert excinfo.value.reason_code == "MODEL_INVALID_RESPONSE"
 
 
@@ -341,7 +341,7 @@ def test_wrong_tool_call_shape_fails_explicitly(
     model = _model(_responding(_chat_payload(tool_calls=tool_calls)))
     with pytest.raises(ModelTurnError, match=match) as excinfo:
         model.propose_action(_context())
-    assert excinfo.value.failure_class is ModelFailureClass.PERMANENT
+    assert excinfo.value.failure_class is ModelFailureClass.TRANSIENT
 
 
 def test_non_string_argument_value_fails_explicitly() -> None:

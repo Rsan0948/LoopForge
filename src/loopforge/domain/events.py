@@ -162,6 +162,10 @@ class VerificationPassed(DomainEvent):
 class VerificationFailed(DomainEvent):
     summary: str
     score: float | None = None
+    inconclusive: bool = False
+    """True when the verdict reflects checks that never executed (infra
+    error) rather than measured workspace state. Defaults False so replays
+    of pre-existing streams keep their meaning."""
 
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)

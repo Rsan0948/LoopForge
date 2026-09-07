@@ -16,6 +16,9 @@ class VerificationResult:
     passed: bool
     summary: str
     score: float | None = None
+    inconclusive: bool = False
+    """True when at least one check never executed (infra error, not a code
+    verdict). Fail-closed: inconclusive results are never ``passed``."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.passed, bool):  # pyright: ignore[reportUnnecessaryIsInstance]

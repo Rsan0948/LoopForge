@@ -108,7 +108,7 @@ def test_deepseek_rejects_non_string_tool_arguments() -> None:
     model = DeepSeekModel(api_key="key", tools=TOOLS, template=TEMPLATE, transport=transport)
     with pytest.raises(ModelTurnError, match="string-to-string") as raised:
         model.propose_action(_context())
-    assert raised.value.failure_class is ModelFailureClass.PERMANENT
+    assert raised.value.failure_class is ModelFailureClass.TRANSIENT
 
 
 def test_deepseek_normalizes_authentication_failure() -> None:

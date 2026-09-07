@@ -293,8 +293,34 @@ def test_checkout_validates_paths(tmp_path: Path) -> None:
 
 def test_checkout_unknown_path_raises_workspace_error(tmp_path: Path) -> None:
     workspace = _manager(tmp_path).materialize(_fixture())
-    with pytest.raises(WorkspaceError, match="git checkout"):
+    # Present neither at the base revision nor in the worktree: nothing to
+    # revert, and the failure names the path honestly.
+    with pytest.raises(WorkspaceError, match=r"cannot revert untracked-new-file.py"):
         workspace.checkout(("untracked-new-file.py",))
+
+
+def test_checkout_removes_files_the_run_created(tmp_path: Path) -> None:
+    workspace = _manager(tmp_path).materialize(_fixture())
+    created = workspace.root / "untracked-new-file.py"
+    created.write_text("print('new')\n", encoding="utf-8")
+
+    workspace.checkout(("untracked-new-file.py",))
+
+    assert not created.exists()
+    assert "untracked-new-file.py" not in workspace.status().untracked
+
+
+def test_checkout_mixed_tracked_and_created_paths(tmp_path: Path) -> None:
+    workspace = _manager(tmp_path).materialize(_fixture())
+    tracked = workspace.root / "module.py"
+    tracked.write_text("value = 99\n", encoding="utf-8")
+    created = workspace.root / "created.txt"
+    created.write_text("new\n", encoding="utf-8")
+
+    workspace.checkout(("module.py", "created.txt"))
+
+    assert not created.exists()
+    assert workspace.status().changed == ()
 
 
 def test_reset_restores_base_revision_and_removes_untracked(tmp_path: Path) -> None:

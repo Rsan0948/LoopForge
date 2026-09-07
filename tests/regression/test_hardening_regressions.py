@@ -1066,7 +1066,7 @@ def test_corrupt_content_encoding_maps_to_invalid_response() -> None:
     model = _p011_model(httpx.MockTransport(handler))
     with pytest.raises(ModelTurnError, match="could not be decoded") as excinfo:
         model.propose_action(_p011_context())
-    assert excinfo.value.failure_class is ModelFailureClass.PERMANENT
+    assert excinfo.value.failure_class is ModelFailureClass.TRANSIENT
     assert excinfo.value.reason_code == "MODEL_INVALID_RESPONSE"
 
 

@@ -206,6 +206,35 @@ def test_transient_retries_do_not_burn_iteration_budget() -> None:
     assert state.iteration == 1
 
 
+def _invalid_response() -> ModelTurnError:
+    return ModelTurnError(
+        ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", "model proposed 0 tool actions"
+    )
+
+
+def test_invalid_model_response_is_reprompted_then_proceeds() -> None:
+    # A single malformed turn (zero tool calls, bad JSON — a small-model
+    # hiccup, not a run defect) is absorbed by the bounded reprompt.
+    model = FlakyModel(
+        [_invalid_response(), ActionProposal(ActionId("a1"), "inspect", {"target": "auth"})],
+    )
+    runtime = _runtime(model, sleeper=RecordingSleeper())
+    state = runtime.run("objective")
+    assert state.status is RunStatus.SUCCEEDED
+    assert model.calls == 2
+
+
+def test_invalid_response_streak_exhaustion_still_stops_the_run() -> None:
+    store = InMemoryEventStore()
+    model = FlakyModel([_invalid_response()] * 3)
+    runtime = _runtime(model, sleeper=RecordingSleeper(), store=store)
+    state = runtime.run("objective")
+    assert state.status is RunStatus.FAILED
+    assert state.stop_reason is StopReason.FAILURE
+    assert model.calls == 3
+    assert "MODEL_INVALID_RESPONSE" in _stopped_summary(store, state.run_id)
+
+
 def test_failure_streak_resets_after_a_successful_turn() -> None:
     # Two transient failures, a successful (but unverified) action, then two
     # more transient failures: the streak must restart, not accumulate.

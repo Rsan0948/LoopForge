@@ -158,14 +158,14 @@ class DeepSeekModel(OllamaModel):
         response = self._post_deepseek(payload)
         if len(response.choices) != 1:
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT,
+                ModelFailureClass.TRANSIENT,
                 "MODEL_INVALID_RESPONSE",
                 f"model returned {len(response.choices)} choices, expected exactly one",
             )
         choice = response.choices[0]
         if choice.finish_reason not in {None, "tool_calls"}:
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT,
+                ModelFailureClass.TRANSIENT,
                 "MODEL_INVALID_RESPONSE",
                 _bounded(f"model stopped without a tool call: {choice.finish_reason}"),
             )
@@ -180,7 +180,7 @@ class DeepSeekModel(OllamaModel):
                 arguments = json.loads(call.function.arguments)
             except json.JSONDecodeError as exc:
                 raise ModelTurnError(
-                    ModelFailureClass.PERMANENT,
+                    ModelFailureClass.TRANSIENT,
                     "MODEL_INVALID_RESPONSE",
                     "model tool arguments were not valid JSON",
                 ) from exc
@@ -189,7 +189,7 @@ class DeepSeekModel(OllamaModel):
                 for key, value in cast(dict[object, object], arguments).items()
             ):
                 raise ModelTurnError(
-                    ModelFailureClass.PERMANENT,
+                    ModelFailureClass.TRANSIENT,
                     "MODEL_INVALID_RESPONSE",
                     "model tool arguments must be a string-to-string object",
                 )
@@ -240,7 +240,7 @@ class DeepSeekModel(OllamaModel):
             ) from exc
         except httpx.DecodingError as exc:
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT,
+                ModelFailureClass.TRANSIENT,
                 "MODEL_INVALID_RESPONSE",
                 "provider response body could not be decoded",
             ) from exc
@@ -265,7 +265,7 @@ class DeepSeekModel(OllamaModel):
             return _Response.model_validate(raw.json())
         except (json.JSONDecodeError, ValidationError) as exc:
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT,
+                ModelFailureClass.TRANSIENT,
                 "MODEL_INVALID_RESPONSE",
                 "provider response violated the chat schema",
             ) from exc

@@ -595,6 +595,23 @@ def test_follow_up_clones_wiring_with_a_report_seeded_objective(tmp_path: Path) 
     assert listing[successor_id]["driving"] is False
 
 
+def test_follow_up_with_auto_start_drives_the_successor_immediately(tmp_path: Path) -> None:
+    factory = _plain_factory()
+    manager = _manager(tmp_path, factory)
+    run_id = manager.create_session(_wiring())
+    manager.start_driving(run_id)
+    _wait_for(lambda: manager.state(run_id).status is RunStatus.SUCCEEDED)
+
+    successor_id = manager.follow_up(run_id, auto_start=True)
+
+    _wait_for(lambda: manager.state(successor_id).status is RunStatus.SUCCEEDED)
+    listing = {entry["run_id"]: entry for entry in manager.list_sessions()}
+    # The drive completed (scripted model), so driving has wound down, but
+    # the run is no longer quiescent-READY: it ran to its terminal verdict.
+    assert listing[successor_id]["driving"] is False
+    assert manager.state(successor_id).status is RunStatus.SUCCEEDED
+
+
 def test_follow_up_records_the_parent_run_id_durably(tmp_path: Path) -> None:
     manager = _manager(tmp_path, _plain_factory())
     run_id = manager.create_session(_wiring())

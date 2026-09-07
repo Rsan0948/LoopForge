@@ -69,6 +69,7 @@ export interface SessionDetail extends SessionEntry {
   last_verification: string | null;
   last_verification_passed: boolean | null;
   last_verification_score: number | null;
+  last_verification_inconclusive: boolean;
   plan: string | null;
   current_proposal: CurrentProposal | null;
   waiting_for_approval: boolean;
@@ -280,10 +281,15 @@ export function rollbackRun(runId: string, paths?: string[]): Promise<StatusResp
   );
 }
 
-/** Follow-up (PACS-014b): clone a TERMINAL run's wiring into a quiescent
- *  successor session whose objective carries the consolidated report. */
-export function followUp(runId: string): Promise<{ run_id: string }> {
-  return post<{ run_id: string }>(`/api/sessions/${encodeURIComponent(runId)}/follow-up`);
+/** Follow-up (PACS-014b): clone a TERMINAL run's wiring into a successor
+ *  session whose objective carries the consolidated report. The successor
+ *  stays quiescent unless `opts.start` is true — nothing auto-chains unless
+ *  the operator explicitly asks. */
+export function followUp(runId: string, opts?: { autoStart?: boolean }): Promise<{ run_id: string }> {
+  return post<{ run_id: string }>(
+    `/api/sessions/${encodeURIComponent(runId)}/follow-up`,
+    opts === undefined ? undefined : { auto_start: opts.autoStart ?? false },
+  );
 }
 
 // -- Provenance / explain / lineage (PACS-015) --------------------------------

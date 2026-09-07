@@ -162,6 +162,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   const [forceChecked, setForceChecked] = useState(false);
   const [amendOpen, setAmendOpen] = useState(false);
   const [amendText, setAmendText] = useState("");
+  const [followUpStart, setFollowUpStart] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [rejectReason, setRejectReason] = useState("");
   const [instruction, setInstruction] = useState("");
@@ -415,7 +416,7 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
   const onFollowUp = (): void => {
     void (async () => {
       try {
-        const { run_id } = await followUp(runId);
+        const { run_id } = await followUp(runId, { autoStart: followUpStart });
         navigateToSession(run_id);
       } catch (err) {
         setToast(err instanceof ApiError ? err.detail : String(err));
@@ -593,6 +594,12 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
                 </dd>
               </div>
             </dl>
+            {detail.last_verification_inconclusive && (
+              <p className="warning">
+                ⚠ check harness broken — infra error, not a test failure; the model cannot fix this.
+                Repair the harness, then follow up.
+              </p>
+            )}
             {detail.operator_instructions.length > 0 && (
               <p className="muted">
                 operator instructions ({detail.operator_instructions.length}) — latest: “
@@ -904,13 +911,23 @@ export default function SessionView({ runId }: { runId: string }): ReactElement 
             amend objective…
           </button>
           {canFollowUp && (
-            <button
-              type="button"
-              title="Create a new session on the same repository, seeded with a consolidated report from this finished run. You review the objective and press start — nothing auto-chains."
-              onClick={onFollowUp}
-            >
-              follow up →
-            </button>
+            <span className="followup-panel">
+              <label className="followup-start">
+                <input
+                  type="checkbox"
+                  checked={followUpStart}
+                  onChange={(event) => setFollowUpStart(event.target.checked)}
+                />
+                start the follow-up automatically
+              </label>
+              <button
+                type="button"
+                title="Create a new session on the same repository, seeded with a consolidated report from this finished run. The successor stays quiescent — tick the box only if you want it to start driving right away."
+                onClick={onFollowUp}
+              >
+                follow up →
+              </button>
+            </span>
           )}
         </div>
         {detail !== null && (

@@ -1088,6 +1088,7 @@ class Runtime:
                     sequence=sequence,
                     summary=verification.summary,
                     score=verification.score,
+                    inconclusive=verification.inconclusive,
                 ),
             )
         self._record_artifacts(run_id)

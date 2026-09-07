@@ -37,7 +37,7 @@ from loopforge.adapters.postgres_events import PostgresEventStore
 from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.application.provenance import build_provenance_graph, explain_provenance
 from loopforge.application.runtime import UnknownRunError
-from loopforge.domain.events import ApprovalRequested, ArtifactRecorded, Event
+from loopforge.domain.events import ApprovalRequested, ArtifactRecorded, Event, VerificationFailed
 from loopforge.domain.policies import PolicyLifecycle
 from loopforge.domain.provenance import ProvenanceNode, UnknownProvenanceNodeError
 from loopforge.domain.state import InvalidTransitionError
@@ -218,6 +218,14 @@ class InlineProfileRequest(BaseModel):
     model: InlineModelRequest
     budget: InlineBudgetRequest
     approval: InlineApprovalRequest | None = None
+
+
+class FollowUpRequest(BaseModel):
+    """Follow-up options: auto-start is explicit operator opt-in at creation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    auto_start: bool = False
 
 
 class CreateSessionRequest(BaseModel):
@@ -471,6 +479,7 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
                 latest = requested[-1]
                 pending = {"action_id": str(latest.action_id), "reason": latest.reason}
         proposal = state.current_proposal
+        last_failed = next((e for e in reversed(events) if isinstance(e, VerificationFailed)), None)
         budget: dict[str, object] | None = None
         if wiring is not None:
             budget = {
@@ -494,6 +503,9 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
             "last_verification": state.last_verification,
             "last_verification_passed": state.last_verification_passed,
             "last_verification_score": state.last_verification_score,
+            "last_verification_inconclusive": (
+                last_failed is not None and last_failed.inconclusive
+            ),
             "plan": state.plan,
             "current_proposal": (
                 {
@@ -632,8 +644,9 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
         manager.rollback(run_id, paths)
         return _status_response(run_id)
 
-    def follow_up_route(run_id: str) -> dict[str, str]:
-        return {"run_id": manager.follow_up(run_id)}
+    def follow_up_route(run_id: str, request: FollowUpRequest | None = None) -> dict[str, str]:
+        auto_start = request.auto_start if request is not None else False
+        return {"run_id": manager.follow_up(run_id, auto_start=auto_start)}
 
     def profiles_route() -> dict[str, object]:
         profiles: list[dict[str, str]] = []

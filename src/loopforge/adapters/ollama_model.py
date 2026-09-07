@@ -13,7 +13,8 @@ a real provider. The provider owns nothing beyond text generation:
   (AGENTS.md rule 4);
 - provider responses are validated by strict schema before becoming an
   ``ActionProposal`` — malformed output raises ``ModelTurnError`` with
-  ``MODEL_INVALID_RESPONSE`` and never touches the event log;
+  ``MODEL_INVALID_RESPONSE`` (transient: the runtime reprompts with bounded
+  backoff before it can become a durable stop reason);
 - provider failures are normalized into the runtime's ``ModelFailureClass``
   vocabulary; no Ollama/HTTP semantics leak past this module;
 - credentials (an optional bearer token) live only in the request headers and
@@ -300,7 +301,7 @@ class OllamaModel:
             # escapes the failure taxonomy entirely.
             msg = "provider response body could not be decoded"
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT, "MODEL_INVALID_RESPONSE", msg
+                ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg
             ) from exc
         except httpx.RequestError as exc:
             # TransportError and every other request-scoped failure
@@ -316,18 +317,18 @@ class OllamaModel:
         except json.JSONDecodeError as exc:
             msg = "provider response was not valid JSON"
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT, "MODEL_INVALID_RESPONSE", msg
+                ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg
             ) from exc
         try:
             parsed = ChatResponse.model_validate(data)
         except ValidationError as exc:
             msg = f"provider response violated the chat schema: {exc.error_count()} errors"
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT, "MODEL_INVALID_RESPONSE", _bounded(msg)
+                ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", _bounded(msg)
             ) from exc
         if not parsed.done:
             msg_2 = "provider response was not a completed generation"
-            raise ModelTurnError(ModelFailureClass.PERMANENT, "MODEL_INVALID_RESPONSE", msg_2)
+            raise ModelTurnError(ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg_2)
         return parsed
 
     @staticmethod
@@ -354,12 +355,12 @@ class OllamaModel:
         if len(calls) != 1:
             msg = f"model proposed {len(calls)} tool actions, expected exactly one"
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT, "MODEL_INVALID_RESPONSE", _bounded(msg)
+                ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", _bounded(msg)
             )
         function = calls[0].function
         if not function.name.strip():
             msg_2 = "model proposed a tool action with an empty tool name"
-            raise ModelTurnError(ModelFailureClass.PERMANENT, "MODEL_INVALID_RESPONSE", msg_2)
+            raise ModelTurnError(ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg_2)
         arguments = function.arguments or {}
         history = self._conversations.get(context.run_id)
         if history is not None:

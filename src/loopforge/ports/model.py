@@ -27,6 +27,13 @@ class ModelFailureClass(StrEnum):
     provider-specific errors (HTTP statuses, transport failures, malformed
     payloads) into these classes so the runtime can make stopping and retry
     decisions without any provider semantics crossing the boundary.
+
+    ``MODEL_INVALID_RESPONSE`` is TRANSIENT: a single malformed turn (zero
+    tool calls, bad JSON, truncated generation) is a model-quality hiccup,
+    not a run-level defect, so the runtime's bounded reprompt absorbs it.
+    The run still stops with the same durable summary if the streak exhausts
+    the retry budget. Configuration/contract defects (unknown model, auth,
+    prompt-template mismatch, invalid request) stay PERMANENT.
     """
 
     TRANSIENT = "transient"

@@ -291,10 +291,15 @@ def _construct_verification_failed(base: dict[str, Any], data: dict[str, Any]) -
     if score is not None and not math.isfinite(float(score)):
         msg = "score must be finite"
         raise ValueError(msg)
+    inconclusive = data.get("inconclusive", False)
+    if not isinstance(inconclusive, bool):
+        msg = "inconclusive must be a bool"
+        raise TypeError(msg)
     return VerificationFailed(
         **base,
         summary=_required_str(data, "summary"),
         score=float(score) if score is not None else None,
+        inconclusive=inconclusive,
     )
 
 

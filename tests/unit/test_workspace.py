@@ -107,6 +107,27 @@ def test_compose_check_outcomes_is_conjunctive_and_deterministic() -> None:
     assert compose_check_outcomes(outcomes) == composite
 
 
+def test_compose_check_outcomes_flags_checks_that_never_executed() -> None:
+    outcomes = (
+        CheckOutcome(
+            name="command:tests",
+            passed=False,
+            detail="sandbox error: launcher failed",
+            executed=False,
+        ),
+        CheckOutcome(name="patch_constraints", passed=True, detail="ok"),
+    )
+    composite = compose_check_outcomes(outcomes)
+    assert composite.passed is False
+    assert composite.inconclusive is True
+    # Fail-closed scoring is unchanged: an unexecuted check still contributes 0.
+    assert composite.score == 0.5
+    all_executed = compose_check_outcomes(
+        (CheckOutcome(name="only", passed=False, detail="exit_code=1"),)
+    )
+    assert all_executed.inconclusive is False
+
+
 def test_compose_check_outcomes_all_pass_scores_one() -> None:
     composite = compose_check_outcomes((CheckOutcome(name="only", passed=True, detail="ok"),))
     assert composite.passed is True

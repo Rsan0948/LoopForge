@@ -203,7 +203,26 @@ class GitWorkspace:
             _validate_checkout_path(path)
         # Restore from the base revision (index and worktree), never from the
         # possibly-staged index: revert converges to the recorded base.
-        self.run_git("checkout", self._base_revision, "--", *paths)
+        at_base = tuple(path for path in paths if self._exists_at_base(path))
+        if at_base:
+            self.run_git("checkout", self._base_revision, "--", *at_base)
+        # Files the run created (untracked at the base) have nothing to
+        # restore — reverting them means removing them, honestly.
+        for path in paths:
+            if path in at_base:
+                continue
+            candidate = self._root.joinpath(*path.split("/"))
+            if candidate.is_symlink() or candidate.is_file():
+                candidate.unlink()
+            elif candidate.exists():
+                msg_2 = f"cannot revert {path}: not a regular file"
+                raise WorkspaceError(msg_2)
+            else:
+                msg_3 = f"cannot revert {path}: not at the base revision and not in the worktree"
+                raise WorkspaceError(msg_3)
+
+    def _exists_at_base(self, path: str) -> bool:
+        return bool(self.run_git("ls-tree", "--name-only", self._base_revision, "--", path).strip())
 
     def reset(self) -> None:
         self.run_git("reset", "--hard", "-q", self._base_revision)

@@ -547,16 +547,18 @@ class SessionManager:
             else:
                 session.bundle.workspace.checkout(paths)
 
-    def follow_up(self, run_id: RunId | str) -> str:
-        """Create a quiescent successor session seeded with a terminal run's report.
+    def follow_up(self, run_id: RunId | str, *, auto_start: bool = False) -> str:
+        """Create a successor session seeded with a terminal run's report.
 
         The follow-up clones the source run's wiring (same repository,
         profile, model, and budgets) with the objective extended by a
         bounded, deterministic report consolidated from the durable event
-        stream (PACS-014b). The new session is left READY but undriven:
-        the operator reviews the seeded objective and presses start —
-        nothing auto-chains. Denied for non-terminal runs (the source must
-        be finished) and unmanaged runs (there is no wiring to clone). The
+        stream (PACS-014b). By default the new session is left READY but
+        undriven: the operator reviews the seeded objective and presses
+        start. ``auto_start=True`` — an explicit operator choice made at
+        creation time, never a silent chain — starts driving immediately.
+        Denied for non-terminal runs (the source must be finished) and
+        unmanaged runs (there is no wiring to clone). The
         repository-exclusivity guard passes because the source run is
         terminal.
         """
@@ -579,7 +581,10 @@ class SessionManager:
             # provenance and the console derive run lineages from.
             parent_run_id=str(rid),
         )
-        return self.create_session(successor)
+        successor_id = self.create_session(successor)
+        if auto_start:
+            self.start_driving(successor_id)
+        return successor_id
 
     # -- projections ----------------------------------------------------------
 

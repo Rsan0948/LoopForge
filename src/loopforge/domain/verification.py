@@ -11,6 +11,9 @@ class CheckOutcome:
     name: str
     passed: bool
     detail: str
+    executed: bool = True
+    """False when the check never ran (sandbox/infra error, harness bug) —
+    distinct from "ran and failed": the workspace was never measured."""
 
     def __post_init__(self) -> None:
         if not isinstance(self.passed, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -31,11 +34,22 @@ class CompositeVerification:
     passed: bool
     summary: str
     score: float
+    inconclusive: bool = False
+    """True when at least one check never executed (infra error): the score
+    still counts it as not passed (fail-closed), but the verdict is flagged
+    so operators and the console can tell "harness broken" apart from "code
+    wrong"."""
 
     def __post_init__(self) -> None:
         if not math.isfinite(self.score) or not 0.0 <= self.score <= 1.0:
             msg = "composite verification score must be a finite fraction in [0, 1]"
             raise ValueError(msg)
+
+
+def _outcome_verdict(outcome: CheckOutcome) -> str:
+    if outcome.passed:
+        return "passed"
+    return "failed" if outcome.executed else "inconclusive"
 
 
 def compose_check_outcomes(outcomes: tuple[CheckOutcome, ...]) -> CompositeVerification:
@@ -51,11 +65,11 @@ def compose_check_outcomes(outcomes: tuple[CheckOutcome, ...]) -> CompositeVerif
         raise ValueError(msg)
     passed_count = sum(1 for outcome in outcomes if outcome.passed)
     summary = "; ".join(
-        f"{outcome.name}: {'passed' if outcome.passed else 'failed'} ({outcome.detail})"
-        for outcome in outcomes
+        f"{outcome.name}: {_outcome_verdict(outcome)} ({outcome.detail})" for outcome in outcomes
     )
     return CompositeVerification(
         passed=passed_count == len(outcomes),
         summary=summary,
         score=passed_count / len(outcomes),
+        inconclusive=any(not outcome.executed for outcome in outcomes),
     )

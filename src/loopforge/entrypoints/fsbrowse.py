@@ -18,6 +18,9 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import subprocess
+import sys
+from functools import cache
 from pathlib import Path
 from typing import Any, Final, cast
 
@@ -32,6 +35,26 @@ _MAKE_TEST_TARGET: Final = re.compile(r"^test\s*:", re.MULTILINE)
 
 class UnknownFsPathError(Exception):
     """Raised when a browse/detect path does not name an existing directory."""
+
+
+@cache
+def memory_rlimit_supported() -> bool:
+    """Probe (once per process) whether this platform enforces RLIMIT_AS.
+
+    Probing in a child process: a real setrlimit here would mutate the
+    server's own limits. macOS rejects RLIMIT_AS outright.
+    """
+    probe = "import resource; resource.setrlimit(resource.RLIMIT_AS, (268435456, 268435456))"
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
 
 
 def _require_directory(raw: str) -> Path:
@@ -130,7 +153,7 @@ def _makefile_has_test_target(makefile: Path) -> bool:
     return _MAKE_TEST_TARGET.search(content) is not None
 
 
-def detect_harness(raw_path: str) -> dict[str, object]:
+def detect_harness(raw_path: str) -> dict[str, object]:  # noqa: PLR0912 - preflight notes add honest branches
     """Suggest inline-profile checks from a repository's marker files.
 
     First match wins (Python markers, then npm, then make); every heuristic
@@ -193,6 +216,20 @@ def detect_harness(raw_path: str) -> dict[str, object]:
     if not prefixes:
         notes.append(
             "no conventional source directories found — set acceptance.allowed_prefixes manually"
+        )
+    root_sources = sorted(candidate.name for candidate in path.glob("*.py") if candidate.is_file())
+    if prefixes and root_sources:
+        shown = ", ".join(root_sources[:3])
+        notes.append(
+            f"root-level Python files present ({shown}) — patches to them are rejected "
+            "unless allowed prefixes include them; add the file names if the task "
+            "should edit them"
+        )
+    if not memory_rlimit_supported():
+        notes.append(
+            "this platform rejects the memory rlimit (macOS) — local checks run with "
+            "it skipped and the skip is recorded in verification details; use "
+            "container mode for untrusted repositories"
         )
     if not _is_git_worktree(path):
         notes.append("not a git worktree (no .git) — session creation requires one")

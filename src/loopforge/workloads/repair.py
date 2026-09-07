@@ -248,7 +248,10 @@ class RepairVerifier:
             outcomes.append(self._hook_outcome(index, hook))
         composite = compose_check_outcomes(tuple(outcomes))
         return VerificationResult(
-            passed=composite.passed, summary=composite.summary, score=composite.score
+            passed=composite.passed,
+            summary=composite.summary,
+            score=composite.score,
+            inconclusive=composite.inconclusive,
         )
 
     def _hook_outcome(self, index: int, hook: RepairCheck) -> CheckOutcome:
@@ -287,6 +290,7 @@ class RepairVerifier:
                 name=f"command:{name}",
                 passed=False,
                 detail=f"sandbox error: {_bounded(str(exc))}",
+                executed=False,
             )
         detail = f"exit_code={result.exit_code}"
         if result.resource_limits_skipped:

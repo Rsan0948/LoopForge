@@ -193,6 +193,24 @@ def test_verifier_treats_sandbox_errors_as_failed_checks() -> None:
     assert not result.passed
     assert "sandbox error" in result.summary
     assert result.score == 0.5
+    # The check never executed: flagged inconclusive (infra error), distinct
+    # from a measured test failure — and rendered as such, not as "failed".
+    assert result.inconclusive is True
+    assert ": inconclusive (sandbox error" in result.summary
+
+
+def test_verifier_marks_measured_test_failures_as_conclusive() -> None:
+    verifier = RepairVerifier(
+        StubSandbox({"run_tests": _result(1)}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+    )
+
+    result = verifier.verify(_state())
+
+    assert not result.passed
+    assert "exit_code=1" in result.summary
+    assert result.inconclusive is False
 
 
 def test_verifier_never_consults_model_claimed_state() -> None:
