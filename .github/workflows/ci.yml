@@ -9,6 +9,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      # The wheel force-includes ui/dist as the packaged console, so it must
+      # exist before uv sync builds the editable install (and before uv build).
+      - run: npm ci && npm run build
+        working-directory: ui
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
