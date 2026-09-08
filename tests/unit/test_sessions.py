@@ -1139,7 +1139,10 @@ class _BarrierFactory(FakeBundleFactory):
     def build(self, wiring: SessionWiring, store: StateStorePort) -> RepairRuntimeBundle:
         if self.armed:
             self.barrier.wait(timeout=10)
-        return super().build(wiring, store)
+        # Zero-arg super() breaks on slotted dataclasses before 3.13: the
+        # decorator recreates the class, so the __class__ cell no longer
+        # matches the instance type.
+        return super(_BarrierFactory, self).build(wiring, store)
 
 
 def test_ensure_session_rebuild_race_keeps_one_session_and_closes_the_loser(
