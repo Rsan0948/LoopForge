@@ -375,7 +375,9 @@ class GitWorkspaceManager:
             for item in fixture.files:
                 path = target.joinpath(*item.path.split("/"))
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(item.content, encoding="utf-8", newline="")
+                # Path.write_text(newline=) needs 3.13+; open() works on 3.12.
+                with path.open("w", encoding="utf-8", newline="") as handle:
+                    handle.write(item.content)
             _run_git(self._git, target, "add", "-A")
             _run_git(self._git, target, "commit", "-q", "-m", f"fixture: {fixture.fixture_id}")
             base_revision = _run_git(self._git, target, "rev-parse", "HEAD").strip()

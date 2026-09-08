@@ -180,7 +180,9 @@ class ConstrainedLocalSandbox:
                 raise SandboxPolicyError(msg_9)
             # newline="" keeps on-disk bytes (CRLF included) faithfully: reads,
             # edits, and diffs must never silently rewrite line endings.
-            return path.read_text(encoding="utf-8", newline="")
+            # Path.read_text(newline=) needs 3.13+; open() works on 3.12.
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                return handle.read()
         except UnicodeDecodeError as exc:
             msg_23 = "read target is not valid utf-8 text"
             raise SandboxPolicyError(msg_23) from exc

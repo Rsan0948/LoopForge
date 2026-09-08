@@ -83,6 +83,10 @@ typeCheckingMode = "strict"
 include = ["src", "tests"]
 venvPath = "."
 venv = ".venv"
+# Check against the declared floor (requires-python = >=3.12) regardless of the
+# interpreter the local venv happens to run, so 3.13+ stdlib APIs fail locally
+# instead of only in CI.
+pythonVersion = "3.12"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config"

@@ -21,6 +21,9 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           enable-cache: true
+          # Test the declared floor (requires-python = >=3.12), not whatever
+          # interpreter the runner image happens to provide.
+          python-version: "3.12"
       - run: uv sync --extra dev
       - run: uv run ruff format --check .
       - run: uv run ruff check .

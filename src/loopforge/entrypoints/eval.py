@@ -628,8 +628,10 @@ def _read_evidence_text(workspace_root: Path, relative_path: str) -> str:
             )
             raise EvalTrialError(msg_5)
         # newline="" mirrors the sandbox read: evidence bytes stay faithful
-        # (CRLF included), never silently rewritten.
-        return resolved.read_text(encoding="utf-8", newline="")
+        # (CRLF included), never silently rewritten. Path.read_text(newline=)
+        # needs 3.13+; open() works on 3.12.
+        with resolved.open("r", encoding="utf-8", newline="") as handle:
+            return handle.read()
     except UnicodeDecodeError as exc:
         msg_6 = f"evidence path {relative_path!r} is not valid utf-8 text"
         raise EvalTrialError(msg_6) from exc
