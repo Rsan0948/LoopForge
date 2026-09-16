@@ -1,4 +1,19 @@
-# Build status — v1.0 closed (PACS-001…PACS-017)
+# Build status — reference architecture complete; package in public beta
+
+PACS-001 through PACS-017 close the planned reference-architecture program.
+The separately versioned distributable remains in the `0.2.x` beta line while
+its public API, packaging, and operator experience receive external use. This
+document records architecture evidence; it does not declare a `1.0.0` package
+release.
+
+Release-candidate readiness re-verified 2026-09-16 on macOS for package
+`0.2.1`: deterministic suite (`--ignore=tests/live`) **2461 passed, 46
+platform skips, 0 failed**, 94.49% branch coverage; Ruff format/lint, Pyright
+strict, both import contracts, UI typecheck/build, wheel install, and sdist
+install all passed. The sdist is 321 KB and excludes local caches and
+`node_modules`. The live-model suite was not repeated for this documentation
+and packaging-only change; the recorded live evidence below remains the latest
+model-run evidence.
 
 Open-source readiness re-verified 2026-09-07 on macOS: `uv run pytest -q` —
 **2465 passed, 46 skipped, 0 failed** (skips are the macOS `RLIMIT_AS` platform

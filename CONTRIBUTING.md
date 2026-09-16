@@ -4,6 +4,10 @@ Contributions are welcome — bug reports, design discussion, documentation, and
 code. By submitting a contribution you agree it is licensed under the project's
 [Apache License 2.0](LICENSE).
 
+Participation is governed by the [Code of Conduct](CODE_OF_CONDUCT.md). Report
+security vulnerabilities through the private process in [SECURITY.md](SECURITY.md),
+not through a public issue.
+
 ## Development setup
 
 Requires Python 3.12+ and [uv](https://docs.astral.sh/uv/):
@@ -24,7 +28,7 @@ ruff format --check .
 ruff check .
 pyright
 lint-imports
-pytest --cov=loopforge --cov-branch
+pytest --ignore=tests/live --cov=loopforge --cov-branch
 ```
 
 UI changes must additionally pass, in `ui/`:

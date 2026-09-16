@@ -1,0 +1,58 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/loopforge-console/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+      - run: npm ci && npm run build
+        working-directory: ui
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --extra dev
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          package_version="$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "$tag_version" = "$package_version" || {
+            echo "tag $tag_version does not match package $package_version" >&2
+            exit 1
+          }
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - run: uv run pyright
+      - run: uv run lint-imports
+      - run: uv run pytest --ignore=tests/live --cov=loopforge --cov-branch --cov-report=term-missing
+      - run: uv build --clear
+      - name: Smoke-test release artifacts
+        run: >-
+          uv run python scripts/smoke_artifacts.py
+          --expected-version "${GITHUB_REF_NAME#v}"
+          "dist/loopforge_console-${GITHUB_REF_NAME#v}-py3-none-any.whl"
+          "dist/loopforge_console-${GITHUB_REF_NAME#v}.tar.gz"
+      - name: Publish to PyPI with trusted publishing
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes --title "LoopForge $GITHUB_REF_NAME"

@@ -1,0 +1,32 @@
+name: Architecture or feature proposal
+description: Propose a capability or change to the reference architecture.
+title: "[Proposal]: "
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and use case
+      description: Describe the control-plane or operator problem, not only the desired implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: authority
+    attributes:
+      label: Authority, verification, and budget implications
+      description: Explain whether this changes permissions, trust, side effects, verification, resource bounds, or termination.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Acceptance evidence
+      description: What deterministic tests, denial cases, benchmark tasks, or operator evidence would demonstrate correctness?
+    validations:
+      required: true

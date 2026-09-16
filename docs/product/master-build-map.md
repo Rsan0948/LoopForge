@@ -229,8 +229,9 @@ Evidence of quality:
 - malicious fixture repos cannot escape a hardened sandbox in test scenarios
 
 **Status:** PACS-005 establishes the security/trust vocabulary, sandbox port, capability negotiation,
-and constrained local reference adapter. Strong hostile-code process filesystem/network/kernel
-isolation remains a later container/VM adapter requirement and is not claimed by the local adapter.
+and constrained local reference adapter. PACS-009 adds the hardened container adapter used for
+untrusted workloads, with enforced process-filesystem and deny-all network isolation. Neither the
+local nor container adapter claims kernel isolation; workloads requiring it continue to fail closed.
 
 ---
 

@@ -5,13 +5,31 @@
 [![Python](https://img.shields.io/pypi/pyversions/loopforge-console)](https://pypi.org/project/loopforge-console/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
-LoopForge is a reference implementation and experimentation platform for **bounded autonomous software-engineering agents**.
+LoopForge is a usable reference architecture and experimentation platform for
+building **deterministic, transparent, and governable agentic systems**. It
+ships a working software-engineering agent runtime and operator console, but
+its primary purpose is to make the control-plane architecture concrete,
+inspectable, and reusable.
 
 Its core thesis is simple:
 
 > A probabilistic model should operate inside a deterministic runtime that owns authority, state, verification, budgets, retries, and termination.
 
-The coding-agent workload is a reference domain, not the product thesis. LoopForge exists to make agent execution **typed, replayable, observable, fault-tolerant, and scientifically evaluable**.
+The coding-agent workload is the reference domain, not the product thesis.
+LoopForge demonstrates how a probabilistic model can operate inside a system
+whose authority, state, verification, budgets, retries, and termination remain
+deterministic. The result is agent execution that is **typed, replayable,
+observable, fault-tolerant, governable, and scientifically evaluable**.
+
+**Models propose. The runtime decides.**
+
+## Project status
+
+The PACS-001 through PACS-017 reference-architecture program is complete. The
+installable project remains a **public beta** (`0.2.x`) while the interfaces,
+packaging, and operator experience are exercised by external users. “Reference
+architecture complete” is therefore an architecture milestone, not a claim of
+production maturity or a `1.0.0` package release.
 
 ## Design principles
 
@@ -28,7 +46,8 @@ The coding-agent workload is a reference domain, not the product thesis. LoopFor
 
 ## What LoopForge provides today
 
-v1.0 is closed (PACS-001 through PACS-017). The invariant-bearing core was built first — a live model is one adapter among many, never the foundation of correctness:
+The invariant-bearing core was built first — a live model is one adapter among
+many, never the foundation of correctness:
 
 - immutable domain events
 - deterministic state projection
@@ -190,6 +209,7 @@ See `docs/process/cycles/PACS-014b-operator-usability.md`.
 - `docs/decisions/` — architecture decision records (ADR-0001 through ADR-0014)
 - `docs/security/threat-model.md` — trust classes, hostile-content assumptions,
   and what the sandbox does and does not guarantee
+- `docs/releasing.md` — versioning, trusted publishing, and release checklist
 - `docs/product/master-build-map.md` — full capability/dependency map
 - `docs/process/` — development process and per-cycle records (PACS-001…017)
 - `ui/README.md` — operator console SPA layout and development workflow
@@ -199,6 +219,8 @@ See `docs/process/cycles/PACS-014b-operator-usability.md`.
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the
 quality gates every change must pass, and [AGENTS.md](AGENTS.md) for the
 architecture invariants that apply to human and AI contributors alike.
+See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for community expectations and
+[CHANGELOG.md](CHANGELOG.md) for user-facing release history.
 
 ## Security
 

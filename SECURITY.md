@@ -6,7 +6,7 @@ code-owned policy and explicit human authorization, never from instruction-like 
 
 ## Current controls
 
-Through PACS-005 the repository includes:
+The repository includes:
 
 - code-owned tool risk/permission/retry/idempotency/approval/timeout metadata
 - explicit trust classes for runtime policy, human authority, observations, evidence, model
@@ -19,6 +19,8 @@ Through PACS-005 the repository includes:
 - wall-clock timeout with process-group termination
 - POSIX CPU/address-space/open-file/file-size limits and bounded captured output
 - tool-level sandbox capability requirements that fail closed during binding
+- a hardened Docker container adapter with read-only root filesystem, explicit mounts,
+  dropped capabilities, bounded resources, and network isolation
 
 ## Important boundary
 
@@ -29,8 +31,10 @@ Through PACS-005 the repository includes:
 - `kernel_isolated=False`
 
 Therefore arbitrary untrusted repository code must not be treated as safely executable through this
-adapter. A later container/VM adapter must provide real process filesystem, network, and kernel
-isolation before LoopForge claims that security property.
+adapter. LoopForge's container adapter is the supported path for untrusted repositories; it declares
+and negotiates process-filesystem, network, and kernel isolation separately, and fails closed when a
+workload's required capability is unavailable. This is defense in depth, not a claim that containers
+are equivalent to a dedicated VM or hostile multi-tenant boundary.
 
 See `docs/security/threat-model.md` and `docs/architecture/sandbox-contract.md` for the full threat
 model and capability contract.

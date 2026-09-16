@@ -1,0 +1,18 @@
+cff-version: 1.2.0
+message: "If LoopForge informs your agent-runtime architecture or research, please cite this software."
+title: "LoopForge: a reference architecture for deterministic, transparent, governable agentic systems"
+type: software
+authors:
+  - family-names: Sanchez
+    given-names: Ruben
+repository-code: "https://github.com/Rsan0948/LoopForge"
+url: "https://github.com/Rsan0948/LoopForge"
+license: Apache-2.0
+version: 0.2.1
+date-released: 2026-09-16
+keywords:
+  - AI agents
+  - agent runtime
+  - governance
+  - event sourcing
+  - evaluation

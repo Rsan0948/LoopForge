@@ -47,8 +47,8 @@ The PACS-003 reliability policy remains authoritative about whether a retry is p
 
 `ConstrainedLocalSandbox` is intentionally named to avoid implying container security. It provides a
 hardened userspace contract for local trusted commands but advertises no network, child-filesystem, or
-kernel isolation. A future container/VM adapter must implement the same port and advertise stronger
-capabilities only when they are actually enforced.
+kernel isolation. Untrusted repository execution uses the container adapter below, which implements
+the same port and advertises only the stronger capabilities it actually enforces.
 
 ## Container adapter boundary (PACS-009)
 

@@ -1,0 +1,55 @@
+name: Bug report
+description: Report reproducible behavior that does not match the documented contract.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks for helping improve LoopForge. Do not include secrets or undisclosed vulnerabilities here; use the private process in SECURITY.md.
+  - type: input
+    id: version
+    attributes:
+      label: LoopForge version or commit
+      placeholder: "0.2.1 or commit SHA"
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Runtime or orchestration
+        - Sandbox or security contract
+        - Verification or evaluation
+        - Operator console
+        - Packaging or installation
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Include the smallest commands, configuration, or repository fixture needed to reproduce the issue.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and relevant output
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      placeholder: "OS, Python, provider/model, sandbox mode, Docker/Postgres availability"
+    validations:
+      required: true
