@@ -397,10 +397,18 @@ def _require_approval(raw: dict[str, Any]) -> frozenset[str]:
 def _require_budget(raw: dict[str, Any]) -> tuple[BudgetLimit, int | None]:
     table = _require_table(raw, "budget")
     max_cost = _require_positive_number(table, "max_cost_usd", section="budget")
-    max_iterations = _optional_positive_int(table, "max_iterations", section="budget", default=0)
-    if max_iterations == 0:
-        msg = "budget.max_iterations must be a positive integer"
-        raise ProfileError(msg)
+    max_iterations: int | None
+    if table.get("max_iterations") == "unlimited":
+        # Explicit operator opt-in: no iteration cap. Cost, token, elapsed,
+        # and no-progress limits still bound the run.
+        max_iterations = None
+    else:
+        max_iterations = _optional_positive_int(
+            table, "max_iterations", section="budget", default=0
+        )
+        if max_iterations == 0:
+            msg = 'budget.max_iterations must be a positive integer or "unlimited"'
+            raise ProfileError(msg)
     max_tokens_raw: object = table.get("max_total_tokens")
     max_tokens: int | None = None
     if max_tokens_raw is not None:

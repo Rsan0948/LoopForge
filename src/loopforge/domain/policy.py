@@ -74,7 +74,7 @@ class ControlPolicy:
                 "STOP_STALLED_NO_PROGRESS",
                 StopReason.STALLED,
             )
-        if state.iteration >= self.budget.max_iterations:
+        if self.budget.max_iterations is not None and state.iteration >= self.budget.max_iterations:
             return ControlDecision(
                 ControlDecisionKind.STOP_FAILURE,
                 "STOP_MAX_ITERATIONS",

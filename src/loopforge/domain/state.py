@@ -537,7 +537,9 @@ def replay(run_id: RunId, events: tuple[Event, ...]) -> RunState:
 
 
 def budget_exceeded(state: RunState, limit: BudgetLimit) -> bool:
-    if state.cost_usd >= limit.max_cost_usd or state.iteration >= limit.max_iterations:
+    if state.cost_usd >= limit.max_cost_usd:
+        return True
+    if limit.max_iterations is not None and state.iteration >= limit.max_iterations:
         return True
     return limit.max_total_tokens is not None and state.total_tokens >= limit.max_total_tokens
 

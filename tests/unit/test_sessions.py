@@ -315,6 +315,15 @@ def test_registry_round_trip_is_atomic_and_typed(tmp_path: Path) -> None:
     assert set(SessionRegistry(path).as_dict()) == {"run_1", "run_2"}
 
 
+def test_registry_round_trips_unlimited_iterations(tmp_path: Path) -> None:
+    path = tmp_path / "sessions.json"
+    registry = SessionRegistry(path)
+    wiring = replace(_wiring(), max_iterations=None)
+
+    registry.put("run_1", wiring)
+    assert SessionRegistry(path).get("run_1") == wiring
+
+
 def test_registry_rejects_a_corrupted_file(tmp_path: Path) -> None:
     path = tmp_path / "sessions.json"
     path.write_text(json.dumps(["not", "a", "mapping"]), encoding="utf-8")
@@ -400,6 +409,23 @@ def test_inline_wiring_renders_validates_and_reconstructs_identically(tmp_path: 
     assert profile.task.objective == fields.objective
     assert [command.name for command in profile.task.commands] == ["unit_tests"]
     assert profile.budget.max_iterations == 30
+
+
+def test_inline_wiring_renders_unlimited_iterations(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    fields = replace(
+        _inline_fields(repo),
+        budget=InlineBudgetFields(max_cost_usd=5.0, max_iterations=None),
+    )
+
+    wiring = wiring_from_inline(fields, profiles_dir=tmp_path / "profiles")
+
+    assert wiring.max_iterations is None
+    persisted = list((tmp_path / "profiles").glob("inline-*.toml"))
+    assert len(persisted) == 1
+    assert 'max_iterations = "unlimited"' in persisted[0].read_text(encoding="utf-8")
+    profile = load_profile(persisted[0])
+    assert profile.budget.max_iterations is None
 
 
 def test_inline_wiring_renders_optional_tables(tmp_path: Path) -> None:

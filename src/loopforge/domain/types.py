@@ -74,7 +74,8 @@ class ControlDecisionKind(StrEnum):
 @dataclass(frozen=True, slots=True)
 class BudgetLimit:
     max_cost_usd: float
-    max_iterations: int
+    max_iterations: int | None
+    """Iteration cap; None = unlimited (cost/token/time/stall budgets still apply)."""
     max_total_tokens: int | None = None
     max_elapsed_seconds: float | None = None
 
@@ -85,8 +86,8 @@ class BudgetLimit:
         if self.max_cost_usd <= 0:
             msg_2 = "max_cost_usd must be positive"
             raise ValueError(msg_2)
-        if self.max_iterations <= 0:
-            msg_3 = "max_iterations must be positive"
+        if self.max_iterations is not None and self.max_iterations <= 0:
+            msg_3 = "max_iterations must be positive when set"
             raise ValueError(msg_3)
         if self.max_total_tokens is not None and self.max_total_tokens <= 0:
             msg_4 = "max_total_tokens must be positive when set"

@@ -280,6 +280,20 @@ def test_missing_budget_iterations_is_denied(tmp_path: Path) -> None:
         load_profile(_write_profile(tmp_path, body))
 
 
+def test_unlimited_budget_iterations_is_loaded(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo).replace("max_iterations = 30", 'max_iterations = "unlimited"')
+    profile = load_profile(_write_profile(tmp_path, body))
+    assert profile.budget.max_iterations is None
+
+
+def test_unknown_budget_iterations_string_is_denied(tmp_path: Path) -> None:
+    repo = _make_repo(tmp_path / "repo")
+    body = _valid_body(repo).replace("max_iterations = 30", 'max_iterations = "lots"')
+    with pytest.raises(ProfileError, match="max_iterations"):
+        load_profile(_write_profile(tmp_path, body))
+
+
 def test_non_positive_timeout_is_denied(tmp_path: Path) -> None:
     repo = _make_repo(tmp_path / "repo")
     body = _valid_body(repo).replace("timeout_seconds = 300", "timeout_seconds = 0")

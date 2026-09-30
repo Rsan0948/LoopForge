@@ -365,6 +365,19 @@ def test_create_session_via_inline_fields(tmp_path: Path) -> None:
         assert detail["iteration"] == 0
 
 
+def test_create_session_inline_accepts_unlimited_iterations(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    body = _inline_body(repo)
+    body["inline"]["budget"]["max_iterations"] = None
+    with _client(tmp_path, _plain_factory()) as client:
+        response = client.post("/api/sessions", json=body)
+        assert response.status_code == 201, response.text
+        run_id = response.json()["run_id"]
+
+        detail = _detail(client, run_id)
+        assert detail["budget"]["max_iterations"] is None
+
+
 def test_create_session_inline_round_trips_no_progress_limit(tmp_path: Path) -> None:
     repo = _repo(tmp_path / "repo")
     data_dir = tmp_path / "data"
