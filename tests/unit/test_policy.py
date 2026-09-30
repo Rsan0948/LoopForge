@@ -274,6 +274,20 @@ def test_iteration_below_max_does_not_stop_run() -> None:
     assert decision.kind is ControlDecisionKind.CONTINUE
 
 
+def test_unlimited_iterations_does_not_stop_on_iteration_count() -> None:
+    policy = _policy(max_iterations=None)
+    decision = policy.evaluate(_state(iteration=100_000), now=NOW)
+    assert decision.kind is ControlDecisionKind.CONTINUE
+
+
+def test_unlimited_iterations_still_stops_on_stall_and_budget() -> None:
+    policy = _policy(max_iterations=None, no_progress_limit=2)
+    stalled = policy.evaluate(_state(iteration=100_000, consecutive_no_progress=2), now=NOW)
+    assert stalled.kind is ControlDecisionKind.STOP_STALLED
+    over_budget = policy.evaluate(_state(iteration=100_000, cost_usd=5.0), now=NOW)
+    assert over_budget.kind is ControlDecisionKind.STOP_BUDGET
+
+
 # --- Continue decision --------------------------------------------------------
 
 
@@ -317,7 +331,7 @@ def _expected_kind(
         kind = ControlDecisionKind.STOP_BUDGET
     elif state.consecutive_no_progress >= policy.no_progress_limit:
         kind = ControlDecisionKind.STOP_STALLED
-    elif state.iteration >= budget.max_iterations:
+    elif budget.max_iterations is not None and state.iteration >= budget.max_iterations:
         kind = ControlDecisionKind.STOP_FAILURE
     return kind
 

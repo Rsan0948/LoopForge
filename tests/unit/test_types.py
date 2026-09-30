@@ -90,6 +90,11 @@ def test_budget_limit_accepts_minimal_limits() -> None:
     assert limit.max_elapsed_seconds is None
 
 
+def test_budget_limit_accepts_unlimited_iterations() -> None:
+    limit = BudgetLimit(max_cost_usd=1.0, max_iterations=None)
+    assert limit.max_iterations is None
+
+
 def test_budget_limit_accepts_optional_token_and_elapsed_caps() -> None:
     limit = BudgetLimit(
         max_cost_usd=1.0,

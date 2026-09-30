@@ -7,6 +7,12 @@ imply a package-version number.
 
 ## [Unreleased]
 
+### Added
+
+- Operator profiles accept `max_iterations = "unlimited"` (inline session
+  API: `"max_iterations": null`) to run without an iteration cap. Cost,
+  token, elapsed-time, and no-progress limits still bound the run.
+
 ## [0.2.1] - 2026-09-16
 
 ### Changed

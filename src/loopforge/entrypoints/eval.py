@@ -185,9 +185,12 @@ def _container_for(image: str | None, spec: BenchmarkTaskSpec) -> str | None:
 def _narrow_budget(config: EvalConfiguration, *, orchestrated: bool) -> BudgetLimit:
     """Tighten the builders' code-owned envelope per axis; never widen it."""
     envelope = _ORCHESTRATED_ENVELOPE if orchestrated else _TRUSTED_ENVELOPE
+    max_iterations = config.max_iterations
+    if envelope.max_iterations is not None:
+        max_iterations = min(max_iterations, envelope.max_iterations)
     return BudgetLimit(
         max_cost_usd=min(config.max_cost_usd, envelope.max_cost_usd),
-        max_iterations=min(config.max_iterations, envelope.max_iterations),
+        max_iterations=max_iterations,
     )
 
 

@@ -194,7 +194,8 @@ class InlineBudgetRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     max_cost_usd: float
-    max_iterations: int
+    max_iterations: int | None
+    """Iteration cap; explicit null = unlimited (cost/token/time/stall still bound the run)."""
     max_total_tokens: int | None = None
     max_elapsed_seconds: float | None = None
     no_progress_limit: int | None = None

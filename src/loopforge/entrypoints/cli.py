@@ -565,9 +565,10 @@ def _print_profile_summary(profile: LoopProfile) -> None:
         f"tier={profile.model_tier.value}"
     )
     budget = profile.budget
+    max_iterations = budget.max_iterations if budget.max_iterations is not None else "unlimited"
     print(
         f"budget max_cost=${budget.max_cost_usd:.2f} "
-        f"max_iterations={budget.max_iterations} "
+        f"max_iterations={max_iterations} "
         f"max_total_tokens={budget.max_total_tokens or '-'} "
         f"max_elapsed_seconds={budget.max_elapsed_seconds or '-'}"
     )

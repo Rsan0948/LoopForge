@@ -99,7 +99,7 @@ class SessionWiring:
     repository: str
     profile_source: dict[str, str]
     max_cost_usd: float
-    max_iterations: int
+    max_iterations: int | None
     max_total_tokens: int | None
     max_elapsed_seconds: float | None
     model_provider: str
@@ -219,8 +219,10 @@ def _wiring_from_dict(data: object) -> SessionWiring:
         msg_2 = "session wiring field 'profile_source' must be a string map"
         raise TypeError(msg_2)
     max_iterations = record.get("max_iterations")
-    if isinstance(max_iterations, bool) or not isinstance(max_iterations, int):
-        msg_3 = "session wiring field 'max_iterations' must be an integer"
+    if max_iterations is not None and (
+        isinstance(max_iterations, bool) or not isinstance(max_iterations, int)
+    ):
+        msg_3 = "session wiring field 'max_iterations' must be an integer or null"
         raise TypeError(msg_3)
     max_total_tokens = record.get("max_total_tokens")
     if max_total_tokens is not None and (
@@ -783,7 +785,8 @@ class InlineModelFields:
 @dataclass(frozen=True, slots=True, kw_only=True)
 class InlineBudgetFields:
     max_cost_usd: float
-    max_iterations: int
+    max_iterations: int | None
+    """Iteration cap; None renders as ``max_iterations = "unlimited"``."""
     max_total_tokens: int | None = None
     max_elapsed_seconds: float | None = None
     no_progress_limit: int | None = None
@@ -880,7 +883,10 @@ def render_inline_profile_toml(fields: InlineProfileFields) -> str:
 def _render_budget_section(lines: list[str], budget: InlineBudgetFields) -> None:
     lines.append("[budget]")
     lines.append(f"max_cost_usd = {float(budget.max_cost_usd)!r}")
-    lines.append(f"max_iterations = {budget.max_iterations}")
+    if budget.max_iterations is None:
+        lines.append('max_iterations = "unlimited"')
+    else:
+        lines.append(f"max_iterations = {budget.max_iterations}")
     if budget.max_total_tokens is not None:
         lines.append(f"max_total_tokens = {budget.max_total_tokens}")
     if budget.max_elapsed_seconds is not None:
