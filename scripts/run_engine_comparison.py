@@ -55,6 +55,10 @@ SECONDS = 2400
 # Upstream mlx_lm.server stores no reusable checkpoint for tool-final requests, which
 # disables prefix reuse on this hybrid model in an agent loop; see mlx_server_agentic.py.
 AGENTIC_CACHE = True
+# Server tuning, chosen by scripts/tune_mlx_server.py measurements (see the handoff log):
+# defaults were best; --kv-bits 8 silently disabled prompt-cache reuse (11.7 vs 46.5 tok/s).
+MLX_SERVER_ARGS: tuple[str, ...] = ()
+MLX_PRESENCE_CONTEXT = 2048
 TURNS = 60
 WARMUP = [{"role": "user", "content": "Reply with the single word OK."}]
 NATIVE_SUFFIX = (
@@ -125,20 +129,42 @@ def mlx_payload(native: dict[str, object], model_path: str) -> dict[str, object]
         "top_k": opts["top_k"],
         "min_p": opts["min_p"],
         "presence_penalty": opts["presence_penalty"],
-        "presence_context_size": 64,  # Ollama's repeat_last_n default window
+        # Tuned (scripts/tune_engine_sampling.py): a 2048-token presence window gave shorter,
+        # far less variable reasoning on MLX with exact edit arguments intact. Ollama keeps
+        # its shipped window; changing repeat_last_n showed no clear effect there.
+        "presence_context_size": MLX_PRESENCE_CONTEXT,
         "repetition_penalty": opts.get("repeat_penalty", 1.0),
         "chat_template_kwargs": {"ollama_rendered_prompt": render(native)},
     }
 
 
+def cache_metrics(engine: str, data: dict[str, object]) -> dict[str, object]:
+    """Ollama reports prefill time; MLX reports cached prompt tokens."""
+    if engine == "ollama":
+        prefill = data.get("prompt_eval_duration", 0) / 1e9  # type: ignore[operator]
+        decode = data.get("eval_duration", 0) / 1e9  # type: ignore[operator]
+        return {
+            "prefill_s": round(prefill, 2),
+            "decode_tok_s": round(data.get("eval_count", 0) / decode, 1) if decode else None,  # type: ignore[operator]
+        }
+    usage = data.get("usage", {})
+    details = usage.get("prompt_tokens_details") or {}  # type: ignore[union-attr]
+    return {"cached_tokens": details.get("cached_tokens", 0)}  # type: ignore[union-attr]
+
+
 class Transport(httpx.BaseTransport):
-    def __init__(self, engine: str, directory: Path, deadline: float) -> None:
+    def __init__(
+        self, engine: str, directory: Path, deadline: float, probe_calls: int | None = None
+    ) -> None:
         self.engine, self.directory, self.deadline = engine, directory, deadline
+        self.probe_calls = probe_calls
         self.calls = 0
         self.client = httpx.Client(trust_env=False)
         self.model_path = mlx_lab.model_info()["local_path"] if engine == "mlx" else ""
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
+        if self.probe_calls is not None and self.calls >= self.probe_calls:
+            raise TimeoutError("probe complete")
         self.calls += 1
         native = json.loads(request.content)
         if self.engine == "mlx":
@@ -177,6 +203,7 @@ class Transport(httpx.BaseTransport):
                         "seconds": round(record["wall_seconds"], 1),  # type: ignore[arg-type]
                         "prompt_tokens": normalized.get("prompt_eval_count"),
                         "output_tokens": normalized.get("eval_count"),
+                        **cache_metrics(self.engine, data),
                         "tools": [c["function"]["name"] for c in calls],
                     }
                 ),
@@ -213,7 +240,7 @@ def task_inputs():
     return config, campaign
 
 
-def child(directory: Path, engine: str) -> None:
+def child(directory: Path, engine: str, probe_calls: int | None = None) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     config, campaign = task_inputs()
     task = config.task
@@ -223,7 +250,7 @@ def child(directory: Path, engine: str) -> None:
     )
     store = SQLiteEventStore(directory / "events.sqlite", codec=JsonEventCodec())
     started = time.monotonic()
-    transport = Transport(engine, directory, started + SECONDS)
+    transport = Transport(engine, directory, started + SECONDS, probe_calls)
     original = coding.OllamaModel
     coding.OllamaModel = lambda **kw: OllamaModel(**kw, transport=transport)  # type: ignore[assignment]
     result: dict[str, object] = {"engine": engine}
@@ -324,9 +351,15 @@ def warm_ollama() -> dict[str, object]:
     }
 
 
-def start_mlx() -> tuple[subprocess.Popen[bytes], float]:
+def start_mlx(extra_args: tuple[str, ...] = ()) -> tuple[subprocess.Popen[bytes], float]:
     started = time.monotonic()
-    provider = mlx_lab.server(True, 18181, RENDER_TEMPLATE, agentic_cache=AGENTIC_CACHE)
+    provider = mlx_lab.server(
+        True,
+        18181,
+        RENDER_TEMPLATE,
+        agentic_cache=AGENTIC_CACHE,
+        extra_args=extra_args or MLX_SERVER_ARGS,
+    )
     deadline = started + 300
     while time.monotonic() < deadline:
         if provider.poll() is not None:
@@ -418,6 +451,8 @@ def run(output: Path, only: str | None) -> None:
         "schedule": schedule,
         "profile": native_options(),
         "mlx_server": "agentic-tool-checkpoint" if AGENTIC_CACHE else "upstream",
+        "mlx_server_args": list(MLX_SERVER_ARGS),
+        "mlx_presence_context_size": MLX_PRESENCE_CONTEXT,
         "cache_modes": __doc__.split("Cache control")[1],
     }
     (output / "plan.json").write_text(json.dumps(plan, indent=2))
@@ -512,15 +547,50 @@ def run(output: Path, only: str | None) -> None:
         lease.release()
 
 
+def probe(output: Path, engine: str, mode: str, calls: int) -> None:
+    """Prepare one engine exactly as a matrix trial would, then run CALLS model calls."""
+    output = output.resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    lease = ModelLease()
+    lease.acquire("engine-comparison-probe")
+    provider = None
+    try:
+        unload_ollama()
+        if engine == "mlx":
+            provider, ready = start_mlx()
+            print(json.dumps({"event": "mlx_ready", "seconds": round(ready, 1)}), flush=True)
+            if mode == "warm":
+                print(json.dumps({"event": "warmup", **warm_mlx()}), flush=True)
+        elif mode == "warm":
+            print(json.dumps({"event": "warmup", **warm_ollama()}), flush=True)
+        child(output / f"{engine}-{mode}", engine, calls)
+    finally:
+        if provider:
+            mlx_lab.stop_server(provider)
+        unload_ollama()
+        cleanup_containers(output / f"{engine}-{mode}" / "workspace")
+        lease.release()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--only", choices=["ollama", "mlx"])
-    parser.add_argument("--child", nargs=2)
+    parser.add_argument("--child", nargs="+", metavar=("DIR", "ENGINE"))
+    parser.add_argument(
+        "--probe",
+        nargs=3,
+        metavar=("ENGINE", "MODE", "CALLS"),
+        help="tuning probe: one engine/mode for CALLS model calls, no matrix",
+    )
     args = parser.parse_args()
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     if args.child:
-        child(Path(args.child[0]), args.child[1])
+        child(
+            Path(args.child[0]), args.child[1], int(args.child[2]) if len(args.child) > 2 else None
+        )
+    elif args.probe and args.output:
+        probe(args.output, args.probe[0], args.probe[1], int(args.probe[2]))
     elif args.output:
         run(args.output, args.only)
     else:

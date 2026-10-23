@@ -17,6 +17,7 @@ class OllamaProfile:
     keep_alive: str = "5m"
     conversation_mode: Literal["history", "state"] = "history"
     thinking_policy: Literal["always", "on_evidence"] = "always"
+    history_replay: Literal["bounded", "exact"] = "bounded"
 
     def options(self) -> dict[str, float | int]:
         return {
@@ -52,17 +53,23 @@ def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inferenc
             # 25K-token request: 720 output tokens with 1.5 versus a long, looping
             # trace with 0.0. The 32K allowance keeps long reasoning from being
             # cut off before the action; 457 tok/s prefill, ~15 tok/s decode on M1 Max.
+            # Hybrid model: a prompt that rewrites earlier turns cannot reuse the
+            # recurrent cache. Ollama's qwen3.5 renderer renders every earlier
+            # assistant turn by the current request's think flag, so the flag stays
+            # constant, and thinking/content replay exactly as generated.
             return OllamaProfile(
-                "coding-native-a3b-v1",
+                "coding-native-a3b-v2",
                 1.0,
                 0.95,
                 1.5,
                 True,
                 32768,
+                preserve_thinking=True,
                 context_tokens=131072,
                 keep_alive="30m",
                 conversation_mode="history",
-                thinking_policy="on_evidence",
+                thinking_policy="always",
+                history_replay="exact",
             )
         return OllamaProfile(
             "coding-native-v1",

@@ -105,6 +105,7 @@ def server(
     chat_template: str | None = None,
     *,
     agentic_cache: bool = False,
+    extra_args: tuple[str, ...] = (),
 ) -> subprocess.Popen:
     info = model_info()
     if info["revision"] != REVISION:
@@ -164,6 +165,7 @@ def server(
                 "2",
                 "--prompt-cache-bytes",
                 "4294967296",
+                *extra_args,
             ],
             cwd=ROOT,
             env=env,

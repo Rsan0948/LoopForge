@@ -130,6 +130,7 @@ class OllamaModel:
         request_token_counter: Callable[[dict[str, object]], int] | None = None,
         byte_ratio_admission: bool = False,
         thinking_policy: Literal["always", "on_evidence"] = "always",
+        history_replay: Literal["bounded", "exact"] = "bounded",
         conversation_mode: Literal["history", "state"] = "history",
         tool_filter: Callable[[ModelContext], frozenset[str]] | None = None,
         tool_spec_filter: Callable[[ModelContext, ModelToolSpec], ModelToolSpec] | None = None,
@@ -233,6 +234,16 @@ class OllamaModel:
             msg = "evidence-driven thinking requires an append-only conversation"
             raise ValueError(msg)
         self._thinking_policy = thinking_policy
+        # "exact" replays each assistant turn as generated (thinking and content
+        # verbatim, no omission notices), so every request extends the previous
+        # prompt plus generated tokens and prefix caches stay valid. Hybrid models
+        # cannot trim recurrent cache state back to a rewritten history point.
+        if history_replay not in {"bounded", "exact"} or (
+            history_replay == "exact" and (conversation_mode != "history" or not preserve_thinking)
+        ):
+            msg = "exact history replay requires an append-only conversation preserving thinking"
+            raise ValueError(msg)
+        self._history_replay = history_replay
         self._ratio_bound_violated: set[RunId] = set()
         self._history_compactions: dict[RunId, int] = {}
         self._temperature = temperature
@@ -369,7 +380,7 @@ class OllamaModel:
             if error.reason_code == "MODEL_TOOL_PARSE":
                 messages.append(
                     {
-                        "role": "user",
+                        "role": self._correction_role(),
                         "content": (
                             "Protocol correction: the provider rejected the previous tool-call "
                             "syntax; no action executed. Return exactly ONE well-formed native "
@@ -620,11 +631,27 @@ class OllamaModel:
                 if observations
                 else "No new observation was recorded for the proposed action."
             )
-            history.append({"role": "tool", "tool_name": pending, "content": result})
             new_items = [item for item in new_items if item not in observations]
+            if self._history_replay == "exact" and new_items:
+                # A separate user message would become the renderer's latest query
+                # and re-render every earlier assistant turn; keep runtime updates
+                # inside the tool response, with their trust labels.
+                result += "\nRuntime update:\n" + "\n".join(
+                    f"- ({item.trust.value}) {item.content}" for item in new_items
+                )
+                new_items = []
+            history.append({"role": "tool", "tool_name": pending, "content": result})
         if new_items:
             lines = "\n".join(f"- ({item.trust.value}) {item.content}" for item in new_items)
             history.append({"role": "user", "content": f"Runtime update:\n{lines}"})
+
+    def _correction_role(self) -> str:
+        """Runtime-owned corrections; in exact replay a mid-conversation system message.
+
+        A user message would become the renderer's latest query and re-render every
+        earlier assistant turn, discarding the prefix cache on hybrid models.
+        """
+        return "system" if self._history_replay == "exact" else "user"
 
     def _render(self, context: ModelContext) -> RenderedPrompt:
         reference = self._template.reference()
@@ -748,7 +775,7 @@ class OllamaModel:
                 # provider content as an instruction or execute a partial batch.
                 history.append(
                     {
-                        "role": "user",
+                        "role": self._correction_role(),
                         "content": (
                             "Protocol correction: the previous response was rejected and "
                             "no tool ran. Return exactly ONE tool call in this response. "
@@ -768,7 +795,7 @@ class OllamaModel:
         arguments = function.arguments or {}
         history = self._conversations.get(context.run_id)
         thinking = response.message.thinking if self._preserve_thinking else ""
-        if len(thinking.encode()) > 4096:
+        if self._history_replay == "bounded" and len(thinking.encode()) > 4096:
             thinking = ""
             self.request_tracker.note("optional_thinking_omitted_over_4096_bytes")
             if history is not None:
@@ -782,7 +809,7 @@ class OllamaModel:
                     }
                 )
         content = response.message.content
-        if len(content.encode()) > 4096:
+        if self._history_replay == "bounded" and len(content.encode()) > 4096:
             content = "[Optional model commentary omitted whole; native action retained exactly.]"
             self.request_tracker.note("optional_commentary_omitted_over_4096_bytes")
         if history is not None:

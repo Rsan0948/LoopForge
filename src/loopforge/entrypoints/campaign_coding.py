@@ -1322,6 +1322,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             context_window_tokens=profile.context_tokens,
             byte_ratio_admission=native,
             thinking_policy=profile.thinking_policy,
+            history_replay=profile.history_replay,
         )
     )
     selected = model if model is not None else live

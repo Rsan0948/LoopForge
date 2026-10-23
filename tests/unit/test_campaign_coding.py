@@ -2029,7 +2029,8 @@ def test_checks_unavailable_still_block_immediately(
             self, command_name: str, *, timeout_seconds: float | None = None
         ) -> SandboxCommandResult:
             del command_name, timeout_seconds
-            raise SandboxError("container runtime unavailable")
+            msg = "container runtime unavailable"
+            raise SandboxError(msg)
 
     monkeypatch.setattr(coding, "ContainerSandbox", Unavailable)
     repo = workspace(tmp_path)

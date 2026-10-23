@@ -1390,3 +1390,127 @@ def test_evidence_driven_exhaustion_skips_reasoning_once_then_resumes() -> None:
     model.propose_action(_context())  # forced action without reasoning
     model.propose_action(_context())  # new evidence from run_tests: reasoning resumes
     assert [r["think"] for r in requests] == [True, False, True]
+
+
+def _history_after_long_thinking(replay: str) -> list[dict[str, object]]:
+    requests: list[dict[str, object]] = []
+    long_thinking = "step " * 2000  # > 4096 bytes
+    payload = _chat_payload()
+    payload["message"]["thinking"] = long_thinking  # type: ignore[index]
+    payload["message"]["content"] = "plan " * 1000  # type: ignore[index]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=payload)
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        thinking=True,
+        preserve_thinking=True,
+        history_replay=replay,  # type: ignore[arg-type]
+        transport=httpx.MockTransport(respond),
+    )
+    model.propose_action(_context())
+    model.propose_action(_context())
+    return cast("list[dict[str, object]]", requests[1]["messages"])
+
+
+def test_exact_replay_keeps_long_thinking_and_content_verbatim_without_notices() -> None:
+    messages = _history_after_long_thinking("exact")
+    assistant = next(m for m in messages if m["role"] == "assistant")
+    assert assistant["thinking"] == "step " * 2000
+    assert assistant["content"] == "plan " * 1000
+    assert not any("omitted" in str(m.get("content", "")) for m in messages)
+
+
+def test_bounded_replay_still_omits_long_thinking_and_commentary() -> None:
+    messages = _history_after_long_thinking("bounded")
+    assistant = next(m for m in messages if m["role"] == "assistant")
+    assert "thinking" not in assistant
+    assert "omitted whole" in str(assistant["content"])
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"history_replay": "exact", "preserve_thinking": False},
+        {"history_replay": "exact", "preserve_thinking": True, "conversation_mode": "state"},
+        {"history_replay": "verbatim"},
+    ],
+)
+def test_exact_replay_requires_append_only_history_with_thinking(kwargs: dict[str, object]) -> None:
+    with pytest.raises(ValueError, match=r"exact history replay|state mode|thinking"):
+        OllamaModel(model="m", tools=TOOLS, template=TEMPLATE, **kwargs)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(("replay", "folded"), [("exact", True), ("bounded", False)])
+def test_runtime_updates_ride_inside_the_tool_response_only_in_exact_mode(
+    replay: str, folded: bool
+) -> None:
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_payload())
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        thinking=True,
+        preserve_thinking=True,
+        history_replay=replay,  # type: ignore[arg-type]
+        transport=httpx.MockTransport(respond),
+    )
+    model.propose_action(_context())
+    model.propose_action(
+        _context_with(
+            _item("objective", "Repair the adder regression.", TrustClass.AUTHORIZED_HUMAN),
+            _item("obs", "Source 'adder.py': return a-b", TrustClass.UNTRUSTED_CONTENT),
+            _item("plan", "Verification recorded; continue.", TrustClass.RUNTIME_POLICY),
+        )
+    )
+    tail = cast("list[dict[str, object]]", requests[1]["messages"])[2:]
+    roles = [m["role"] for m in tail]
+    tool = next(m for m in tail if m["role"] == "tool")
+    if folded:
+        assert roles == ["assistant", "tool"]
+        assert "Runtime update:" in str(tool["content"])
+        assert "(runtime_policy) Verification recorded" in str(tool["content"])
+    else:
+        assert roles == ["assistant", "tool", "user"]
+        assert "Runtime update" not in str(tool["content"])
+
+
+@pytest.mark.parametrize(("replay", "role"), [("exact", "system"), ("bounded", "user")])
+def test_protocol_correction_does_not_become_a_user_query_in_exact_mode(
+    replay: str, role: str
+) -> None:
+    requests: list[dict[str, object]] = []
+    two_calls = [
+        {"function": {"name": "read_file", "arguments": {"path": "a.py"}}},
+        {"function": {"name": "read_file", "arguments": {"path": "b.py"}}},
+    ]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        calls = two_calls if len(requests) == 1 else None
+        return httpx.Response(200, json=_chat_payload(tool_calls=calls))
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        thinking=True,
+        preserve_thinking=True,
+        history_replay=replay,  # type: ignore[arg-type]
+        transport=httpx.MockTransport(respond),
+    )
+    with pytest.raises(ModelTurnError):
+        model.propose_action(_context())
+    model.propose_action(_context())
+    correction = cast("list[dict[str, object]]", requests[1]["messages"])[-1]
+    assert correction["role"] == role
+    assert "Protocol correction" in str(correction["content"])

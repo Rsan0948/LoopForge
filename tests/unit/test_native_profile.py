@@ -146,7 +146,10 @@ def test_a3b_model_gets_vendor_sampling_and_room_for_long_reasoning() -> None:
     assert a3b.output_tokens == 32768
     assert a3b.context_tokens == 131072
     assert a3b.options()["presence_penalty"] == 1.5
-    assert a3b.thinking_policy == "on_evidence"
+    # Constant think flag and exact replay keep the hybrid model's prefix cache valid.
+    assert a3b.thinking_policy == "always"
+    assert a3b.preserve_thinking is True
+    assert a3b.history_replay == "exact"
     dense = profile_for("coding", native=True, model="qwen3.8:27b-q4_K_M")
     assert (dense.temperature, dense.presence_penalty, dense.output_tokens) == (0.6, 0.0, 8192)
     # The model never changes non-native profiles.
