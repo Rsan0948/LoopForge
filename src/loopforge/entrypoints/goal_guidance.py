@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable
 from dataclasses import asdict
 from functools import cache
+from typing import cast
 
 from loopforge.adapters.working_evidence import working_evidence
 from loopforge.domain.goals import GoalState, current_recovery
@@ -51,6 +52,7 @@ def worker_guidance(state: GoalState, original: Callable[[str], str] | None = No
                 state.research, original, max_bytes=24000
             ),
             "source_evidence_ids": state.assignment.evidence_ids if state.assignment else (),
+            "latest_worker_attempt_untrusted": _latest_attempt(state),
             "latest_supervisor_plan_untrusted": state.plan,
             "latest_supervisor_rationale_untrusted": state.decision.rationale
             if state.decision
@@ -98,3 +100,33 @@ def _objective(state: GoalState) -> str:
         + "\n\nEarlier assignment, superseded where it conflicts with the revision above: "
         + base
     )
+
+
+def _latest_attempt(state: GoalState) -> dict[str, object] | None:
+    """Carry the last attempt's measured outcome into a new assignment.
+
+    A fresh delegation creates a new coding task seeded from the preserved
+    candidate; without this the worker would not know how that candidate last
+    failed. Measured fields only; the full evidence stays in its artifact.
+    """
+    evidence = state.observation.evidence
+    if not evidence:
+        return None
+    try:
+        data: object = json.loads(evidence)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    fields = cast("dict[str, object]", data)
+    measured = fields.get("measured_summary")
+    verification = fields.get("last_verification", fields.get("failure_summary"))
+    if measured is None and not isinstance(verification, str):
+        return None
+    return {
+        "meaning": "Measured outcome of the latest worker attempt on candidate "
+        "candidate_sha256; it applies to a seeded candidate only if that is unchanged",
+        "candidate_sha256": state.observation.candidate_sha256,
+        "measured_summary": measured,
+        "last_verification": verification[:6000] if isinstance(verification, str) else None,
+    }

@@ -126,13 +126,10 @@ class CampaignGoalWorker:
         )
         # Only task evidence crosses the supervisor boundary: no environment,
         # credentials, host workspace paths or raw provider request observations.
+        measured = measured_summary(detail, changed, run_events) if row else None
         evidence = json.dumps(
             {
-                **(
-                    {"measured_summary": measured_summary(detail, changed, run_events)}
-                    if row
-                    else {}
-                ),
+                **({"measured_summary": measured} if measured is not None else {}),
                 **{
                     key: detail[key]
                     for key in (
@@ -159,6 +156,7 @@ class CampaignGoalWorker:
             evidence = json.dumps(
                 {
                     "omitted": "Retrieve the full worker artifact with retrieve and offset_bytes",
+                    **({"measured_summary": measured} if measured is not None else {}),
                     "artifact_ids": artifact_ids,
                     "failure_summary": str(detail.get("stop_summary", ""))[:1000],
                     "patch_sha256": detail.get("patch_sha256", ""),

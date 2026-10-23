@@ -335,9 +335,14 @@ class OllamaModel:
                 "num_predict": self._max_output_tokens,
             }
         if self._thinking is not None:
+            exhausted = context.run_id in self._thinking_exhausted
+            if exhausted and self._thinking_policy == "on_evidence":
+                # Evidence-driven runs skip reasoning for one turn to force an action,
+                # then reason again on the next new evidence instead of never again.
+                self._thinking_exhausted.discard(context.run_id)
             payload["think"] = (
                 self._thinking
-                and context.run_id not in self._thinking_exhausted
+                and not exhausted
                 and (self._thinking_policy == "always" or think_now)
             )
         if self._context_window_tokens is not None:
@@ -406,7 +411,11 @@ class OllamaModel:
                 self._thinking_exhausted.add(context.run_id)
                 self.request_tracker.note("thinking_disabled_after_output_exhaustion")
                 summary += (
-                    "; output allowance exhausted without an action; next calls disable thinking"
+                    "; output allowance exhausted without an action; the next call disables "
+                    "thinking"
+                    if self._thinking_policy == "on_evidence"
+                    else "; output allowance exhausted without an action; next calls disable "
+                    "thinking"
                 )
             raise ModelTurnError(
                 error.failure_class,

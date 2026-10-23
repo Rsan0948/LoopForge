@@ -1363,3 +1363,30 @@ def test_two_request_measurements_cannot_be_combined() -> None:
         _ratio_model(
             _responding(_chat_payload()), byte_ratio_admission=True, request_token_counter=len
         )
+
+
+def test_evidence_driven_exhaustion_skips_reasoning_once_then_resumes() -> None:
+    requests: list[dict[str, object]] = []
+    run_tests: list[object] = [{"function": {"name": "run_tests", "arguments": {}}, "id": "call_t"}]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        if len(requests) == 1:  # verbose thinking used the whole allowance, no action
+            return httpx.Response(200, json=_chat_payload(tool_calls=[], output_tokens=64))
+        return httpx.Response(200, json=_chat_payload(tool_calls=run_tests))
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        thinking=True,
+        thinking_policy="on_evidence",
+        max_output_tokens=64,
+        transport=httpx.MockTransport(respond),
+    )
+    with pytest.raises(ModelTurnError) as exc:
+        model.propose_action(_context())
+    assert "the next call disables thinking" in exc.value.summary
+    model.propose_action(_context())  # forced action without reasoning
+    model.propose_action(_context())  # new evidence from run_tests: reasoning resumes
+    assert [r["think"] for r in requests] == [True, False, True]

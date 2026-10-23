@@ -12,6 +12,7 @@ from loopforge.domain.goals import (
     GoalAction,
     GoalState,
     SupervisorDecision,
+    WorkerObservation,
     current_recovery,
 )
 from loopforge.domain.investigation import (
@@ -171,3 +172,29 @@ def test_earlier_hypothesis_does_not_leak_into_a_newer_assignment() -> None:
     assert current_recovery(later) is None
     assert json.loads(worker_guidance(later))["objective"] == "Apply four targeted edits"
     assert current_recovery(replace(state, recoveries=())) is None
+
+
+def test_new_assignment_carries_the_latest_measured_attempt() -> None:
+    measured = {
+        "files_changed_vs_assignment_baseline": ["app/server.py"],
+        "checks": {"x": "failed"},
+    }
+    for evidence in (
+        {"measured_summary": measured, "last_verification": "command:check_project: failed"},
+        {"omitted": "retrieve", "measured_summary": measured, "failure_summary": "stall"},
+    ):
+        state = GoalState(
+            observation=WorkerObservation(
+                status="attention", candidate_sha256="c" * 64, evidence=json.dumps(evidence)
+            )
+        )
+        attempt = json.loads(worker_guidance(state))["latest_worker_attempt_untrusted"]
+        assert attempt["candidate_sha256"] == "c" * 64
+        assert attempt["measured_summary"] == measured
+        assert attempt["last_verification"] in {"command:check_project: failed", "stall"}
+
+
+def test_no_attempt_means_no_inherited_outcome() -> None:
+    assert json.loads(worker_guidance(GoalState()))["latest_worker_attempt_untrusted"] is None
+    unrelated = GoalState(observation=WorkerObservation(evidence=json.dumps({"patch": "x"})))
+    assert json.loads(worker_guidance(unrelated))["latest_worker_attempt_untrusted"] is None
