@@ -52,6 +52,9 @@ OLLAMA = "http://127.0.0.1:11434"
 MLX = "http://127.0.0.1:18181"
 MODEL = "qwen3.6:35b-a3b"
 SECONDS = 2400
+# Upstream mlx_lm.server stores no reusable checkpoint for tool-final requests, which
+# disables prefix reuse on this hybrid model in an agent loop; see mlx_server_agentic.py.
+AGENTIC_CACHE = True
 TURNS = 60
 WARMUP = [{"role": "user", "content": "Reply with the single word OK."}]
 NATIVE_SUFFIX = (
@@ -323,7 +326,7 @@ def warm_ollama() -> dict[str, object]:
 
 def start_mlx() -> tuple[subprocess.Popen[bytes], float]:
     started = time.monotonic()
-    provider = mlx_lab.server(True, 18181, RENDER_TEMPLATE)
+    provider = mlx_lab.server(True, 18181, RENDER_TEMPLATE, agentic_cache=AGENTIC_CACHE)
     deadline = started + 300
     while time.monotonic() < deadline:
         if provider.poll() is not None:
@@ -387,6 +390,7 @@ def run(output: Path, only: str | None) -> None:
         Path(__file__).resolve(),
         ROOT / "scripts/mlx_lab.py",
         ROOT / "scripts/run_mlx_comparison.py",
+        ROOT / "scripts/mlx_server_agentic.py",
         ROOT / "scripts/ollama_renderer/chat_template.jinja",
         ORACLE,
     ]
@@ -413,6 +417,7 @@ def run(output: Path, only: str | None) -> None:
         "turns": TURNS,
         "schedule": schedule,
         "profile": native_options(),
+        "mlx_server": "agentic-tool-checkpoint" if AGENTIC_CACHE else "upstream",
         "cache_modes": __doc__.split("Cache control")[1],
     }
     (output / "plan.json").write_text(json.dumps(plan, indent=2))
