@@ -168,7 +168,7 @@ def load_gemini_key(path: Path | None = None) -> str:
 
 
 class GeminiSupervisor:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit operator-owned provider wiring
         self,
         api_key: str,
         *,
@@ -176,6 +176,7 @@ class GeminiSupervisor:
         max_request_bytes: int = MAX_REQUEST_BYTES,
         working_evidence_bytes: int = 24_000,
         count_tokens: bool = False,
+        diagnostics: Path | None = None,
     ) -> None:
         if not api_key:
             msg = "Gemini credential is required"
@@ -194,6 +195,7 @@ class GeminiSupervisor:
         self._max_request_bytes = max_request_bytes
         self._working_evidence_bytes = working_evidence_bytes
         self._count_tokens = count_tokens is True
+        self.diagnostics = diagnostics
         self.evidence_store: ResearchStore | None = None
         self._api_key = api_key
         self.client = client or httpx.Client(timeout=httpx.Timeout(120), trust_env=False)
@@ -473,6 +475,29 @@ class GeminiSupervisor:
         return self._decode(bytes(raw), request)
 
     def _decode(self, raw: bytes, request: SupervisorRequest) -> SupervisorResponse:
+        try:
+            return self._decode_envelope(raw, request)
+        except SupervisorFailure as failure:
+            self._record_failure(raw, request, str(failure))
+            raise
+
+    def _record_failure(self, raw: bytes, request: SupervisorRequest, reason: str) -> None:
+        """Operator-only local record of a rejected response; never model context."""
+        if self.diagnostics is None or self._api_key.encode() in raw:
+            return
+        self.diagnostics.mkdir(parents=True, exist_ok=True)
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        (self.diagnostics / f"rejected-{digest}.json").write_text(
+            json.dumps(
+                {
+                    "reason": reason,
+                    "request_sha256": json.loads(request.trace)["request_sha256"],
+                    "response": raw.decode("utf-8", errors="replace"),
+                }
+            )
+        )
+
+    def _decode_envelope(self, raw: bytes, request: SupervisorRequest) -> SupervisorResponse:
         charge: int | None = None
         try:
             envelope = ResponsePayload.model_validate_json(raw)

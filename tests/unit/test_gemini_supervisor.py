@@ -470,3 +470,28 @@ def test_invalid_assignment_names_the_rule_without_echoing_provider_values(
     assert f"assignment:value_error (Assignment invalid: {reason})" in message
     assert "SECRET-OBJECTIVE" not in message
     assert "passwd" not in message
+
+
+def test_rejected_response_is_recorded_for_the_operator_only(tmp_path: Path) -> None:
+    bad = response()
+    bad["candidates"][0]["content"]["parts"][0]["text"] = "not json"  # type: ignore[index]
+    with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=bad))) as c:
+        adapter = GeminiSupervisor(KEY, client=c, diagnostics=tmp_path / "diag")
+        with pytest.raises(SupervisorFailure) as failure:
+            adapter.decide(adapter.prepare(state()))
+    records = list((tmp_path / "diag").glob("rejected-*.json"))
+    assert len(records) == 1
+    saved = json.loads(records[0].read_text())
+    assert saved["reason"] == str(failure.value)
+    assert "not json" in saved["response"]
+    assert "not json" not in str(failure.value)
+
+
+def test_response_containing_the_credential_is_never_recorded(tmp_path: Path) -> None:
+    bad = response()
+    bad["candidates"][0]["content"]["parts"][0]["text"] = KEY  # type: ignore[index]
+    with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(200, json=bad))) as c:
+        adapter = GeminiSupervisor(KEY, client=c, diagnostics=tmp_path / "diag")
+        with pytest.raises(SupervisorFailure):
+            adapter.decide(adapter.prepare(state()))
+    assert not (tmp_path / "diag").exists()

@@ -11,7 +11,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from loopforge.adapters.gemini_supervisor import (
-    MAX_REQUEST_BYTES,
+    MAX_CONFIGURABLE_REQUEST_BYTES,
     MAX_RESPONSE_BYTES,
     MODEL,
     PRICE_VALID_UNTIL,
@@ -29,6 +29,14 @@ class ReviewProviderError(ValueError):
     """Transport/provider status failure without a validated decision."""
 
 
+# Thinking tokens count toward the output cap; the final report must still fit.
+REVIEW_OUTPUT_TOKENS = 8192
+REVIEW_REQUEST_BYTES = 120_000
+# Earlier reads stay visible so the final report is written from everything read,
+# not only the latest excerpt.
+REVIEW_HISTORY_BYTES = 60_000
+
+
 class ReviewAction(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     tool_name: str = Field(min_length=1, max_length=80)
@@ -36,7 +44,7 @@ class ReviewAction(BaseModel):
 
 
 class GeminiReviewModel:
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit operator-owned provider wiring
         self,
         key: str,
         budget: PaidBudgetPort,
@@ -44,7 +52,17 @@ class GeminiReviewModel:
         diagnostics: Path,
         *,
         client: httpx.Client | None = None,
+        max_request_bytes: int = REVIEW_REQUEST_BYTES,
     ) -> None:
+        if (
+            type(max_request_bytes) is not int
+            or not 16_000 <= max_request_bytes <= MAX_CONFIGURABLE_REQUEST_BYTES
+        ):
+            msg = "Review request limit is outside the supported bounds"
+            raise ValueError(msg)
+        self.max_request_bytes = max_request_bytes
+        self._history: dict[str, list[dict[str, object]]] = {}
+        self._last_action: dict[str, tuple[str, dict[str, str]]] = {}
         self.key, self.budget, self.tools, self.diagnostics = key, budget, tools, diagnostics
         self.client = client or httpx.Client(timeout=120, trust_env=False)
         self.owns_client = client is None
@@ -73,10 +91,30 @@ class GeminiReviewModel:
             )
         schema = ReviewAction.model_json_schema()
         schema["properties"]["tool_name"]["enum"] = [s.name for s in self.tools]
+        run = str(context.run_id)
+        history = self._history.setdefault(run, [])
+        previous = self._last_action.pop(run, None)
+        if previous is not None:
+            observed = "\n".join(
+                i.content for i in context.items if str(i.item_id).endswith(":observation")
+            )
+            history.append(
+                {"tool": previous[0], "arguments": previous[1], "result": observed or "(none)"}
+            )
+        retained: list[dict[str, object]] = []
+        used = 0
+        for entry in reversed(history):
+            size = len(json.dumps(entry, ensure_ascii=False).encode())
+            if used + size > REVIEW_HISTORY_BYTES:
+                break
+            retained.insert(0, entry)
+            used += size
         packet = {
-            "run_id": str(context.run_id),
+            "run_id": run,
             "tools": [asdict(t) for t in self.tools],
             "items": [asdict(i) for i in context.items],
+            "your_earlier_actions_and_results_untrusted": retained,
+            "earlier_entries_omitted": len(history) - len(retained),
         }
         body = json.dumps(
             {
@@ -102,7 +140,7 @@ class GeminiReviewModel:
                     }
                 ],
                 "generationConfig": {
-                    "maxOutputTokens": 4096,
+                    "maxOutputTokens": REVIEW_OUTPUT_TOKENS,
                     "thinkingConfig": {"thinkingLevel": "MEDIUM"},
                     "responseMimeType": "application/json",
                     "responseJsonSchema": schema,
@@ -110,14 +148,14 @@ class GeminiReviewModel:
             },
             ensure_ascii=False,
         )
-        if len(body.encode()) > MAX_REQUEST_BYTES or self.key in body:
+        if len(body.encode()) > self.max_request_bytes or self.key in body:
             raise ModelTurnError(
                 ModelFailureClass.PERMANENT,
                 "REVIEW_CONTEXT_DENIED",
                 "Review request exceeds admission or credential policy",
             )
         bound = len(body.encode()) + 4096
-        maximum = bound * 2 + 4096 * 10
+        maximum = bound * 2 + REVIEW_OUTPUT_TOKENS * 10
         key = f"review:{context.run_id}:{self.turn}"
         try:
             self.budget.reserve(key, "review", maximum)
@@ -150,7 +188,7 @@ class GeminiReviewModel:
                 output = usage.candidatesTokenCount + usage.thoughtsTokenCount
                 if (
                     usage.promptTokenCount > bound
-                    or output > 4096
+                    or output > REVIEW_OUTPUT_TOKENS
                     or usage.cachedContentTokenCount > usage.promptTokenCount
                     or usage.totalTokenCount != usage.promptTokenCount + output
                 ):
@@ -182,6 +220,7 @@ class GeminiReviewModel:
                 msg = "Invalid review tool arguments"
                 raise ValueError(msg)  # noqa: TRY301 - explicit boundary dispatch/normalization
             self.budget.settle(key, maximum if charged is None else charged)
+            self._last_action[run] = (action.tool_name, dict(action.arguments))
             self.diagnostics.mkdir(parents=True, exist_ok=True)
             (self.diagnostics / f"{context.run_id}-{self.turn}.json").write_text(
                 json.dumps(
@@ -206,7 +245,7 @@ class GeminiReviewModel:
                     input_tokens=usage.promptTokenCount if usage else bound,
                     output_tokens=usage.candidatesTokenCount + usage.thoughtsTokenCount
                     if usage
-                    else 4096,
+                    else REVIEW_OUTPUT_TOKENS,
                 ),
             )
         except (httpx.HTTPError, ValueError, ValidationError) as exc:
