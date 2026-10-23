@@ -5,7 +5,7 @@ import json
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Protocol, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
@@ -16,6 +16,8 @@ from loopforge.adapters.gemini_supervisor import (
     MODEL,
     PRICE_VALID_UNTIL,
     ResponsePayload,
+    count_input_tokens,
+    counted_bound,
 )
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
@@ -34,7 +36,16 @@ REVIEW_OUTPUT_TOKENS = 8192
 REVIEW_REQUEST_BYTES = 120_000
 # Earlier reads stay visible so the final report is written from everything read,
 # not only the latest excerpt.
-REVIEW_HISTORY_BYTES = 60_000
+# Re-sent every call, so cost grows with it; 32 KB holds the diff and changed files.
+REVIEW_HISTORY_BYTES = 32_000
+
+
+class ReviewProgress(Protocol):
+    """Code-owned review state: what may be offered now and measured coverage."""
+
+    def offered_tools(self) -> frozenset[str] | None: ...
+
+    def review_status(self) -> dict[str, object]: ...
 
 
 class ReviewAction(BaseModel):
@@ -53,6 +64,7 @@ class GeminiReviewModel:
         *,
         client: httpx.Client | None = None,
         max_request_bytes: int = REVIEW_REQUEST_BYTES,
+        count_tokens: bool = True,
     ) -> None:
         if (
             type(max_request_bytes) is not int
@@ -61,6 +73,8 @@ class GeminiReviewModel:
             msg = "Review request limit is outside the supported bounds"
             raise ValueError(msg)
         self.max_request_bytes = max_request_bytes
+        self.count_tokens = count_tokens is True
+        self.progress: ReviewProgress | None = None
         self._history: dict[str, list[dict[str, object]]] = {}
         self._last_action: dict[str, tuple[str, dict[str, str]]] = {}
         self.key, self.budget, self.tools, self.diagnostics = key, budget, tools, diagnostics
@@ -89,8 +103,10 @@ class GeminiReviewModel:
             raise ModelTurnError(
                 ModelFailureClass.PERMANENT, "REVIEW_PRICING_EXPIRED", "Revalidate frontier pricing"
             )
+        offered = self.progress.offered_tools() if self.progress is not None else None
+        tools = tuple(t for t in self.tools if offered is None or t.name in offered) or self.tools
         schema = ReviewAction.model_json_schema()
-        schema["properties"]["tool_name"]["enum"] = [s.name for s in self.tools]
+        schema["properties"]["tool_name"]["enum"] = [s.name for s in tools]
         run = str(context.run_id)
         history = self._history.setdefault(run, [])
         previous = self._last_action.pop(run, None)
@@ -109,12 +125,16 @@ class GeminiReviewModel:
                 break
             retained.insert(0, entry)
             used += size
+        # Stable-first ordering keeps a reusable request prefix across calls.
         packet = {
             "run_id": run,
-            "tools": [asdict(t) for t in self.tools],
-            "items": [asdict(i) for i in context.items],
+            "tools": [asdict(t) for t in tools],
             "your_earlier_actions_and_results_untrusted": retained,
             "earlier_entries_omitted": len(history) - len(retained),
+            "review_status_runtime_measured": self.progress.review_status()
+            if self.progress is not None
+            else None,
+            "items": [asdict(i) for i in context.items],
         }
         body = json.dumps(
             {
@@ -129,7 +149,12 @@ class GeminiReviewModel:
                             "Use submit_report with a "
                             "JSON-encoded report string, never finalize_report. "
                             "Fixed checks independently decide "
-                            "acceptance; prose cannot assert verification."
+                            "acceptance; prose cannot assert verification. "
+                            "Read CAMPAIGN_PATCH.diff and the changed intervals first; "
+                            "review_status_runtime_measured reports coverage and how many "
+                            "calls remain before only submit_report is offered. "
+                            "Put a real defect in findings; list as unresolved only a check you "
+                            "could not settle. Your earlier reads and results are included."
                         }
                     ]
                 },
@@ -155,6 +180,8 @@ class GeminiReviewModel:
                 "Review request exceeds admission or credential policy",
             )
         bound = len(body.encode()) + 4096
+        if self.count_tokens:
+            bound = counted_bound(bound, count_input_tokens(self.client, self.key, body))
         maximum = bound * 2 + REVIEW_OUTPUT_TOKENS * 10
         key = f"review:{context.run_id}:{self.turn}"
         try:
@@ -204,7 +231,7 @@ class GeminiReviewModel:
                 msg = "Review response contains excluded credential"
                 raise ValueError(msg)  # noqa: TRY301 - explicit boundary dispatch/normalization
             action = ReviewAction.model_validate_json(text)
-            spec = next((s for s in self.tools if s.name == action.tool_name), None)
+            spec = next((s for s in tools if s.name == action.tool_name), None)
             if spec is None:
                 msg = "Unknown review tool"
                 raise ValueError(msg)  # noqa: TRY301 - explicit boundary dispatch/normalization

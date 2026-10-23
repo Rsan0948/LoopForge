@@ -496,6 +496,9 @@ class CodingCoordinator:
                     model=frontier,
                     max_source_reads=contract.max_review_reads,
                 )
+                review_tools.post_coverage_calls = contract.max_review_calls_after_coverage
+                if frontier is not None:
+                    frontier.progress = review_tools
                 checking, _ = build_coding(
                     config, contract, workspace, store=events, model=ScriptedModel([])
                 )

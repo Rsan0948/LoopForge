@@ -374,6 +374,9 @@ class CodingTaskConfig(StrictRecord):
     # plus an app server) stall under the legacy 128. Repository or model
     # content can never set this; it is part of the frozen task contract.
     sandbox_max_open_files: int = Field(default=128, ge=64, le=4096)
+    # Operator-frozen review termination: tool calls allowed after required
+    # coverage is complete, then only submit_report. None keeps legacy behavior.
+    max_review_calls_after_coverage: int | None = Field(default=None, ge=1, le=20)
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
@@ -384,6 +387,8 @@ class CodingTaskConfig(StrictRecord):
         # Omit the legacy default so previously frozen contract hashes are unchanged.
         if self.sandbox_max_open_files == 128:
             data.pop("sandbox_max_open_files", None)
+        if self.max_review_calls_after_coverage is None:
+            data.pop("max_review_calls_after_coverage", None)
         return data
 
     @model_validator(mode="after")

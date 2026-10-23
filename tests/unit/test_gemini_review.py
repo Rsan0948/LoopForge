@@ -85,6 +85,8 @@ def test_reasoning_beyond_4096_tokens_is_accepted(tmp_path: Path) -> None:
     requests: list[dict[str, object]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(":countTokens"):
+            return httpx.Response(200, json={"totalTokens": 500})
         requests.append(json.loads(request.content))
         return httpx.Response(200, json=_reply(6000))
 
@@ -109,6 +111,8 @@ def test_reviewer_sees_its_earlier_reads_when_reporting(tmp_path: Path) -> None:
     requests: list[dict[str, object]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(":countTokens"):
+            return httpx.Response(200, json={"totalTokens": 500})
         requests.append(json.loads(request.content))
         return httpx.Response(200, json=_reply(500))
 
@@ -140,3 +144,33 @@ def test_review_request_limit_bounds(tmp_path: Path) -> None:
             GeminiReviewModel(
                 "fixture-review-key", budget, (READ,), tmp_path, max_request_bytes=value
             )
+
+
+def test_counted_tokens_tighten_review_reservation_and_failure_falls_back(
+    tmp_path: Path,
+) -> None:
+    def ledger(count_reply: httpx.Response) -> int:
+        reserved: list[int] = []
+
+        def respond(request: httpx.Request) -> httpx.Response:
+            if request.url.path.endswith(":countTokens"):
+                return count_reply
+            return httpx.Response(200, json=_reply(300))
+
+        reviewer, client = _reviewer(
+            tmp_path / str(len(list(tmp_path.iterdir()))), httpx.MockTransport(respond)
+        )
+        original = reviewer.budget.reserve
+
+        def capture(key: str, role: str, maximum: int) -> None:
+            reserved.append(maximum)
+            original(key, role, maximum)
+
+        reviewer.budget.reserve = capture  # type: ignore[method-assign]
+        with client:
+            reviewer.propose_action(_context(None))
+        return reserved[0]
+
+    counted = ledger(httpx.Response(200, json={"totalTokens": 300}))
+    fallback = ledger(httpx.Response(500))
+    assert counted < fallback

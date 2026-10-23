@@ -223,6 +223,45 @@ class ReviewTools:
         self.report_observations: list[str] = []
         self.overflow_checks: list[str] = []
         self.finding_basis: list[dict[str, object]] = []
+        # Operator-frozen: tool calls allowed once required coverage is complete.
+        # None keeps the legacy open-ended investigation.
+        self.post_coverage_calls: int | None = None
+        self.calls = 0
+        self.covered_at: int | None = None
+
+    def coverage_complete(self) -> bool:
+        return bool(self.required_intervals) and not missing_coverage(
+            self.excerpts, self.required_intervals, files=self.files
+        )
+
+    def report_required(self) -> bool:
+        """Code-owned termination: after the post-coverage allowance only reporting remains."""
+        return (
+            self.post_coverage_calls is not None
+            and self.covered_at is not None
+            and self.calls >= self.covered_at + self.post_coverage_calls
+        )
+
+    def offered_tools(self) -> frozenset[str] | None:
+        return frozenset({"submit_report"}) if self.report_required() else None
+
+    def review_status(self) -> dict[str, object]:
+        missing = (
+            missing_coverage(self.excerpts, self.required_intervals, files=self.files)
+            if self.required_intervals
+            else []
+        )
+        remaining = (
+            None
+            if self.post_coverage_calls is None or self.covered_at is None
+            else max(0, self.covered_at + self.post_coverage_calls - self.calls)
+        )
+        return {
+            "required_coverage": "complete" if self.coverage_complete() else missing,
+            "tool_calls_so_far": self.calls,
+            "calls_remaining_before_report": remaining,
+            "report_required_now": self.report_required(),
+        }
 
     def allowance_notice(self) -> str:
         if self.max_source_reads is None:
@@ -381,7 +420,27 @@ class ReviewTools:
             )
             raise ValueError(msg)
 
-    def execute(self, request: ToolExecutionRequest) -> ToolResult:  # noqa: PLR0911
+    def execute(self, request: ToolExecutionRequest) -> ToolResult:
+        if self.report_required() and request.proposal.tool_name != "submit_report":
+            return ToolResult(
+                ok=False,
+                observation="Post-coverage review allowance reached; no tool ran. Call "
+                "submit_report now from what you have read; list checks you could not "
+                "settle as unresolved.",
+                error_code="REVIEW_REPORT_REQUIRED",
+                failure_class=ToolFailureClass.PERMANENT,
+            )
+        result = self._execute_tool(request)
+        self.calls += 1
+        if (
+            self.post_coverage_calls is not None
+            and self.covered_at is None
+            and self.coverage_complete()
+        ):
+            self.covered_at = self.calls
+        return result
+
+    def _execute_tool(self, request: ToolExecutionRequest) -> ToolResult:  # noqa: PLR0911
         name = request.proposal.tool_name
         self.metadata_for(name)
         args = request.proposal.arguments

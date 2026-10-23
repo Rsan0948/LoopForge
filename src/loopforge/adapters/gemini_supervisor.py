@@ -395,9 +395,7 @@ class GeminiSupervisor:
         basis = "utf8_byte_upper_bound_plus_4096"
         counted = self._counted_input_tokens(body) if self._count_tokens else None
         if counted is not None:
-            # Margin covers schema/framing tokens the count may exclude. Never above
-            # the byte bound, so counting can only tighten a reservation.
-            bound = min(bound, counted + counted // 4 + 2048)
+            bound = counted_bound(bound, counted)
             basis = "count_tokens_plus_25_percent_plus_2048"
         maximum = bound * 2 + MAX_OUTPUT_TOKENS * 10
         trace = json.dumps(
@@ -418,31 +416,7 @@ class GeminiSupervisor:
         return SupervisorRequest(body, maximum, trace)
 
     def _counted_input_tokens(self, body: str) -> int | None:
-        """Free provider token count; any failure falls back to the byte bound."""
-        request = json.loads(body)
-        payload = {
-            "generateContentRequest": {
-                "model": f"models/{MODEL}",
-                "systemInstruction": request["systemInstruction"],
-                "contents": request["contents"],
-            }
-        }
-        try:
-            response = self.client.post(
-                f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:countTokens",
-                headers={"x-goog-api-key": self._api_key, "Content-Type": "application/json"},
-                content=json.dumps(payload).encode(),
-                timeout=30,
-            )
-        except httpx.HTTPError:
-            return None
-        if response.status_code != 200 or len(response.content) > 4096:
-            return None
-        try:
-            total = json.loads(response.content).get("totalTokens")
-        except ValueError:
-            return None
-        return total if type(total) is int and 0 < total <= len(body.encode()) else None
+        return count_input_tokens(self.client, self._api_key, body)
 
     def decide(self, request: SupervisorRequest) -> SupervisorResponse:
         try:
@@ -577,3 +551,36 @@ def _code_owned_reason(error: ErrorDetails) -> str:
     if not message.startswith(_CODE_OWNED_REASONS) or len(message) > 400:
         return ""
     return " (" + message + ")"
+
+
+def count_input_tokens(client: httpx.Client, key: str, body: str) -> int | None:
+    """Free provider token count; any failure returns None so callers keep the byte bound."""
+    request = json.loads(body)
+    payload = {
+        "generateContentRequest": {
+            "model": f"models/{MODEL}",
+            "systemInstruction": request["systemInstruction"],
+            "contents": request["contents"],
+        }
+    }
+    try:
+        response = client.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:countTokens",
+            headers={"x-goog-api-key": key, "Content-Type": "application/json"},
+            content=json.dumps(payload).encode(),
+            timeout=30,
+        )
+    except httpx.HTTPError:
+        return None
+    if response.status_code != 200 or len(response.content) > 4096:
+        return None
+    try:
+        total = json.loads(response.content).get("totalTokens")
+    except ValueError:
+        return None
+    return total if type(total) is int and 0 < total <= len(body.encode()) else None
+
+
+def counted_bound(byte_bound: int, counted: int | None) -> int:
+    """Counting can only tighten: count + 25% + 2048 for schema/framing, never above bytes."""
+    return byte_bound if counted is None else min(byte_bound, counted + counted // 4 + 2048)
