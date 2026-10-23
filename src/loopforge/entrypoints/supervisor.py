@@ -9,9 +9,9 @@ import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
-from pydantic import Field, model_validator
+from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
 
 from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
@@ -40,7 +40,17 @@ class PreparedGoalConfig(StrictRecord):
     max_goal_seconds: int = Field(default=3600, ge=30, le=86400)
     max_decisions: int = Field(default=12, ge=1, le=100)
     max_failures: int = Field(default=3, ge=1, le=10)
+    # Opt-in: count only consecutive supervisor failures, reset by a valid decision.
+    consecutive_failures: bool = False
     remote_data: Literal["none", "synthetic-fixture", "prepared-repository"] = "none"
+
+    @model_serializer(mode="wrap")
+    def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
+        data = cast("dict[str, object]", handler(self))
+        # Omit the legacy default so frozen intake bindings are unchanged.
+        if not self.consecutive_failures:
+            data.pop("consecutive_failures", None)
+        return data
 
     @model_validator(mode="after")
     def repair_requires_remote_authority(self) -> "PreparedGoalConfig":
@@ -168,6 +178,7 @@ class PreparedGoalService(BaseGoalService):
                         deadline_epoch=int(self.clock.now().timestamp()) + config.max_goal_seconds,
                         max_decisions=config.max_decisions,
                         max_failures=config.max_failures,
+                        consecutive_failures=config.consecutive_failures,
                         remote_data=config.remote_data,
                         worker_binding_sha256=hashlib.sha256(
                             config.model_dump_json().encode()

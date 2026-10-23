@@ -982,6 +982,7 @@ class ReportingReviewModel:
             "qwen-app-v1",
             "qwen-state-v1",
             "qwen-session-v1",
+            "qwen-native-v1",
         }
         tools.reporting_v3 = config.inference_profile == "qwen-bounded-v3"
         self.pending: dict[str, ActionProposal] = {}
@@ -1257,7 +1258,7 @@ def build_review(  # noqa: PLR0913 - explicit trusted workload context tuning
         state_driven=config.inference_profile == "qwen-state-v1",
         bounded_v2=config.inference_profile in {"qwen-bounded-v2", "qwen-bounded-v3"},
         app_workload=config.inference_profile
-        in {"qwen-app-v1", "qwen-state-v1", "qwen-session-v1"},
+        in {"qwen-app-v1", "qwen-state-v1", "qwen-session-v1", "qwen-native-v1"},
     )
     live = (
         None

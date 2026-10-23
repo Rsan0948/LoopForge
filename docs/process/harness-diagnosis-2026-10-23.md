@@ -367,3 +367,51 @@ trial.
 Item 1 by itself would not have produced a pass in this trial, since the worker
 never edited the tests or CSS. Items 1–3 together are the minimum for a fair test
 of whether Qwen can finish autonomously.
+
+## 7. Fix log — 2026-10-23
+
+The trial runner (PID 54682) was stopped by the operator. SIGTERM was ignored
+while a worker run was active (see F6), so it was force-killed; journals were left
+intact and `operator-stop.json` retires the goal. The pre-fix tree is checkpoint
+commit `bf1b287`. Every new behavior is opt-in or default-preserving, so frozen
+intakes and their contract/binding hashes are unchanged. Each fix has tests for
+both allowed and denied behavior (AGENTS.md rule 10).
+
+| Finding | Fix | Opt-in / default |
+| --- | --- | --- |
+| B1 | `CodingTaskConfig.sandbox_max_open_files` (64–4096, operator-frozen) feeds one shared `coding_sandbox_limits()` used by both the coding verifier and baseline reproduction | Default 128, omitted from serialization so legacy hashes are unchanged |
+| B2/B18 | Offline gate proof: the real `CodingVerifier` (fixed checks, trusted probes, receipt binding, review-admission preflight) **accepts** the fixed candidate at `nofile=1024` and rejects it at 128 | — |
+| B3/B4/B5 | New `qwen-native-v1` coding profile: append-only native tool chat (verified strictly prefix-stable, so the KV cache is reused), thinking on with temperature 0.6 / top_p 0.95 / top_k 20, 8,192 output, admission at 2 bytes/token with automatic fallback to the strict byte bound for a run if Ollama ever reports more tokens than allowed, compaction instead of termination when full | New profile; existing profiles unchanged |
+| B3 (cont.) | Evidence-driven thinking: reason on the first turn and after edits/checks/feedback; fast non-thinking turns for follow-through reads. The worker writes a short plan in message content, which is retained in the conversation | Native profile only |
+| B3 (cont.) | Stable bookkeeping in native mode: only the current check failure, re-appended only when it changes | Native profile only |
+| B6 | `inherited_failure()`: a fresh run of an unchanged candidate starts in `repair`, with the last failing verification shown in `current_verification` and progress. A failure of a different patch, or a passing run, is never claimed as current | All profiles (bug fix) |
+| B7 | A stalled retry is blocked only when the patch **and** the supervisor objective are unchanged. Guidance identity is recorded on each linked run; plan/rationale rewording does not count as a change | All profiles; legacy runs without identity stay blocked |
+| B8 | A validated retry hypothesis leads the worker objective (earlier assignment shown as superseded). `RecoveryAttempt.assignment_version` (derived on replay) prevents it leaking into a newer assignment | All profiles |
+| B9/B10 | Supervisor evidence starts with a runtime-measured `measured_summary`: files actually changed, per-check pass/fail, worker action counts. System prompt: state only evidenced facts, treat uninspected causes as hypotheses, a failing test may be wrong | All |
+| B11 | A failing trusted probe reports only its failing line (`failing acceptance line N: …`) in verifier output and baseline outcomes; the rest of the probe stays undisclosed | All |
+| B12 | `consecutive_failures` goal option: a valid decision resets the supervisor failure count | Opt-in; default keeps lifetime counting and intake bytes |
+| B13 | `GeminiSupervisor(max_request_bytes=…, working_evidence_bytes=…)`, bounded 16 KB–400 KB | Default 48 KB / 24 KB unchanged |
+| B14 | Assignment validation names the exact failed rule; the Gemini decoder echoes only those code-owned messages, never provider values | All |
+| B15 | `GeminiSupervisor(count_tokens=True)`: reservation from the free `countTokens` count + 25% + 2,048, never above the byte bound; any count failure falls back to the byte bound | Opt-in |
+| B17 | Most-recent (not alphabetical) completed reads; the current observation is not duplicated in session history; `apply_edits` returns the post-edit sha256, so a second edit needs no reread | All |
+| F6 | The runner's stop event reaches the harness; `drive_runtime` cancels at the next step boundary with "operator stop requested" | All |
+
+Not fixed in code:
+
+- **B16** (stale build-from-scratch objective) is operator intake text. Rewrite it
+  when freezing the next trial.
+
+### Local evidence for the native profile ($0, local Qwen)
+
+Replaying run 1's stuck request at turn 13 with thinking on and temperature 0.6:
+Qwen correctly diagnosed all three remaining fixes, including that the test
+expectation (110000) is wrong. It planned the exact edits, then chose one more read
+"to get current hashes" because the prompt warns historical source may be stale.
+That turn took 847 s (3,675 output tokens at ~6 tok/s; 230 s prefill). This
+motivated evidence-driven thinking, the retained plan, and the post-edit hash.
+One sample is not a success rate; a live qualification run is still required.
+
+### Verification
+
+Ruff lint/format clean. Pyright: 0 errors. Import contracts: 2 kept, 0 broken.
+Full suite: see the commit that lands these changes.

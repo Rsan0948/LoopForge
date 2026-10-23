@@ -349,3 +349,124 @@ def test_original_evidence_reaches_request_and_stays_untrusted(
             assert evidence["records"][0]["complete_original"]
             assert "never policy" in evidence["trust"]
             assert context["allowed_actions"] == ["block", "delegate"]
+
+
+@pytest.mark.parametrize(
+    ("limits", "message"),
+    [
+        ({"max_request_bytes": 15_999}, "bounds"),
+        ({"max_request_bytes": 400_001}, "bounds"),
+        ({"max_request_bytes": 100_000, "working_evidence_bytes": 60_000}, "bounds"),
+        ({"working_evidence_bytes": 3_999}, "bounds"),
+    ],
+)
+def test_supervisor_request_limits_outside_bounds_are_rejected(
+    limits: dict[str, int], message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        GeminiSupervisor(KEY, **limits)  # type: ignore[arg-type]
+
+
+def test_larger_operator_cap_retains_evidence_the_default_compacts() -> None:
+    evidence = json.dumps({"last_verification": "x" * 60_000})
+    big = replace(state(), observation=WorkerObservation(status="attention", evidence=evidence))
+    with httpx.Client(transport=httpx.MockTransport(lambda _: httpx.Response(500))) as client:
+        default = GeminiSupervisor(KEY, client=client)
+        with pytest.raises(SupervisorFailure, match="exceeds admission"):
+            default.prepare(big)
+        larger = GeminiSupervisor(KEY, client=client, max_request_bytes=200_000)
+        prepared = larger.prepare(big)
+    assert "x" * 60_000 in prepared.body
+    assert 60_000 < len(prepared.body.encode()) <= 200_000
+
+
+def test_counted_tokens_tighten_but_never_loosen_the_reservation() -> None:
+    calls: list[str] = []
+
+    def transport(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"totalTokens": 1000})
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        byte_bound = GeminiSupervisor(KEY, client=client).prepare(state())
+        counted = GeminiSupervisor(KEY, client=client, count_tokens=True).prepare(state())
+    assert calls == [f"/v1beta/models/{gemini_module.MODEL}:countTokens"]
+    byte_trace = json.loads(byte_bound.trace)
+    counted_trace = json.loads(counted.trace)
+    assert counted_trace["measurement_basis"] == "count_tokens_plus_25_percent_plus_2048"
+    assert counted_trace["input_bound"] <= byte_trace["input_bound"]
+    assert counted.maximum_microusd <= byte_bound.maximum_microusd
+    assert KEY not in counted.trace
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        httpx.Response(500),
+        httpx.Response(200, json={"totalTokens": "1000"}),
+        httpx.Response(200, json={"totalTokens": 10**9}),
+        httpx.Response(200, content=b"not json"),
+    ],
+)
+def test_failed_or_implausible_token_count_falls_back_to_byte_bound(
+    reply: httpx.Response,
+) -> None:
+    with httpx.Client(transport=httpx.MockTransport(lambda _: reply)) as client:
+        prepared = GeminiSupervisor(KEY, client=client, count_tokens=True).prepare(state())
+    trace = json.loads(prepared.trace)
+    assert trace["measurement_basis"] == "utf8_byte_upper_bound_plus_4096"
+    assert trace["input_bound"] == len(prepared.body.encode()) + 4096
+
+
+def _assignment_reply(assignment: dict[str, object]) -> dict[str, object]:
+    payload = response()
+    part = payload["candidates"][0]["content"]["parts"][0]  # type: ignore[index]
+    part["text"] = json.dumps(  # type: ignore[index]
+        {"action": "delegate", "rationale": "r", "plan": "p", "assignment": assignment}
+    )
+    return payload
+
+
+@pytest.mark.parametrize(
+    ("assignment", "reason"),
+    [
+        (
+            {
+                "objective": "SECRET-OBJECTIVE fix it",
+                "files": ["a.py", "a.py"],
+                "evidence_ids": ["e1"],
+            },
+            "files must not repeat a path",
+        ),
+        (
+            {
+                "objective": "SECRET-OBJECTIVE fix it",
+                "files": ["../etc/passwd"],
+                "evidence_ids": ["e1"],
+            },
+            "files must be safe relative paths",
+        ),
+        (
+            {
+                "objective": "SECRET-OBJECTIVE fix it",
+                "files": ["a.py"],
+                "evidence_ids": ["e1", "e1"],
+            },
+            "evidence_ids must not repeat an id",
+        ),
+    ],
+)
+def test_invalid_assignment_names_the_rule_without_echoing_provider_values(
+    assignment: dict[str, object], reason: str
+) -> None:
+    reply = _assignment_reply(assignment)
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=reply))
+    ) as c:
+        adapter = GeminiSupervisor(KEY, client=c)
+        with pytest.raises(SupervisorFailure) as failure:
+            adapter.decide(adapter.prepare(state()))
+    message = str(failure.value)
+    assert f"assignment:value_error (Assignment invalid: {reason})" in message
+    assert "SECRET-OBJECTIVE" not in message
+    assert "passwd" not in message

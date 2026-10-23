@@ -125,3 +125,14 @@ def test_session_profile_has_capacity_without_changing_old_profiles() -> None:
     assert profile_for("coding", session=True).context_tokens == 98304
     assert profile_for("coding", session=True).conversation_mode == "state"
     assert profile_for("coding", state_driven=True).context_tokens == 65536
+
+
+def test_current_observation_is_not_paid_for_twice_in_history() -> None:
+    original = events()
+    current = "Applied edit 5; historical source \u03b1"
+    packet = json.loads(session_history(original, present=frozenset({current})))
+    results = {a["sequence"]: a["result"] for a in packet["actions"]}
+    assert results[12] == "(identical to the current observation item; not repeated)"
+    assert results[10] == "Applied edit 4; historical source \u03b1"
+    assert results[6] == "Rejected stale source; no edit applied"
+    assert json.loads(session_history(original))["actions"][-1]["result"] == current

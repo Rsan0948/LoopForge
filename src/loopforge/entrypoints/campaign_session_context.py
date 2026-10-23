@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from loopforge.domain.events import ActionProposed, Event, ToolFailed, ToolSucceeded
 
 
-def session_history(events: Sequence[Event], *, max_bytes: int = 40000) -> str:
+def session_history(
+    events: Sequence[Event], *, max_bytes: int = 40000, present: frozenset[str] = frozenset()
+) -> str:
     proposals = {e.proposal.action_id: e.proposal for e in events if isinstance(e, ActionProposed)}
     selected: list[dict[str, object]] = []
     omitted: list[int] = []
@@ -23,7 +25,9 @@ def session_history(events: Sequence[Event], *, max_bytes: int = 40000) -> str:
             "tool": proposal.tool_name,
             "arguments": dict(proposal.arguments),
             "outcome": "succeeded" if isinstance(event, ToolSucceeded) else "failed",
-            "result": event.observation
+            "result": "(identical to the current observation item; not repeated)"
+            if isinstance(event, ToolSucceeded) and event.observation in present
+            else event.observation
             if isinstance(event, ToolSucceeded)
             else event.error_message,
         }

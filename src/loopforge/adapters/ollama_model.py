@@ -48,6 +48,10 @@ from loopforge.ports.model import (
 )
 
 _CHAT_PATH: Final = "/api/chat"
+# Read-only navigation whose result the model planned for; no fresh reasoning needed.
+_FOLLOW_THROUGH_TOOLS: Final = frozenset(
+    {"read_file", "search_files", "repository_map", "find_symbol", "workspace_status"}
+)
 _SUMMARY_BUDGET: Final = 200
 
 
@@ -124,6 +128,8 @@ class OllamaModel:
         preserve_thinking: bool = False,
         keep_alive: str = "5m",
         request_token_counter: Callable[[dict[str, object]], int] | None = None,
+        byte_ratio_admission: bool = False,
+        thinking_policy: Literal["always", "on_evidence"] = "always",
         conversation_mode: Literal["history", "state"] = "history",
         tool_filter: Callable[[ModelContext], frozenset[str]] | None = None,
         tool_spec_filter: Callable[[ModelContext, ModelToolSpec], ModelToolSpec] | None = None,
@@ -215,6 +221,19 @@ class OllamaModel:
         self._preserve_thinking = preserve_thinking
         self._keep_alive = keep_alive
         self._request_token_counter = request_token_counter
+        if type(byte_ratio_admission) is not bool or (
+            byte_ratio_admission and request_token_counter is not None
+        ):
+            msg = "choose one code-owned request measurement"
+            raise ValueError(msg)
+        self._byte_ratio_admission = byte_ratio_admission
+        if thinking_policy not in {"always", "on_evidence"} or (
+            thinking_policy == "on_evidence" and conversation_mode != "history"
+        ):
+            msg = "evidence-driven thinking requires an append-only conversation"
+            raise ValueError(msg)
+        self._thinking_policy = thinking_policy
+        self._ratio_bound_violated: set[RunId] = set()
         self._history_compactions: dict[RunId, int] = {}
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
@@ -282,6 +301,15 @@ class OllamaModel:
     def propose_action(self, context: ModelContext) -> ModelTurn:
         selected_tools = self._selected_tools(context)
         rendered = self._render(context)
+        # Decided before the conversation consumes the pending call: reason on the
+        # first turn and after actions that produce new evidence (edits, checks,
+        # feedback); follow-through reads use the plan already in the conversation.
+        previous_tool = self._pending_calls.get(context.run_id)
+        think_now = (
+            context.run_id not in self._conversations
+            or previous_tool is None
+            or previous_tool not in _FOLLOW_THROUGH_TOOLS
+        )
         messages = self._conversation(context, rendered)
         self._turn_count += 1
         payload: dict[str, object] = {
@@ -307,7 +335,11 @@ class OllamaModel:
                 "num_predict": self._max_output_tokens,
             }
         if self._thinking is not None:
-            payload["think"] = self._thinking and context.run_id not in self._thinking_exhausted
+            payload["think"] = (
+                self._thinking
+                and context.run_id not in self._thinking_exhausted
+                and (self._thinking_policy == "always" or think_now)
+            )
         if self._context_window_tokens is not None:
             options = {"temperature": self._temperature, "num_ctx": self._context_window_tokens}
             options["num_predict"] = self._max_output_tokens or 2048
@@ -348,6 +380,14 @@ class OllamaModel:
             input_tokens=response.prompt_eval_count,
             output_tokens=response.eval_count,
         )
+        if (
+            admission is not None
+            and admission.measurement_basis is InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
+            and response.prompt_eval_count > admission.input_token_bound
+        ):
+            # The ratio assumption failed for this run: fail closed to the strict bound.
+            self._ratio_bound_violated.add(context.run_id)
+            self.request_tracker.note("byte_ratio_bound_exceeded_strict_bound_restored")
         try:
             action = self._parse_action(context, response)
         except ModelTurnError as error:
@@ -392,18 +432,23 @@ class OllamaModel:
                 ).encode()
             )
             count = (
-                serialized_bytes
-                if self._request_token_counter is None
-                else self._request_token_counter(payload)
+                self._request_token_counter(payload)
+                if self._request_token_counter is not None
+                else -(-serialized_bytes // 2)
+                if self._byte_ratio_admission and context.run_id not in self._ratio_bound_violated
+                else serialized_bytes
             )
             if type(count) is not int or count < 0:
                 msg = "request token counter returned invalid occupancy"
                 raise ValueError(msg)
             admission = ContextAdmission(
                 measurement_basis=(
-                    InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND
-                    if self._request_token_counter is None
-                    else InputMeasurementBasis.TOKEN_COUNTER
+                    InputMeasurementBasis.TOKEN_COUNTER
+                    if self._request_token_counter is not None
+                    else InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
+                    if self._byte_ratio_admission
+                    and context.run_id not in self._ratio_bound_violated
+                    else InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND
                 ),
                 input_token_bound=count,
                 serialized_request_bytes=serialized_bytes,
@@ -483,6 +528,7 @@ class OllamaModel:
         self._seen_items.pop(run_id, None)
         self._pending_calls.pop(run_id, None)
         self._history_compactions.pop(run_id, None)
+        self._ratio_bound_violated.discard(run_id)
 
     def _conversation(
         self, context: ModelContext, rendered: RenderedPrompt

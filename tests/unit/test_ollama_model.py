@@ -11,6 +11,7 @@ import httpx
 import pytest
 
 from loopforge.adapters.ollama_model import OllamaModel
+from loopforge.domain.admission import InputMeasurementBasis
 from loopforge.domain.context import (
     ContextItem,
     ContextSource,
@@ -1301,3 +1302,64 @@ def test_qualification_records_the_actual_local_request_payload() -> None:
         assert recorded[0]["tools"]
     finally:
         model.close()
+
+
+def _ratio_model(transport: httpx.MockTransport, **kwargs: object) -> OllamaModel:
+    return OllamaModel(
+        model="devstral-small-2:latest",
+        tools=TOOLS,
+        template=TEMPLATE,
+        transport=transport,
+        context_window_tokens=8192,
+        max_output_tokens=1024,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def _large_context(size: int) -> ModelContext:
+    return _context_with(
+        _item("objective", "Repair the adder regression.", TrustClass.AUTHORIZED_HUMAN),
+        _item("source", "x" * size, TrustClass.UNTRUSTED_CONTENT),
+    )
+
+
+def test_byte_ratio_admits_a_request_the_strict_byte_gate_rejects() -> None:
+    context = _large_context(9000)
+    strict = _ratio_model(_responding(_chat_payload(prompt_tokens=2600)))
+    with pytest.raises(ModelTurnError) as denied:
+        strict.propose_action(context)
+    assert denied.value.reason_code == "MODEL_CONTEXT_LIMIT"
+    ratio = _ratio_model(_responding(_chat_payload(prompt_tokens=2600)), byte_ratio_admission=True)
+    turn = ratio.propose_action(context)
+    assert turn.context_admission is not None
+    assert (
+        turn.context_admission.measurement_basis
+        is InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
+    )
+    serialized = turn.context_admission.serialized_request_bytes
+    assert turn.context_admission.input_token_bound == -(-serialized // 2)
+    assert serialized > 8192
+
+
+def test_ratio_violation_restores_the_strict_byte_bound_for_that_run() -> None:
+    context = _large_context(3000)
+    model = _ratio_model(_responding(_chat_payload(prompt_tokens=7000)), byte_ratio_admission=True)
+    first = model.propose_action(context)
+    assert first.context_admission is not None
+    assert (
+        first.context_admission.measurement_basis
+        is InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
+    )
+    second = model.propose_action(context)
+    assert second.context_admission is not None
+    assert second.context_admission.measurement_basis is InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND
+    assert "byte_ratio_bound_exceeded_strict_bound_restored" in json.dumps(
+        model.request_tracker.observations()
+    )
+
+
+def test_two_request_measurements_cannot_be_combined() -> None:
+    with pytest.raises(ValueError, match="one code-owned request measurement"):
+        _ratio_model(
+            _responding(_chat_payload()), byte_ratio_admission=True, request_token_counter=len
+        )

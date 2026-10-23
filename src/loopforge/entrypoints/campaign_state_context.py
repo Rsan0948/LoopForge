@@ -45,10 +45,12 @@ class CodingStateContext:
         *,
         feedback_snapshot: Callable[[], str] | None = None,
         patch_identity: Callable[[], str] | None = None,
+        inherited_failure: Callable[[], str | None] | None = None,
     ) -> None:
         self.delegate, self.store, self.workspace = delegate, store, workspace
         self.task, self.config = task, config
         self.feedback_snapshot, self.patch_identity = feedback_snapshot, patch_identity
+        self.inherited_failure = inherited_failure
 
     def build_context(  # noqa: PLR0912, PLR0915 - bounded exact evidence projection
         self,
@@ -209,11 +211,16 @@ class CodingStateContext:
                     created_at=context.assembled_at,
                 ),
             )
+        # A fresh run inherits the known failure of an unchanged candidate.
+        inherited = self.inherited_failure() if self.inherited_failure else None
         packet: dict[str, object] = {
             "kind": "current_state_not_chat_history",
             "current_patch_sha256": self.patch_identity() if self.patch_identity else None,
             "workflow": {
-                "phase": "repair" if state.last_verification_passed is False else "verify",
+                "phase": "repair"
+                if state.last_verification_passed is False
+                or (state.last_verification_passed is None and inherited is not None)
+                else "verify",
                 "startup_feedback_complete": self.feedback_snapshot is not None,
                 "feedback_delivery": (
                     "included_in_this_context" if self.feedback_snapshot else "not_configured"
@@ -254,7 +261,9 @@ class CodingStateContext:
             # Admission still checks the fully serialized provider request.
             history = ContextItem(
                 item_id=ContextItemId(f"{context.run_id}:working-session"),
-                content=session_history(events),
+                content=session_history(
+                    events, present=frozenset(i.content for i in context.items)
+                ),
                 trust=TrustClass.UNTRUSTED_CONTENT,
                 source=ContextSource(
                     origin=TrustClass.UNTRUSTED_CONTENT,

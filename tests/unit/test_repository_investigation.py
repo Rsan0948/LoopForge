@@ -721,3 +721,32 @@ def test_query_at_nonzero_offset_retains_valid_synthetic_evidence_range(
     assert "value_20" in record.excerpt
     assert record.start_offset_bytes == 0
     assert record.end_offset_bytes == 0
+
+
+@pytest.mark.parametrize("open_files", [128, 1024])
+def test_baseline_measurement_uses_the_frozen_coding_sandbox_limits(
+    tmp_path: Path, config: RepositoryGoalConfig, monkeypatch: pytest.MonkeyPatch, open_files: int
+) -> None:
+    config = config.model_copy(
+        update={"task": config.task.model_copy(update={"sandbox_max_open_files": open_files})}
+    )
+    observed: list[int] = []
+
+    def run(
+        self: ContainerSandbox, command_name: str, *, timeout_seconds: float | None = None
+    ) -> SandboxCommandResult:
+        del timeout_seconds
+        observed.append(self._limits.max_open_files)  # pyright: ignore[reportPrivateUsage]
+        ok = command_name == "check_environment"
+        return SandboxCommandResult(exit_code=0 if ok else 1, stdout="", stderr="x", succeeded=ok)
+
+    monkeypatch.setattr(ContainerSandbox, "run", run)
+    instance = RepositoryGoalService(tmp_path / "limits-goal")
+    try:
+        instance.create(config)
+        research(instance, decision(GoalAction.PREPARE, environment="stdlib"))
+        research(instance, decision(GoalAction.REPRODUCE))
+    finally:
+        instance.close()
+    assert observed
+    assert set(observed) == {open_files}

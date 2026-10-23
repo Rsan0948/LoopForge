@@ -8,13 +8,14 @@ from dataclasses import asdict
 from pathlib import Path
 
 from loopforge.adapters.container_sandbox import ContainerSandbox, ContainerSandboxConfig
-from loopforge.adapters.local_sandbox import CommandSpec, SandboxLimits
+from loopforge.adapters.local_sandbox import CommandSpec
 from loopforge.adapters.research_store import ResearchStore
 from loopforge.domain.evidence_pages import evidence_page
 from loopforge.domain.goals import GoalAction, GoalState, SupervisorDecision
 from loopforge.domain.investigation import FailureKind, ResearchRecord, TaskAssignment
 from loopforge.entrypoints.campaign_coding import (
     CODING_REQUIREMENTS,
+    coding_sandbox_limits,
     local_git_bytes,
     prepare_checkout,
 )
@@ -24,6 +25,7 @@ from loopforge.entrypoints.goal_checkpoint import capture, snapshot_checkpoint
 from loopforge.entrypoints.repository_goal_models import ApprovedEnvironment, RepositoryGoalConfig
 from loopforge.ports.sandbox import SandboxError
 from loopforge.ports.supervisor import InvestigationFailure
+from loopforge.workloads.repair import acceptance_failure_line
 
 MAX_ARTIFACT_BYTES = 262_144
 
@@ -549,7 +551,7 @@ class RepositoryInvestigation:
                 image=environment.image,
                 commands=commands,
                 workspace_read_only=True,
-                limits=SandboxLimits(max_output_bytes=12000, max_memory_bytes=2 * 1024**3),
+                limits=coding_sandbox_limits(config.task, max_output_bytes=12000),
                 environment={"PYTHONDONTWRITEBYTECODE": "1", "HOME": "/tmp", "TMPDIR": "/tmp"},
             ),
         ) as sandbox:
@@ -574,16 +576,25 @@ class RepositoryInvestigation:
                     passed = result.succeeded and (
                         marker is None or result.stdout.rstrip().endswith(marker)
                     )
-                    outcomes.append(
-                        {
-                            "name": check.name,
-                            "executed": True,
-                            "passed": passed,
-                            "exit_code": result.exit_code,
-                            "stdout": result.stdout,
-                            "stderr": result.stderr,
-                        }
+                    outcome: dict[str, object] = {
+                        "name": check.name,
+                        "executed": True,
+                        "passed": passed,
+                        "exit_code": result.exit_code,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                    }
+                    probe = next(
+                        (p for p in config.task.acceptance_probes if p.name == check.name), None
                     )
+                    hint = (
+                        acceptance_failure_line(probe.source, result.stdout + "\n" + result.stderr)
+                        if probe is not None and not passed
+                        else None
+                    )
+                    if hint is not None:
+                        outcome["failing_acceptance_line"] = hint
+                    outcomes.append(outcome)
                     if not passed and failure != FailureKind.ENVIRONMENT:
                         failure = (
                             FailureKind.VERIFICATION

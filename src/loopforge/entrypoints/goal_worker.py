@@ -2,7 +2,8 @@
 
 import hashlib
 import json
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Sequence
 from dataclasses import replace
 from pathlib import Path
 from typing import cast
@@ -13,6 +14,7 @@ from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.research_store import ResearchStore
 from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.application.failure_recovery import worker_failure
+from loopforge.domain.events import ActionProposed, Event
 from loopforge.domain.goals import GoalAction, WorkerObservation
 from loopforge.domain.investigation import FailureKind
 from loopforge.domain.state import replay
@@ -113,23 +115,38 @@ class CampaignGoalWorker:
                 (self.task,),
             ).fetchone()
         detail = cast("dict[str, object]", json.loads(row["detail"])) if row else {}
+        candidate_dir = self.harness.directory / "coding" / self.task
+        changed = sorted(self._workspace().status().files) if row and candidate_dir.exists() else []
+        run_events = (
+            SQLiteEventStore(
+                self.harness.directory / "runs.sqlite", codec=JsonEventCodec()
+            ).events_for(RunId(str(detail["run_id"])))
+            if row and isinstance(detail.get("run_id"), str)
+            else ()
+        )
         # Only task evidence crosses the supervisor boundary: no environment,
         # credentials, host workspace paths or raw provider request observations.
         evidence = json.dumps(
             {
-                key: detail[key]
-                for key in (
-                    "patch",
-                    "report",
-                    "last_verification",
-                    "stop_summary",
-                    "acceptance_receipt",
-                )
-                if key in detail
+                **(
+                    {"measured_summary": measured_summary(detail, changed, run_events)}
+                    if row
+                    else {}
+                ),
+                **{
+                    key: detail[key]
+                    for key in (
+                        "patch",
+                        "report",
+                        "last_verification",
+                        "stop_summary",
+                        "acceptance_receipt",
+                    )
+                    if key in detail
+                },
             }
         )
         artifact_ids: tuple[str, ...] = ()
-        candidate_dir = self.harness.directory / "coding" / self.task
         identity = patch_identity(self._workspace()) if candidate_dir.exists() else ""
         goal_path = self.harness.directory.parent / "goals.sqlite"
         if goal_path.exists() and evidence != "{}":
@@ -378,3 +395,38 @@ class CampaignGoalWorker:
         if not dispatch.get("accepted"):
             msg = "Prepared worker dispatch did not start; reconcile before continuing"
             raise ValueError(msg)
+
+
+_CHECK_STATUS = re.compile(r"(command:[A-Za-z0-9_]+|patch_constraints): (passed|failed)")
+
+
+def measured_summary(
+    detail: dict[str, object], changed_files: list[str], events: Sequence[Event]
+) -> dict[str, object]:
+    """Code-derived facts about a worker attempt, so no model must infer them from a diff."""
+    verification = str(detail.get("last_verification") or "")
+    checks: dict[str, str] = {}
+    for name, status in _CHECK_STATUS.findall(verification):
+        checks.setdefault(name.removeprefix("command:"), status)
+    actions: dict[str, int] = {}
+    for event in events:
+        if isinstance(event, ActionProposed):
+            tool = event.proposal.tool_name
+            kind = (
+                "edits"
+                if tool in {"apply_edits", "edit_file", "write_file", "format_python_imports"}
+                else "checks"
+                if tool.startswith("check_")
+                else "reads"
+                if tool in {"read_file", "search_files", "repository_map", "find_symbol"}
+                else "other"
+            )
+            actions[kind] = actions.get(kind, 0) + 1
+    return {
+        "trust": "runtime_measured; computed from the workspace and journal, not model claims",
+        "run_id": detail.get("run_id"),
+        "run_status": detail.get("run_status"),
+        "files_changed_vs_assignment_baseline": changed_files,
+        "checks": checks or "no verification recorded for this attempt",
+        "worker_actions": actions,
+    }

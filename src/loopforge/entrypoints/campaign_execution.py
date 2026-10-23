@@ -1,5 +1,6 @@
 """Serial coding/review driver sharing the campaign execution slot."""
 
+import hashlib
 import json
 import subprocess
 import time
@@ -50,6 +51,19 @@ from loopforge.entrypoints.campaign_store import CampaignStore
 from loopforge.ports.model import ModelPort
 from loopforge.ports.paid_budget import PaidBudgetPort
 from loopforge.ports.verifier import VerificationResult, VerifierPort
+
+
+def guidance_objective_sha256(guidance: str | None) -> str | None:
+    """Identity of the supervisor's current objective, ignoring plan/rationale wording."""
+    if guidance is None:
+        return None
+    try:
+        data: object = json.loads(guidance)
+    except ValueError:
+        data = None
+    objective = cast("dict[str, object]", data).get("objective") if isinstance(data, dict) else None
+    text = objective if isinstance(objective, str) else guidance
+    return hashlib.sha256(text.encode()).hexdigest()
 
 
 def coding_feedback(details: list[str]) -> str:
@@ -288,14 +302,20 @@ class CodingCoordinator:
                 ).fetchone()
                 preflight(contract)
                 events = SQLiteEventStore(self.directory / "runs.sqlite", codec=JsonEventCodec())
-                previous_ids = [
-                    json.loads(item["event"])["run_id"]
+                linked: list[tuple[str, object]] = [
+                    (str(json.loads(item["event"])["run_id"]), json.loads(item["detail"] or "{}"))
                     for item in db.execute(
-                        "SELECT event FROM coding_events WHERE task=? AND "
+                        "SELECT event, detail FROM coding_events WHERE task=? AND "
                         "json_extract(event,'$.kind')='linked'",
                         (task,),
                     )
                 ]
+                previous_ids = [rid for rid, _ in linked]
+                prior_guidance = {
+                    RunId(rid): str(cast("dict[str, object]", detail)["guidance_objective_sha256"])
+                    for rid, detail in linked
+                    if isinstance(detail, dict) and "guidance_objective_sha256" in detail
+                }
                 used = sum(
                     replay(RunId(rid), events.events_for(RunId(rid))).total_tokens
                     for rid in previous_ids
@@ -362,6 +382,10 @@ class CodingCoordinator:
                     store=events,
                     model=prepared_check_model(contract, workspace, prepared),
                     prior_runs=tuple(RunId(rid) for rid in previous_ids),
+                    prior_guidance=prior_guidance,
+                    guidance_objective_sha256=guidance_objective_sha256(
+                        self.assignment_guidance.get(task)
+                    ),
                     repair_ledger=self.directory / "repair" / task / "ledger.sqlite",
                     parent_budget=self.parent_budget,
                     require_revision=any(
@@ -425,6 +449,17 @@ class CodingCoordinator:
                         "paths, protected files, commands and budgets remain mandatory. "
                         "No merge or deployment."
                     )
+                if config.inference_profile == "qwen-native-v1":
+                    objective = (
+                        contract.objective
+                        + "\nThis is one continuous conversation: your earlier tool calls and "
+                        "their results stay above. Call review_feedback once for earlier "
+                        "attempts' check evidence. Choose reads, edits and registered checks "
+                        "to complete the task, and run the failing check after a coherent "
+                        "change. Use current source hashes for edits. The supervisor "
+                        "assignment is guidance; original acceptance, allowed paths, protected "
+                        "files, commands and budgets remain mandatory. No merge or deployment."
+                    )
                 review_tools = None
                 before = None
             else:
@@ -485,7 +520,19 @@ class CodingCoordinator:
             run_id = runtime.start(objective)
             with self.store.connect() as db:
                 db.execute("BEGIN IMMEDIATE")
-                self.jobs.append(db, task, CodingEvent("linked", str(run_id)), "{}")
+                guidance_sha = (
+                    guidance_objective_sha256(self.assignment_guidance.get(task))
+                    if event == "start"
+                    else None
+                )
+                self.jobs.append(
+                    db,
+                    task,
+                    CodingEvent("linked", str(run_id)),
+                    json.dumps({"guidance_objective_sha256": guidance_sha})
+                    if guidance_sha
+                    else "{}",
+                )
                 self.store.append(
                     db, campaign, CampaignEvent("linked", task), json.dumps({"run_id": str(run_id)})
                 )

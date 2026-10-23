@@ -434,3 +434,48 @@ def test_probe_completion_contract_rejects_unknown_or_ambiguous_checks(
             _criteria(),
             completion_markers=contract,
         )
+
+
+_PROBE = "setup = 1\nsecret_fixture = 'not disclosed'\nassert page_ready(), 'Mobile overflow'\n"
+
+
+def _probe_failure(frame_line: int) -> SandboxCommandResult:
+    stderr = (
+        'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\n'
+        f'  File "<trusted-acceptance>", line {frame_line}, in <module>\n'
+        "AssertionError: Mobile overflow\n"
+    )
+    return SandboxCommandResult(exit_code=1, stdout="", stderr=stderr, succeeded=False)
+
+
+def test_failing_probe_names_only_its_failing_line() -> None:
+    sandbox = StubSandbox({"run_tests": _probe_failure(3)})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("app.css",)))
+    result = RepairVerifier(
+        sandbox, workspace, _criteria(), probe_sources=(("run_tests", _PROBE),)
+    ).verify(_state())
+    assert not result.passed
+    assert "failing acceptance line 3: assert page_ready(), 'Mobile overflow'" in result.summary
+    assert "not disclosed" not in result.summary
+    assert "setup = 1" not in result.summary
+
+
+@pytest.mark.parametrize("frame_line", [0, 99])
+def test_unmatched_probe_frame_discloses_nothing(frame_line: int) -> None:
+    sandbox = StubSandbox({"run_tests": _probe_failure(frame_line)})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("app.css",)))
+    result = RepairVerifier(
+        sandbox, workspace, _criteria(), probe_sources=(("run_tests", _PROBE),)
+    ).verify(_state())
+    assert not result.passed
+    assert "failing acceptance line" not in result.summary
+
+
+def test_passing_probe_adds_no_hint() -> None:
+    sandbox = StubSandbox({"run_tests": _result(0)})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("app.css",)))
+    result = RepairVerifier(
+        sandbox, workspace, _criteria(), probe_sources=(("run_tests", _PROBE),)
+    ).verify(_state())
+    assert result.passed
+    assert "failing acceptance line" not in result.summary

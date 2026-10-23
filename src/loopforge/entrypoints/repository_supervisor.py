@@ -201,6 +201,7 @@ class RepositoryGoalService(BaseGoalService):
                         deadline_epoch=int(self.clock.now().timestamp()) + config.max_goal_seconds,
                         max_decisions=config.max_decisions,
                         max_failures=config.max_failures,
+                        consecutive_failures=config.consecutive_failures,
                         remote_data=config.remote_data,
                         worker_binding_sha256=repository_binding(config),
                         investigation_enabled=True,

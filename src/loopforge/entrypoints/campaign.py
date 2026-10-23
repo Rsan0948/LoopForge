@@ -393,6 +393,9 @@ class CampaignHarness:
         self.guard = threading.Lock()
         self.active_live: OllamaModel | None = None
         self.service_lock: BinaryIO | None = None
+        # Set by the owning runner on operator stop (e.g. SIGTERM). The coding
+        # thread is non-daemon, so without this a stop waits for the whole run.
+        self.operator_stop: threading.Event | None = None
 
     def observe_provider(self, live: OllamaModel | None) -> None:
         self.active_live = live
@@ -623,6 +626,8 @@ class CampaignHarness:
                 )
             if cancelled:
                 return runtime.cancel(run_id, summary="campaign cancellation acknowledged")
+            if self.operator_stop is not None and self.operator_stop.is_set():
+                return runtime.cancel(run_id, summary="operator stop requested")
             state = runtime.step(run_id)
         return state
 

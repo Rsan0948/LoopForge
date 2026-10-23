@@ -97,6 +97,7 @@ class GoalPolicy:
     deadline_epoch: int
     max_decisions: int = 12
     max_failures: int = 3
+    consecutive_failures: bool = False
     max_action_rejections: int = 3
     task_intent: str = "bugfix"
     require_recovery_evidence: bool = False
@@ -129,6 +130,9 @@ class GoalPolicy:
             raise ValueError(msg)
         if len({p.topic for p in self.clarifications}) != len(self.clarifications):
             msg = "Clarification topics must be unique"
+            raise ValueError(msg)
+        if type(self.consecutive_failures) is not bool:
+            msg = "Failure counting mode requires a boolean"
             raise ValueError(msg)
         if type(self.investigation_enabled) is not bool:
             msg = "Investigation authority requires a boolean"
@@ -374,6 +378,17 @@ def allowed_actions(observation: WorkerObservation) -> frozenset[GoalAction]:
     return frozenset(actions)
 
 
+def current_recovery(state: GoalState) -> RecoveryIntent | None:
+    """The validated retry hypothesis that applies to the current assignment, if any."""
+    if state.decision and state.decision.action == GoalAction.RETRY and state.decision.recovery:
+        return state.decision.recovery
+    if state.recoveries and state.recoveries[-1].assignment_version == len(
+        state.assignment_versions
+    ):
+        return state.recoveries[-1].intent
+    return None
+
+
 def goal_allowed_actions(state: GoalState) -> frozenset[GoalAction]:
     actions = set(allowed_actions(state.observation))
     if state.policy and state.policy.dynamic_clarifications and len(state.dynamic_questions) < 8:
@@ -461,6 +476,9 @@ def reduce_goal(state: GoalState, event: GoalEvent) -> GoalState:  # noqa: PLR09
         if isinstance(event, DecisionRecorded):
             result = replace(
                 result,
+                failures=0
+                if state.policy and state.policy.consecutive_failures
+                else state.failures,
                 phase="ready"
                 if state.control_requested or state.late_answer_conflict
                 else "action",
@@ -497,7 +515,11 @@ def reduce_goal(state: GoalState, event: GoalEvent) -> GoalState:  # noqa: PLR09
             decision=None,
             recoveries=(
                 *state.recoveries,
-                RecoveryAttempt(state.observation.candidate_sha256, state.decision.recovery),
+                RecoveryAttempt(
+                    state.observation.candidate_sha256,
+                    state.decision.recovery,
+                    len(state.assignment_versions),
+                ),
             )
             if state.decision
             and state.decision.action == GoalAction.RETRY

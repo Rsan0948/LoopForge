@@ -7,8 +7,20 @@ from datetime import UTC, datetime
 from loopforge.adapters.scripted import ScriptedModel
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ContextItem, ContextSource, ModelContext
-from loopforge.domain.goals import GoalState
-from loopforge.domain.investigation import FailureKind, ResearchRecord, TaskAssignment
+from loopforge.domain.goals import (
+    AssignmentVersion,
+    GoalAction,
+    GoalState,
+    SupervisorDecision,
+    current_recovery,
+)
+from loopforge.domain.investigation import (
+    FailureKind,
+    RecoveryAttempt,
+    RecoveryIntent,
+    ResearchRecord,
+    TaskAssignment,
+)
 from loopforge.domain.security import TrustClass
 from loopforge.domain.types import ActionId, ContextItemId, RunId
 from loopforge.entrypoints.campaign_coding import AssignmentGuidanceModel
@@ -120,3 +132,42 @@ def test_worker_handoff_reads_failures_beyond_successful_first_page() -> None:
     clean = replace(state, research=())
     assert json.loads(worker_guidance(clean, original))["measured_baseline_untrusted"] is None
     assert requested == ["baseline"]
+
+
+def _recovery_state() -> tuple[GoalState, RecoveryIntent]:
+    assignment = TaskAssignment("Fix three failures in server and CSS", ("app/server.py",), ("e1",))
+    intent = RecoveryIntent(
+        "test_api expects 409 for a wrong-job upload but CONTRACT.md mandates 422",
+        ("e1",),
+        FailureKind.NO_PROGRESS,
+    )
+    version = AssignmentVersion(assignment, "env")
+    state = GoalState(assignment=assignment, assignment_versions=(version,))
+    return state, intent
+
+
+def test_retry_hypothesis_leads_the_worker_objective_in_flight_and_after_observation() -> None:
+    state, intent = _recovery_state()
+    retry = SupervisorDecision(GoalAction.RETRY, "revise", "retry", recovery=intent)
+    in_flight = replace(state, decision=retry)
+    observed = replace(state, recoveries=(RecoveryAttempt("c" * 64, intent, 1),))
+    for current in (in_flight, observed):
+        assert current_recovery(current) == intent
+        objective = json.loads(worker_guidance(current))["objective"]
+        assert objective.startswith("Revised after the previous attempt (no_progress): test_api")
+        assert "superseded where it conflicts" in objective
+        assert "Fix three failures" in objective
+
+
+def test_earlier_hypothesis_does_not_leak_into_a_newer_assignment() -> None:
+    state, intent = _recovery_state()
+    newer = TaskAssignment("Apply four targeted edits", ("app/tests/test_api.py",), ("e2",))
+    later = replace(
+        state,
+        assignment=newer,
+        assignment_versions=(*state.assignment_versions, AssignmentVersion(newer, "env")),
+        recoveries=(RecoveryAttempt("c" * 64, intent, 1),),
+    )
+    assert current_recovery(later) is None
+    assert json.loads(worker_guidance(later))["objective"] == "Apply four targeted edits"
+    assert current_recovery(replace(state, recoveries=())) is None

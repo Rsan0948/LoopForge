@@ -53,6 +53,9 @@ class RecoveryIntent:
 class RecoveryAttempt:
     candidate_sha256: str
     intent: RecoveryIntent
+    # Derived on replay: the assignment version this hypothesis revised. A later
+    # assignment must not inherit an earlier assignment's recovery hypothesis.
+    assignment_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -104,14 +107,24 @@ class TaskAssignment:
     evidence_ids: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        if not 10 <= len(self.objective.strip()) <= 1500 or not (
-            1 <= len(self.files) <= 30
-            and len(set(self.files)) == len(self.files)
-            and all(relative_path(path) for path in self.files)
-            and 1 <= len(self.evidence_ids) <= 12
-            and len(set(self.evidence_ids)) == len(self.evidence_ids)
-        ):
-            msg = "Assignment requires an objective, explicit safe deliverables and evidence"
+        # Each rule has its own fixed message so a model can correct the exact field.
+        rules = (
+            (10 <= len(self.objective.strip()) <= 1500, "objective must be 10-1500 characters"),
+            (1 <= len(self.files) <= 30, "files must list 1-30 paths"),
+            (len(set(self.files)) == len(self.files), "files must not repeat a path"),
+            (
+                all(relative_path(path) for path in self.files),
+                "files must be safe relative paths",
+            ),
+            (1 <= len(self.evidence_ids) <= 12, "evidence_ids must list 1-12 ids"),
+            (
+                len(set(self.evidence_ids)) == len(self.evidence_ids),
+                "evidence_ids must not repeat an id",
+            ),
+        )
+        failed = [message for ok, message in rules if not ok]
+        if failed:
+            msg = "Assignment invalid: " + "; ".join(failed)
             raise ValueError(msg)
 
 

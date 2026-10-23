@@ -16,6 +16,7 @@ class OllamaProfile:
     context_tokens: int = 32768
     keep_alive: str = "5m"
     conversation_mode: Literal["history", "state"] = "history"
+    thinking_policy: Literal["always", "on_evidence"] = "always"
 
     def options(self) -> dict[str, float | int]:
         return {
@@ -30,7 +31,7 @@ class OllamaProfile:
         }
 
 
-def profile_for(  # noqa: PLR0913 - explicit legacy and opt-in inference profiles
+def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inference profiles
     role: Literal["coding", "review", "reporter"],
     *,
     candidate: bool = False,
@@ -39,7 +40,23 @@ def profile_for(  # noqa: PLR0913 - explicit legacy and opt-in inference profile
     app_workload: bool = False,
     state_driven: bool = False,
     session: bool = False,
+    native: bool = False,
 ) -> OllamaProfile:
+    if native and role == "coding":
+        # Append-only native tool chat (prefix KV cache reuse), reasoning enabled,
+        # and Qwen's recommended thinking-mode sampling instead of greedy decoding.
+        return OllamaProfile(
+            "coding-native-v1",
+            0.6,
+            0.95,
+            0.0,
+            True,
+            8192,
+            context_tokens=98304,
+            keep_alive="30m",
+            conversation_mode="history",
+            thinking_policy="on_evidence",
+        )
     if session:
         return OllamaProfile(
             f"{role}-session-v1",

@@ -185,6 +185,7 @@ class GoalExecutionService:
         supervisor = None
         try:
             service.harness.nonblocking_goals = True
+            service.harness.operator_stop = stop
             service.worker().recover_interrupted()
             initial = service.journal.load(GOAL)
             if initial.terminal:

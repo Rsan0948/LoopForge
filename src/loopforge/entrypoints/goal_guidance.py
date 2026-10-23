@@ -6,7 +6,7 @@ from dataclasses import asdict
 from functools import cache
 
 from loopforge.adapters.working_evidence import working_evidence
-from loopforge.domain.goals import GoalState
+from loopforge.domain.goals import GoalState, current_recovery
 
 
 def worker_guidance(state: GoalState, original: Callable[[str], str] | None = None) -> str:
@@ -27,6 +27,11 @@ def worker_guidance(state: GoalState, original: Callable[[str], str] | None = No
                     "name": outcome.get("name"),
                     "executed": outcome.get("executed"),
                     "exit_code": outcome.get("exit_code"),
+                    **(
+                        {"failing_acceptance_line": outcome["failing_acceptance_line"]}
+                        if "failing_acceptance_line" in outcome
+                        else {}
+                    ),
                     "stdout": stdout[:2000],
                     "stderr": stderr[:1000],
                     "omitted_characters": max(0, len(stdout) - 2000) + max(0, len(stderr) - 1000),
@@ -41,11 +46,7 @@ def worker_guidance(state: GoalState, original: Callable[[str], str] | None = No
                 {"topic": q.topic, "answer": q.answer} for q in state.questions if q.answer
             ],
             "assumptions_untrusted": [asdict(e) for e in state.experiments],
-            "objective": state.assignment.objective
-            if state.assignment
-            else state.policy.objective
-            if state.policy
-            else "",
+            "objective": _objective(state),
             "working_evidence_untrusted": working_evidence(
                 state.research, original, max_bytes=24000
             ),
@@ -74,4 +75,26 @@ def worker_guidance(state: GoalState, original: Callable[[str], str] | None = No
                 "and fixed checks. Verify current source before following historical advice."
             ),
         }
+    )
+
+
+def _objective(state: GoalState) -> str:
+    """A validated retry hypothesis leads; the assignment it revised stays visible."""
+    base = (
+        state.assignment.objective
+        if state.assignment
+        else state.policy.objective
+        if state.policy
+        else ""
+    )
+    recovery = current_recovery(state)
+    if recovery is None:
+        return base
+    return (
+        "Revised after the previous attempt ("
+        + recovery.failure.value
+        + "): "
+        + recovery.changed_hypothesis.strip()
+        + "\n\nEarlier assignment, superseded where it conflicts with the revision above: "
+        + base
     )

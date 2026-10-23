@@ -40,6 +40,7 @@ class CampaignConfig(StrictRecord):
         "qwen-app-v1",
         "qwen-state-v1",
         "qwen-session-v1",
+        "qwen-native-v1",
     ] = "baseline-v1"
     max_iterations: int = Field(default=96, ge=2, le=192)
     max_tokens: int = Field(default=500_000, ge=1000, le=2_000_000)
@@ -369,6 +370,10 @@ class CodingTaskConfig(StrictRecord):
     max_task_tokens: int = Field(default=2_000_000, ge=1000, le=5_000_000)
     max_task_seconds: int = Field(default=21_600, ge=30, le=43_200)
     max_review_reads: int = Field(default=64, ge=2, le=256)
+    # Operator-frozen container descriptor ceiling. Browser workloads (Chromium
+    # plus an app server) stall under the legacy 128. Repository or model
+    # content can never set this; it is part of the frozen task contract.
+    sandbox_max_open_files: int = Field(default=128, ge=64, le=4096)
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
@@ -376,6 +381,9 @@ class CodingTaskConfig(StrictRecord):
         for name in ("editable_project_paths", "immutable_paths"):
             if not getattr(self, name):
                 data.pop(name, None)
+        # Omit the legacy default so previously frozen contract hashes are unchanged.
+        if self.sandbox_max_open_files == 128:
+            data.pop("sandbox_max_open_files", None)
         return data
 
     @model_validator(mode="after")

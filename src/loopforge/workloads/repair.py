@@ -237,6 +237,7 @@ class RepairVerifier:
         hooks: tuple[RepairCheck, ...] = (),
         command_detail_budget: int = _DETAIL_BUDGET,
         completion_markers: tuple[tuple[str, str], ...] = (),
+        probe_sources: tuple[tuple[str, str], ...] = (),
     ) -> None:
         if not 64 <= command_detail_budget <= 8000:
             msg = "command detail budget must be between 64 and 8000 characters"
@@ -247,6 +248,7 @@ class RepairVerifier:
         self._hooks = hooks
         self._command_detail_budget = command_detail_budget
         self._completion_markers = dict(completion_markers)
+        self._probe_sources = dict(probe_sources)
         if (
             len(self._completion_markers) != len(completion_markers)
             or any(not name or not marker for name, marker in completion_markers)
@@ -313,6 +315,11 @@ class RepairVerifier:
         completed = marker is None or result.stdout.splitlines()[-1:] == [marker]
         if not completed:
             detail += "; trusted acceptance completion marker missing"
+        source = self._probe_sources.get(name)
+        if source is not None and not (result.succeeded and completed):
+            hint = acceptance_failure_line(source, result.stdout + "\n" + result.stderr)
+            if hint is not None:
+                detail += f"; {hint}"
         if not result.succeeded and (result.stdout or result.stderr):
             detail += (
                 f"; stdout={_bounded(result.stdout, self._command_detail_budget)}; "
@@ -560,3 +567,25 @@ def _path_allowed(path: str, allowed_prefixes: tuple[str, ...]) -> bool:
     return any(
         path == prefix or path.startswith(prefix.rstrip("/") + "/") for prefix in allowed_prefixes
     )
+
+
+_PROBE_FRAME = re.compile(r'File "<trusted-acceptance>", line (\d+)')
+
+
+def acceptance_failure_line(source: str, output: str) -> str | None:
+    """Name the one probe line that failed, without disclosing the rest of the probe.
+
+    Probe source stays omitted so it cannot be gamed, but a bare line number of
+    unseen code is not actionable. The innermost probe frame is reported.
+    """
+    frames = _PROBE_FRAME.findall(output)
+    if not frames:
+        return None
+    number = int(frames[-1])
+    lines = source.splitlines()
+    if not 1 <= number <= len(lines):
+        return None
+    text = lines[number - 1].strip()
+    if len(text) > 300:
+        text = text[:297] + "..."
+    return f"failing acceptance line {number}: {text}"

@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 import sqlite3
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -552,6 +553,8 @@ def test_serial_coding_review_acceptance(  # noqa: PLR0915 - complete sequential
         model: ModelPort | None = None,
         require_revision: bool = False,
         prior_runs: tuple[RunId, ...] = (),
+        prior_guidance: dict[RunId, str] | None = None,
+        guidance_objective_sha256: str | None = None,
         repair_ledger: Path | None = None,
         parent_budget: PaidBudgetPort | None = None,
     ):
@@ -1126,10 +1129,18 @@ def test_multi_edit_validates_entire_batch_before_any_write(
     assert not execute([{"old": "return 0", "new": "return a+b"}], "a" * 64).ok
     assert not execute([{"old": "assert", "new": "pass"}], target="tests/test_add.py").ok
     assert not execute([{"old": "return 0", "new": "x", "authority": "write"}]).ok
-    assert execute(
+    first = execute(
         [{"old": "return 0", "new": "return a+b"}, {"old": "def add(a,b)", "new": "def add(a, b)"}]
-    ).ok
+    )
+    assert first.ok
     assert path.read_text() == "def add(a, b): return a+b\n"
+    reported = re.search(r"after this edit: ([0-9a-f]{64})", first.observation)
+    assert reported is not None
+    assert reported[1] == hashlib.sha256(path.read_text().encode()).hexdigest()
+    # The stale pre-edit hash is still denied; the reported one needs no reread.
+    assert not execute([{"old": "a+b", "new": "b+a"}]).ok
+    assert execute([{"old": "a+b", "new": "b+a"}], reported[1]).ok
+    assert path.read_text() == "def add(a, b): return b+a\n"
     assert runtime.tools.metadata_for("apply_edits").retry.value == "never"
 
 
@@ -1654,3 +1665,252 @@ def test_state_diagnostics_are_readable_and_not_repeated(
         next(i.content for i in context.items if str(i.item_id).endswith(":feedback-state"))
     )
     assert "not repeated" in feedback["current_verification"]["summary"]
+
+
+def test_sandbox_open_files_default_preserves_frozen_contract_hash() -> None:
+    task = contract()
+    assert task.sandbox_max_open_files == 128
+    assert "sandbox_max_open_files" not in task.model_dump(mode="json")
+    explicit = CodingTaskConfig.model_validate({**task.model_dump(), "sandbox_max_open_files": 128})
+    assert coding.acceptance_contract_hash(explicit) == coding.acceptance_contract_hash(task)
+    assert coding.coding_sandbox_limits(task).max_open_files == 128
+
+
+def test_operator_open_files_reaches_coding_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[ContainerSandboxConfig] = []
+
+    class Capturing(FakeChecks):
+        def __init__(self, root: Path, *, config: ContainerSandboxConfig) -> None:
+            captured.append(config)
+            super().__init__(root, config=config)
+
+    monkeypatch.setattr(coding, "ContainerSandbox", Capturing)
+    repo = workspace(tmp_path)
+    task = contract().model_copy(update={"sandbox_max_open_files": 1024})
+    assert task.model_dump(mode="json")["sandbox_max_open_files"] == 1024
+    assert coding.acceptance_contract_hash(task) != coding.acceptance_contract_hash(contract())
+    coding.build_coding(
+        campaign_config(repo), task, repo, store=InMemoryEventStore(), model=ScriptedModel([])
+    )
+    assert captured[0].limits.max_open_files == 1024
+    argv = Capturing(repo.root, config=captured[0])._docker_run_argv(  # pyright: ignore[reportPrivateUsage]
+        spec=captured[0].commands[0], container_name="limits-pin"
+    )
+    assert "nofile=1024:1024" in argv
+
+
+@pytest.mark.parametrize("value", [0, 63, 4097, "1024", True])
+def test_open_files_outside_operator_bounds_is_rejected(value: object) -> None:
+    with pytest.raises(ValidationError):
+        CodingTaskConfig.model_validate(
+            {**contract().model_dump(), "sandbox_max_open_files": value}
+        )
+
+
+def _inherit_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, same_patch: bool, run_status: str
+) -> tuple[coding.Runtime, list[ModelContext], GitWorkspace]:
+    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
+    repo = workspace(tmp_path)
+    contexts: list[ModelContext] = []
+
+    class RecordingModel(ScriptedModel):
+        def propose_action(self, context: ModelContext) -> ModelTurn:
+            contexts.append(context)
+            return super().propose_action(context)
+
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
+    runtime, _ = coding.build_coding(
+        config,
+        contract(),
+        repo,
+        store=InMemoryEventStore(),
+        model=RecordingModel(
+            [ActionProposal(ActionId("read"), "read_file", {"path": "src/add.py"})]
+        ),
+    )
+    tools = runtime.tools
+    assert isinstance(tools, coding.ConfinedCodingTools)
+    tools.feedback = execution.coding_feedback(
+        [
+            json.dumps(
+                {
+                    "run_id": "run_previous",
+                    "run_status": run_status,
+                    "last_verification": "command:check_regression: failed (assert 0 == 3)",
+                    "patch_sha256": coding.patch_identity(repo) if same_patch else "f" * 64,
+                }
+            )
+        ]
+    )
+    return runtime, contexts, repo
+
+
+def _packet(context: ModelContext, suffix: str) -> dict[str, object]:
+    return json.loads(next(i.content for i in context.items if str(i.item_id).endswith(suffix)))
+
+
+def test_fresh_run_inherits_known_failure_of_the_unchanged_candidate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, contexts, _ = _inherit_runtime(
+        tmp_path, monkeypatch, same_patch=True, run_status="failed"
+    )
+    state = RunState(RunId("fresh-inherit"), objective="Fix addition")
+    context = runtime.context.build_context(state)
+    packet = _packet(context, ":continuation-state")
+    assert cast("dict[str, object]", packet["workflow"])["phase"] == "repair"
+    feedback = _packet(context, ":feedback-state")
+    summary = cast("dict[str, str]", feedback["current_verification"])["summary"]
+    assert "FAILED" in summary
+    assert "assert 0 == 3" in summary
+    assert "run_previous" in summary
+    runtime.model.propose_action(context)
+    progress = _packet(contexts[-1], ":coding-progress")
+    assert progress["current_check_failure"] != "No check failure recorded in this attempt yet"
+
+
+@pytest.mark.parametrize(("same_patch", "run_status"), [(False, "failed"), (True, "succeeded")])
+def test_failure_of_a_different_or_passing_candidate_is_not_claimed_current(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, same_patch: bool, run_status: str
+) -> None:
+    runtime, contexts, _ = _inherit_runtime(
+        tmp_path, monkeypatch, same_patch=same_patch, run_status=run_status
+    )
+    state = RunState(RunId("fresh-other"), objective="Fix addition")
+    context = runtime.context.build_context(state)
+    packet = _packet(context, ":continuation-state")
+    assert cast("dict[str, object]", packet["workflow"])["phase"] == "verify"
+    feedback = _packet(context, ":feedback-state")
+    summary = cast("dict[str, str]", feedback["current_verification"])["summary"]
+    assert "FAILED" not in summary
+    assert "no earlier failure is recorded" in summary
+    runtime.model.propose_action(context)
+    progress = _packet(contexts[-1], ":coding-progress")
+    assert progress["current_check_failure"] == "No check failure recorded in this attempt yet"
+
+
+def _stalled_first_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[CampaignConfig, GitWorkspace, InMemoryEventStore, RunId]:
+    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
+    repo = workspace(tmp_path)
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
+    store = InMemoryEventStore()
+    runtime, _ = coding.build_coding(
+        config,
+        contract(),
+        repo,
+        store=store,
+        model=ScriptedModel(
+            [
+                ActionProposal(ActionId(f"read-{i}"), "read_file", {"path": "src/add.py"})
+                for i in range(20)
+            ]
+        ),
+        guidance_objective_sha256="a" * 64,
+    )
+    first = runtime.run("Fix addition")
+    assert any("CODING_NO_NEW_EVIDENCE" in str(e) for e in store.events_for(first.run_id))
+    return config, repo, store, first.run_id
+
+
+@pytest.mark.parametrize(("previous", "current"), [("a" * 64, "a" * 64), (None, "b" * 64)])
+def test_unchanged_patch_and_objective_retry_stays_blocked(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    previous: str | None,
+    current: str,
+) -> None:
+    config, repo, store, first = _stalled_first_run(tmp_path, monkeypatch)
+    successor, _ = coding.build_coding(
+        config,
+        contract(),
+        repo,
+        store=store,
+        model=ScriptedModel([]),
+        prior_runs=(first,),
+        prior_guidance={first: previous} if previous else {},
+        guidance_objective_sha256=current,
+    )
+    blocked = successor.run("Fix addition")
+    assert any("CODING_STALLED_RETRY" in str(e) for e in store.events_for(blocked.run_id))
+
+
+def test_revised_objective_permits_retry_of_unchanged_zero_edit_patch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config, repo, store, first = _stalled_first_run(tmp_path, monkeypatch)
+    successor, _ = coding.build_coding(
+        config,
+        contract(),
+        repo,
+        store=store,
+        model=ScriptedModel(
+            [
+                ActionProposal(
+                    ActionId("fix"),
+                    "write_file",
+                    {"path": "src/add.py", "content": "def add(a,b): return a+b\n"},
+                )
+            ]
+        ),
+        prior_runs=(first,),
+        prior_guidance={first: "a" * 64},
+        guidance_objective_sha256="b" * 64,
+    )
+    revised = successor.run("Fix addition")
+    events = store.events_for(revised.run_id)
+    assert not any("CODING_STALLED_RETRY" in str(e) for e in events)
+    assert any(isinstance(e, ActionProposed) for e in events)
+
+
+def test_guidance_identity_ignores_plan_wording_but_tracks_objective() -> None:
+    base = {"objective": "Fix the test", "latest_supervisor_plan_untrusted": "plan one"}
+    reworded = {**base, "latest_supervisor_plan_untrusted": "plan two"}
+    revised = {**base, "objective": "Revised: fix the CSS"}
+    sha = execution.guidance_objective_sha256
+    assert sha(json.dumps(base)) == sha(json.dumps(reworded))
+    assert sha(json.dumps(base)) != sha(json.dumps(revised))
+    assert sha(None) is None
+
+
+def test_completed_reads_keep_the_most_recent_not_alphabetically_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
+    repo = workspace(tmp_path)
+    contexts: list[ModelContext] = []
+
+    class RecordingModel(ScriptedModel):
+        def propose_action(self, context: ModelContext) -> ModelTurn:
+            contexts.append(context)
+            return super().propose_action(context)
+
+    paths = [f"src/z{i:02d}.py" for i in range(12)] + ["docs/api.md"]
+    for name in paths:
+        (repo.root / name).write_text(f"# {name}\n")
+    actions = [
+        ActionProposal(ActionId(f"r{i}"), "read_file", {"path": p}) for i, p in enumerate(paths)
+    ]
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
+    runtime, _ = coding.build_coding(
+        config,
+        contract(),
+        repo,
+        store=InMemoryEventStore(),
+        model=RecordingModel([*actions, actions[-1]]),
+    )
+    with pytest.raises(RuntimeError, match="exhausted"):
+        runtime.run("Fix addition")
+    progress = next(
+        json.loads(i.content)
+        for i in contexts[13].items
+        if str(i.item_id).endswith(":coding-progress")
+    )
+    recent = [path for path, _ in progress["completed_source_reads"]]
+    assert recent[-1] == "docs/api.md"
+    assert "src/z00.py" not in recent
+    assert len(recent) == 12

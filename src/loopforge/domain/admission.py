@@ -7,6 +7,9 @@ from enum import StrEnum
 class InputMeasurementBasis(StrEnum):
     UTF8_BYTE_UPPER_BOUND = "utf8_byte_upper_bound"
     TOKEN_COUNTER = "token_counter"
+    # Conservative ratio bound: serialized UTF-8 bytes / 2. Measured local Qwen
+    # requests average ~3.4 bytes per token, so this keeps large headroom.
+    UTF8_BYTES_PER_TOKEN_FLOOR_2 = "utf8_bytes_per_token_floor_2"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
