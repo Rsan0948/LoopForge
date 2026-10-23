@@ -47,6 +47,8 @@ class ReviewProgress(Protocol):
 
     def review_status(self) -> dict[str, object]: ...
 
+    def review_decided(self) -> str | None: ...
+
 
 class ReviewAction(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -102,6 +104,12 @@ class GeminiReviewModel:
         if datetime.now(UTC) >= PRICE_VALID_UNTIL:
             raise ModelTurnError(
                 ModelFailureClass.PERMANENT, "REVIEW_PRICING_EXPIRED", "Revalidate frontier pricing"
+            )
+        decided = self.progress.review_decided() if self.progress is not None else None
+        if decided is not None:
+            # Ends the run before another paid call; the report stays with the task.
+            raise ModelTurnError(
+                ModelFailureClass.PERMANENT, "REVIEW_CHANGES_REQUESTED", decided[:1000]
             )
         offered = self.progress.offered_tools() if self.progress is not None else None
         tools = tuple(t for t in self.tools if offered is None or t.name in offered) or self.tools

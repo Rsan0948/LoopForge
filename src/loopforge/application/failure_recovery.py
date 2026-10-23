@@ -18,6 +18,9 @@ def worker_failure(events: Sequence[DomainEvent]) -> FailureKind:  # noqa: PLR09
             failure = FailureKind.PROVIDER
             if event.reason_code in {"CODING_NO_NEW_EVIDENCE", "CODING_REPAIR_UNABLE"}:
                 failure = FailureKind.NO_PROGRESS
+            elif event.reason_code == "REVIEW_CHANGES_REQUESTED":
+                # A completed review found a defect in the patch: a verification outcome.
+                failure = FailureKind.VERIFICATION
             elif event.reason_code == "MODEL_INVALID_RESPONSE" or event.reason_code.startswith(
                 ("REPAIR_", "MODEL_TOOL_", "MODEL_ACTION_", "REVIEW_PROTOCOL_")
             ):

@@ -55,6 +55,17 @@ NOW = datetime(2026, 10, 20, tzinfo=UTC)
                 run_id=RunId("r"),
                 occurred_at=NOW,
                 sequence=1,
+                reason_code="REVIEW_CHANGES_REQUESTED",
+                summary="Review requested changes: 409 conflict assertion removed",
+            ),
+            FailureKind.VERIFICATION,
+        ),
+        (
+            ModelAttemptFailed(
+                event_id=EventId("e"),
+                run_id=RunId("r"),
+                occurred_at=NOW,
+                sequence=1,
                 reason_code="CONTEXT_ADMISSION",
                 summary="not admitted",
                 context_admission=ContextAdmission(

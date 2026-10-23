@@ -217,6 +217,7 @@ class ReviewTools:
         self.fragments: dict[tuple[str, int], dict[int, str]] = {}
         self.reference_columns: dict[str, int] = {}
         self.report: ReviewReport | None = None
+        self.report_completed = False
         self.required_intervals: dict[str, list[tuple[int, int]]] = {}
         self.finalize_when_covered = False
         self.require_new_evidence_after_report = False
@@ -240,6 +241,23 @@ class ReviewTools:
             self.post_coverage_calls is not None
             and self.covered_at is not None
             and self.calls >= self.covered_at + self.post_coverage_calls
+        )
+
+    def review_decided(self) -> str | None:
+        """A valid blocking report after the allowance ends the review: changes requested.
+
+        Without this, only submit_report remains and an unchanged blocking report
+        could be resubmitted indefinitely. The report is kept for the worker.
+        """
+        report = self.report
+        if report is None or not self.report_required():
+            return None
+        blocking = [f.title for f in report.findings if f.disposition != "rejected"]
+        if not blocking and not report.unresolved:
+            return None
+        return (
+            "Review requested changes: "
+            + "; ".join([*blocking, *(f"unresolved: {u}" for u in report.unresolved)])[:900]
         )
 
     def offered_tools(self) -> frozenset[str] | None:
@@ -510,6 +528,7 @@ class ReviewTools:
                 )
                 self.validate_report_quotes(report)
                 self.report = report
+                self.report_completed = bool(self.excerpts) and self.coverage_complete()
                 return ToolResult(ok=True, observation=report.model_dump_json())
             msg = "unexpected tool arguments"
             raise ValueError(msg)  # noqa: TRY301 - strict tool boundary
@@ -745,9 +764,12 @@ class ReviewStateContext:
 class CompletionAwareModel:
     """Stop before inference when authoritative events make review completion impossible."""
 
-    def __init__(self, model: ModelPort, store: StateStorePort) -> None:
+    def __init__(
+        self, model: ModelPort, store: StateStorePort, tools: ReviewTools | None = None
+    ) -> None:
         self.model = model
         self.store = store
+        self.tools = tools
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -755,6 +777,22 @@ class CompletionAwareModel:
 
     def propose_action(self, context: ModelContext) -> ModelTurn:
         state = replay(context.run_id, self.store.events_for(context.run_id))
+        # A valid, covered patch report completes review even when acceptance
+        # fails. Preserve its findings for the coding coordinator; another paid
+        # review turn cannot repair the candidate. Invalid/incomplete reports
+        # still use the existing bounded correction path.
+        if (
+            self.tools is not None
+            and self.tools.require_new_evidence_after_report
+            and self.tools.report is not None
+            and self.tools.report_completed
+        ):
+            raise ModelTurnError(
+                ModelFailureClass.PERMANENT,
+                "REVIEW_REPAIR_REQUIRED",
+                "Patch review completed without acceptance; preserve the report and return "
+                "its findings or failing checks to coding repair. Do not resubmit the report.",
+            )
         if "submit_report" in state.open_circuit_tools:
             raise ModelTurnError(
                 ModelFailureClass.PERMANENT,
@@ -1361,7 +1399,7 @@ def build_review(  # noqa: PLR0913 - explicit trusted workload context tuning
     if profile.conversation_mode == "state":
         context_port = ReviewStateContext(context_builder, tools)
     runtime = Runtime(
-        model=CompletionAwareModel(DeadlineAwareModel(selected, store, config), store),
+        model=CompletionAwareModel(DeadlineAwareModel(selected, store, config), store, tools),
         tools=tools,
         verifier=tools,
         store=store,

@@ -342,6 +342,28 @@ class ConfinedCodingTools:
                 continue
             if entry.get("patch_sha256") != patch_sha256 or entry.get("run_status") == "succeeded":
                 return None
+            report = entry.get("report")
+            if isinstance(report, dict):
+                review = cast("dict[str, object]", report)
+                findings = review.get("findings")
+                titles = [
+                    str(cast("dict[str, object]", f).get("title", ""))
+                    for f in (cast("list[object]", findings) if isinstance(findings, list) else [])
+                    if isinstance(f, dict)
+                ]
+                unresolved = review.get("unresolved")
+                return (
+                    f"Fixed checks passed, but the last review of this exact candidate (run "
+                    f"{entry.get('run_id', 'unknown')}) requested changes. Findings: "
+                    + ("; ".join(titles) or "none")
+                    + ". Unresolved: "
+                    + (
+                        "; ".join(map(str, cast("list[object]", unresolved)))
+                        if isinstance(unresolved, list) and unresolved
+                        else "none"
+                    )
+                    + ". Call review_feedback for the full report and evidence."
+                )
             return (
                 f"No check has run yet in this attempt. The last verification of this exact "
                 f"candidate (run {entry.get('run_id', 'unknown')}) FAILED:\n{summary}"
@@ -684,9 +706,10 @@ class CodingVerifier:
         self.last_failure: tuple[str, str] | None = None
         self.repetitions = 0
         self.blocked = False
+        self.checked: tuple[str, VerificationResult] | None = None
         self.starting_patch = patch_identity(workspace) if require_revision else None
 
-    def verify(self, state: RunState) -> VerificationResult:
+    def verify(self, state: RunState) -> VerificationResult:  # noqa: PLR0911 - ordered gates
         self.acceptance_receipt = None
         if acceptance_contract_hash(self.task) != self.contract_sha256:
             self.blocked = True
@@ -743,6 +766,17 @@ class CodingVerifier:
                     summary=f"Review admission blocked: {exc}; "
                     "reduce the patch or stop for decomposition",
                 )
+        identity = patch_identity(self.workspace)
+        if self.checked is not None and self.checked[0] == identity:
+            # Unchanged candidate: reuse its conclusive failing verdict instead of
+            # re-running every check and counting a strike. Runtime-triggered
+            # verifications after a failed read or an unrelated check must not end
+            # a run that is still investigating; stalls are bounded separately.
+            return replace(
+                self.checked[1],
+                summary=self.checked[1].summary
+                + "\nCandidate unchanged since this verification; edit to re-verify.",
+            )
         candidate = candidate_revision(self.workspace)
         result = self.verifier.verify(state)
         result = self._bind_acceptance(state, candidate, result)
@@ -761,6 +795,7 @@ class CodingVerifier:
                 + "\nCheck receipts: "
                 + json.dumps(self.receipts.history[-len(self.task.execution_checks) :]),
             )
+        self.checked = (identity, result) if not result.passed and not result.inconclusive else None
         return result
 
     def _bind_acceptance(

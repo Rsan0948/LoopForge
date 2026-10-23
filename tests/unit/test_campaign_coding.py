@@ -45,7 +45,7 @@ from loopforge.entrypoints.campaign_review import ReviewTools
 from loopforge.entrypoints.campaign_state_context import CodingStateContext
 from loopforge.ports.model import ModelPort, ModelToolSpec, ModelTurn
 from loopforge.ports.paid_budget import PaidBudgetPort
-from loopforge.ports.sandbox import SandboxCommandResult
+from loopforge.ports.sandbox import SandboxCommandResult, SandboxError
 from loopforge.ports.tools import ToolExecutionRequest
 from loopforge.ports.verifier import VerificationResult
 
@@ -1914,3 +1914,143 @@ def test_completed_reads_keep_the_most_recent_not_alphabetically_last(
     assert recent[-1] == "docs/api.md"
     assert "src/z00.py" not in recent
     assert len(recent) == 12
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_retry_completed_review_routes_to_repair_only(
+    completed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = workspace(tmp_path / "repo")
+    harness = CampaignHarness(tmp_path / "ledger")
+    campaign = harness.create(campaign_config(repo))
+
+    def ready(_task: CodingTaskConfig) -> None:
+        pass
+
+    monkeypatch.setattr(execution, "preflight", ready)
+    harness.coding.enqueue(campaign, "task", contract())
+    with harness.store.connect() as db:
+        for kind in ("start", "patched", "review"):
+            harness.coding.jobs.append(db, "task", CodingEvent(kind), "{}")
+        harness.coding.jobs.append(
+            db, "task", CodingEvent("failed"), json.dumps({"review_completed": completed})
+        )
+        before = harness.coding.jobs.config(db, "task")
+    result = harness.coding.command(
+        campaign, "task", CodingCommand(command="retry", evidence="Use recorded review outcome")
+    )
+    assert result["status"] == ("queued" if completed else "review_pending")
+    with harness.store.connect() as db:
+        state = harness.coding.jobs.state(db, "task")
+        assert (state.attempts, state.review_attempts) == (1, 1)
+        assert harness.coding.jobs.config(db, "task") == before
+
+
+def test_inherited_review_outcome_says_changes_requested_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, _, repo = _inherit_runtime(tmp_path, monkeypatch, same_patch=True, run_status="failed")
+    tools = runtime.tools
+    assert isinstance(tools, coding.ConfinedCodingTools)
+    tools.feedback = execution.coding_feedback(
+        [
+            json.dumps(
+                {
+                    "run_id": "run_review",
+                    "run_status": "failed",
+                    "last_verification": "command:check_regression: passed (exit_code=0)",
+                    "patch_sha256": coding.patch_identity(repo),
+                    "report": {
+                        "summary": "s",
+                        "findings": [{"title": "409 conflict assertion removed"}],
+                        "unresolved": [],
+                    },
+                }
+            )
+        ]
+    )
+    inherited = tools.inherited_failure(coding.patch_identity(repo))
+    assert inherited is not None
+    assert "requested changes" in inherited
+    assert "409 conflict assertion removed" in inherited
+    assert "FAILED" not in inherited
+
+
+def test_investigating_after_a_failed_check_is_not_blocked_as_a_repeated_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runs: list[str] = []
+
+    class CountingChecks(FakeChecks):
+        def run(
+            self, command_name: str, *, timeout_seconds: float | None = None
+        ) -> SandboxCommandResult:
+            runs.append(self.read_text("src/add.py"))
+            return super().run(command_name, timeout_seconds=timeout_seconds)
+
+    monkeypatch.setattr(coding, "ContainerSandbox", CountingChecks)
+    repo = workspace(tmp_path)
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
+    store = InMemoryEventStore()
+    actions = [
+        ActionProposal(
+            ActionId("wrong"),
+            "write_file",
+            {"path": "src/add.py", "content": "def add(a,b): return a-b\n"},
+        ),
+        # Mirrors the MLX-comparison control: failed read, a check, another failed read.
+        ActionProposal(ActionId("binary"), "read_file", {"path": "src/missing.py"}),
+        ActionProposal(ActionId("check"), "check_regression", {}),
+        ActionProposal(ActionId("again"), "read_file", {"path": "src/missing.py"}),
+        ActionProposal(
+            ActionId("fix"),
+            "write_file",
+            {"path": "src/add.py", "content": "def add(a,b): return a+b\n"},
+        ),
+    ]
+    runtime, _ = coding.build_coding(
+        config, contract(), repo, store=store, model=ScriptedModel(actions)
+    )
+    result = runtime.run("Fix addition")
+    assert result.status is RunStatus.SUCCEEDED
+    events = store.events_for(result.run_id)
+    assert not any("CODING_AUTOMATIC_CHECK_BLOCKED" in str(e) for e in events)
+    # Verifier checks physically ran once per distinct candidate; the explicit
+    # check_regression tool call ran its own command once.
+    assert runs.count("def add(a,b): return a-b\n") == 2
+    assert runs.count("def add(a,b): return a+b\n") == 1
+
+
+def test_checks_unavailable_still_block_immediately(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Unavailable(FakeChecks):
+        def run(
+            self, command_name: str, *, timeout_seconds: float | None = None
+        ) -> SandboxCommandResult:
+            del command_name, timeout_seconds
+            raise SandboxError("container runtime unavailable")
+
+    monkeypatch.setattr(coding, "ContainerSandbox", Unavailable)
+    repo = workspace(tmp_path)
+    store = InMemoryEventStore()
+    runtime, _ = coding.build_coding(
+        campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"}),
+        contract(),
+        repo,
+        store=store,
+        model=ScriptedModel(
+            [
+                ActionProposal(
+                    ActionId("edit"), "write_file", {"path": "src/add.py", "content": "x = 1\n"}
+                ),
+                *(
+                    ActionProposal(ActionId(f"r{i}"), "read_file", {"path": "src/add.py"})
+                    for i in range(3)
+                ),
+            ]
+        ),
+    )
+    result = runtime.run("Fix addition")
+    assert result.status is not RunStatus.SUCCEEDED
+    assert any("CODING_AUTOMATIC_CHECK_BLOCKED" in str(e) for e in store.events_for(result.run_id))

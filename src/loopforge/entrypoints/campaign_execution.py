@@ -577,6 +577,9 @@ class CodingCoordinator:
                     detail["acceptance_error"] = "No matching complete trusted acceptance receipt"
             if event == "review":
                 report = review_tools.report if review_tools is not None else None
+                detail["review_completed"] = bool(
+                    review_tools is not None and review_tools.report_completed
+                )
                 passed = passed and report is not None and before == patch_identity(workspace)
                 if report is not None:
                     detail["report"] = report.model_dump()
@@ -722,5 +725,16 @@ class CodingCoordinator:
                 if command.command == "retry" and state.failure_stage == "reviewing"
                 else command.command
             )
+            if event_kind == "retry_review":
+                failure = db.execute(
+                    "SELECT detail FROM coding_events WHERE task=? "
+                    "AND json_extract(event,'$.kind')='failed' ORDER BY sequence DESC LIMIT 1",
+                    (task,),
+                ).fetchone()
+                if failure and json.loads(failure["detail"]).get("review_completed") is True:
+                    # Runtime-owned completion receipt: a retry repairs the
+                    # candidate, rather than paying to repeat a completed review.
+                    event_kind = "request_changes"
+                    detail["command"] = "request_changes"
             self.jobs.append(db, task, CodingEvent(event_kind), json.dumps(detail))
             return {"id": task, "status": self.jobs.state(db, task).status}
