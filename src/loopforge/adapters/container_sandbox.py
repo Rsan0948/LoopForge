@@ -106,6 +106,7 @@ class ContainerSandboxConfig:
     tmpfs_bytes: int = 64 * 1024 * 1024
     user: str | None = None
     docker_executable: str = "docker"
+    workspace_read_only: bool = False
 
     def __post_init__(self) -> None:
         if not self.image.strip() or any(char.isspace() for char in self.image):
@@ -182,6 +183,7 @@ class ContainerSandbox:
         self._tmpfs_bytes = config.tmpfs_bytes
         self._user = config.user
         self._docker = config.docker_executable
+        self._workspace_read_only = config.workspace_read_only
         self._active_container: str | None = None
 
     @property
@@ -312,7 +314,8 @@ class ContainerSandbox:
             "--workdir",
             _WORKSPACE_MOUNT,
             "--mount",
-            f"type=bind,source={self._root},target={_WORKSPACE_MOUNT}",
+            f"type=bind,source={self._root},target={_WORKSPACE_MOUNT}"
+            + (",readonly" if self._workspace_read_only else ""),
         ]
         if self._user is not None:
             argv.extend(["--user", self._user])

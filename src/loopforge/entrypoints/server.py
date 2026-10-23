@@ -37,7 +37,13 @@ from loopforge.adapters.postgres_events import PostgresEventStore
 from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.application.provenance import build_provenance_graph, explain_provenance
 from loopforge.application.runtime import UnknownRunError
-from loopforge.domain.events import ApprovalRequested, ArtifactRecorded, Event, VerificationFailed
+from loopforge.domain.events import (
+    ApprovalRequested,
+    ArtifactRecorded,
+    Event,
+    VerificationFailed,
+    VerificationPassed,
+)
 from loopforge.domain.policies import PolicyLifecycle
 from loopforge.domain.provenance import ProvenanceNode, UnknownProvenanceNodeError
 from loopforge.domain.state import InvalidTransitionError
@@ -53,6 +59,8 @@ from loopforge.entrypoints.fsbrowse import (
     browse_directories,
     detect_harness,
 )
+from loopforge.entrypoints.goal_routes import goal_router
+from loopforge.entrypoints.goal_runner import GoalExecutionService
 from loopforge.entrypoints.policy import (
     PolicyRegistryConflictError,
     PolicyRegistryError,
@@ -120,6 +128,7 @@ class ServerSettings:
     sqlite_path: str = ".loopforge/server/events.db"
     data_dir: Path = Path(".loopforge/server")
     """Server-owned state: session registry and inline profiles live here."""
+    goals_dir: Path | None = None
     static_dir: Path | None = None
     """Optional built UI (``ui/dist``) mounted at ``/`` when it exists."""
     evals_dir: Path | None = None
@@ -377,9 +386,13 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
         bundle_factory or build_production_bundle_factory(profiles_dir),
     )
 
+    goal_execution = GoalExecutionService(settings.goals_dir or settings.data_dir / "goals")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        goal_execution.start()
         yield
+        goal_execution.close()
         manager.shutdown()
 
     app = FastAPI(title="loopforge operator server", lifespan=lifespan)
@@ -480,7 +493,10 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
                 latest = requested[-1]
                 pending = {"action_id": str(latest.action_id), "reason": latest.reason}
         proposal = state.current_proposal
-        last_failed = next((e for e in reversed(events) if isinstance(e, VerificationFailed)), None)
+        last_verification = next(
+            (e for e in reversed(events) if isinstance(e, VerificationPassed | VerificationFailed)),
+            None,
+        )
         budget: dict[str, object] | None = None
         if wiring is not None:
             budget = {
@@ -503,9 +519,10 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
             "total_tokens": state.total_tokens,
             "last_verification": state.last_verification,
             "last_verification_passed": state.last_verification_passed,
+            "last_verification_task_complete": state.last_verification_task_complete,
             "last_verification_score": state.last_verification_score,
             "last_verification_inconclusive": (
-                last_failed is not None and last_failed.inconclusive
+                isinstance(last_verification, VerificationFailed) and last_verification.inconclusive
             ),
             "plan": state.plan,
             "current_proposal": (
@@ -852,6 +869,11 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_websocket_route("/ws/sessions/{run_id}", session_stream_route)
 
     # Static UI mounts LAST, after every /api and /ws route is registered.
+
+    app.include_router(
+        goal_router(settings.goals_dir or settings.data_dir / "goals", goal_execution)
+    )
+
     if settings.static_dir is not None and Path(settings.static_dir).is_dir():
         app.mount(
             "/",

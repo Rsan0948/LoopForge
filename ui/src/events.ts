@@ -96,6 +96,8 @@ export interface CircuitOpenedPayload extends EventBase {
   reason_code: string;
 }
 export interface VerificationPassedPayload extends EventBase {
+  task_complete?: boolean;
+  score?: number | null;
   summary: string;
 }
 export interface VerificationFailedPayload extends EventBase {
@@ -118,7 +120,22 @@ export interface ArtifactRecordedPayload extends EventBase {
 export interface BudgetDebitedPayload extends EventBase {
   usage: UsageDelta;
 }
+export interface ContextAdmissionPayload {
+  measurement_basis: "utf8_byte_upper_bound" | "token_counter";
+  input_token_bound: number;
+  serialized_request_bytes: number;
+  context_window_tokens: number;
+  output_reserve_tokens: number;
+  framing_reserve_tokens: number;
+  compacted_turns: number;
+}
+export interface ModelAttemptFailedPayload extends EventBase {
+  reason_code: string;
+  summary: string;
+  context_admission?: ContextAdmissionPayload | null;
+}
 export interface ModelTurnRecordedPayload extends EventBase {
+  context_admission?: ContextAdmissionPayload | null;
   provider: string;
   model: string;
   action_id: string;
@@ -186,6 +203,7 @@ export type EventPayload =
   | ArtifactRecordedPayload
   | BudgetDebitedPayload
   | ModelTurnRecordedPayload
+  | ModelAttemptFailedPayload
   | ShadowDecisionRecordedPayload
   | ApprovalRequestedPayload
   | ApprovalGrantedPayload
@@ -261,7 +279,7 @@ export function describeEvent(envelope: EventEnvelope): { label: string; summary
       return { label: "Circuit opened", summary: `${p.tool_name}: ${p.reason_code}` };
     }
     case "VerificationPassed":
-      return { label: "Verification passed", summary: truncate((e as VerificationPassedPayload).summary, 120) };
+      return { label: (e as VerificationPassedPayload).task_complete === false ? "Checkpoint passed" : "Verification passed", summary: truncate((e as VerificationPassedPayload).summary, 120) };
     case "VerificationFailed": {
       const p = e as VerificationFailedPayload;
       const score = p.score === null ? "" : ` score=${p.score.toFixed(2)}`;
@@ -286,7 +304,13 @@ export function describeEvent(envelope: EventEnvelope): { label: string; summary
     }
     case "ModelTurnRecorded": {
       const p = e as ModelTurnRecordedPayload;
-      return { label: "Model turn", summary: `${p.provider}/${p.model}` };
+      const a = p.context_admission;
+      const measurement = a ? ` · ≤${a.input_token_bound} input (${a.measurement_basis === "utf8_byte_upper_bound" ? "byte estimate" : "counter"}) + ${a.output_reserve_tokens} output reserved · ${a.compacted_turns} compacted` : "";
+      return { label: "Model turn", summary: truncate(`${p.provider}/${p.model}${measurement}`, 160) };
+    }
+    case "ModelAttemptFailed": {
+      const p = e as ModelAttemptFailedPayload;
+      return { label: "Model attempt failed", summary: truncate(`${p.reason_code}: ${p.summary}`, 160) };
     }
     case "ShadowDecisionRecorded": {
       const p = e as ShadowDecisionRecordedPayload;

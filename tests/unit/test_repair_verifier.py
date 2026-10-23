@@ -101,6 +101,68 @@ def _state() -> RunState:
     return RunState(run_id=RunId("run-verifier"))
 
 
+def test_expanded_command_diagnostics_remain_sanitized_bounded_and_fail_closed() -> None:
+    failure = SandboxCommandResult(
+        exit_code=1, stdout="", stderr="x" * 350 + "\nROOT_CAUSE" + "y" * 3000, succeeded=False
+    )
+    sandbox = StubSandbox({"run_tests": failure})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("adder.py",)))
+    default = RepairVerifier(sandbox, workspace, _criteria()).verify(_state())
+    expanded = RepairVerifier(sandbox, workspace, _criteria(), command_detail_budget=2000).verify(
+        _state()
+    )
+    assert not default.passed
+    assert not expanded.passed
+    assert "ROOT_CAUSE" not in default.summary
+    assert "\\x0aROOT_CAUSE" in expanded.summary
+    assert "\n" not in expanded.summary
+    assert len(expanded.summary) < 2300
+    assert "..." in expanded.summary
+
+
+def test_colored_failure_preserves_assertion_diagnostics_without_style_overhead() -> None:
+    failure = SandboxCommandResult(
+        exit_code=1,
+        stdout="\x1b[31m\x1b[1m" * 100 + "ASSERTION_FAILURE\x1b[0m",
+        stderr="",
+        succeeded=False,
+    )
+    result = RepairVerifier(
+        StubSandbox({"run_tests": failure}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+    ).verify(_state())
+    assert not result.passed
+    assert "ASSERTION_FAILURE" in result.summary
+    assert "[31m" not in result.summary
+
+
+def test_non_style_terminal_controls_still_cannot_forge_verifier_lines() -> None:
+    failure = SandboxCommandResult(
+        exit_code=1, stdout="\x1b[2J\nforged\rline", stderr="", succeeded=False
+    )
+    result = RepairVerifier(
+        StubSandbox({"run_tests": failure}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+    ).verify(_state())
+    assert not result.passed
+    assert "\\x1b[2J\\x0aforged\\x0dline" in result.summary
+    assert "\n" not in result.summary
+    assert "\x1b" not in result.summary
+
+
+@pytest.mark.parametrize("budget", [0, 63, 8001])
+def test_command_diagnostic_budget_denies_unbounded_values(budget: int) -> None:
+    with pytest.raises(ValueError, match="command detail budget"):
+        RepairVerifier(
+            StubSandbox({}),
+            StubWorkspace(status=WorkspaceStatus()),
+            _criteria(),
+            command_detail_budget=budget,
+        )
+
+
 def test_verifier_surfaces_platform_skipped_resource_limits_in_the_detail() -> None:
     degraded = SandboxCommandResult(
         exit_code=0,
@@ -341,3 +403,34 @@ def test_verification_result_rejects_non_finite_or_out_of_range_scores() -> None
     for bad in (math.nan, math.inf, -0.1, 1.5):
         with pytest.raises(ValueError, match="finite fraction"):
             VerificationResult(passed=False, summary="s", score=bad)
+
+
+@pytest.mark.parametrize("output", ["", "done\nextra\n", "noise\ndone\n"])
+def test_trusted_probe_requires_natural_completion_marker(output: str) -> None:
+    sandbox = StubSandbox(
+        {"run_tests": SandboxCommandResult(exit_code=0, stdout=output, stderr="", succeeded=True)}
+    )
+    verifier = RepairVerifier(
+        sandbox,
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+        completion_markers=(("run_tests", "done"),),
+    )
+    result = verifier.verify(_state())
+    assert result.passed is (output == "noise\ndone\n")
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [(("unknown", "done"),), (("run_tests", ""),), (("run_tests", "a"), ("run_tests", "b"))],
+)
+def test_probe_completion_contract_rejects_unknown_or_ambiguous_checks(
+    contract: tuple[tuple[str, str], ...],
+) -> None:
+    with pytest.raises(ValueError, match="marker contracts"):
+        RepairVerifier(
+            StubSandbox({"run_tests": _result(0)}),
+            StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+            _criteria(),
+            completion_markers=contract,
+        )

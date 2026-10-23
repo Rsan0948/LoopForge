@@ -367,3 +367,33 @@ def test_spawned_events_carry_durable_worker_ownership() -> None:
     passed = [e for e in store.events_for(state.run_id) if isinstance(e, VerificationPassed)]
     assert passed
     assert passed[0].summary == "all green"
+
+
+def test_passing_integration_checkpoint_cannot_accept_an_incomplete_goal() -> None:
+    worker = FakeRuntime([RunStatus.SUCCEEDED])
+    instance, store = _orchestrator(
+        (_binding("only", worker),),
+        verifier=FakeVerifier(VerificationResult(True, "subset passed", task_complete=False)),
+    )
+    result = instance.run("Complete every acceptance criterion", "Run one bounded worker")
+    assert result.stop_reason is StopReason.FAILURE
+    events = store.events_for(result.run_id)
+    checkpoint = next(event for event in events if isinstance(event, VerificationPassed))
+    assert checkpoint.task_complete is False
+    assert any(
+        isinstance(event, RunStopped) and event.summary.startswith("MERGED_TASK_INCOMPLETE")
+        for event in events
+    )
+
+
+def test_unexecuted_integration_check_remains_inconclusive_in_durable_history() -> None:
+    instance, store = _orchestrator(
+        (_binding("only", FakeRuntime([RunStatus.SUCCEEDED])),),
+        verifier=FakeVerifier(
+            VerificationResult(False, "launcher unavailable", score=0, inconclusive=True)
+        ),
+    )
+    result = instance.run("Verify all outcomes", "Run one bounded worker")
+    assert result.stop_reason is StopReason.FAILURE
+    failure = next(e for e in store.events_for(result.run_id) if isinstance(e, VerificationFailed))
+    assert failure.inconclusive is True

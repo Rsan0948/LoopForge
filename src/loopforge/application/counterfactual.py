@@ -64,6 +64,9 @@ from loopforge.ports.tools import ToolResult
 from loopforge.ports.verifier import VerificationResult
 
 _VOLATILE_FIELDS = frozenset({"event_id", "run_id", "occurred_at", "sequence", "caused_by"})
+# A scripted redrive does not send a provider request. Preserve historical
+# measurements in the journal, but never fabricate measurements for the replay.
+_DIAGNOSTIC_FIELDS = frozenset({"context_admission"})
 
 
 class ReplayOutcome(StrEnum):
@@ -162,9 +165,13 @@ def extract_scripted_turns(events: tuple[Event, ...]) -> ScriptedTurns:
         if isinstance(event, ActionAuthorized):
             metadata.setdefault(event.tool_metadata.name, event.tool_metadata)
     verifications = tuple(
-        VerificationResult(passed=True, summary=event.summary)
+        VerificationResult(
+            passed=True, summary=event.summary, task_complete=event.task_complete, score=event.score
+        )
         if isinstance(event, VerificationPassed)
-        else VerificationResult(passed=False, summary=event.summary, score=event.score)
+        else VerificationResult(
+            passed=False, summary=event.summary, score=event.score, inconclusive=event.inconclusive
+        )
         for event in events
         if isinstance(event, (VerificationPassed, VerificationFailed))
     )
@@ -193,7 +200,7 @@ def _canonical_events(
             sorted(
                 (field.name, repr(getattr(event, field.name)))
                 for field in fields(event)
-                if field.name not in _VOLATILE_FIELDS
+                if field.name not in _VOLATILE_FIELDS | _DIAGNOSTIC_FIELDS
             )
         )
         canonical.append((type(event).__name__, body))

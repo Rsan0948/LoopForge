@@ -20,6 +20,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -485,6 +486,9 @@ def _catalog_examples() -> dict[type[Event], Event]:
         BudgetDebited: BudgetDebited(
             **_event_fields(16),
             usage=UsageDelta(cost_usd=0.01, input_tokens=10, output_tokens=5),
+        ),
+        ModelAttemptFailed: ModelAttemptFailed(
+            **_event_fields(26), reason_code="MODEL_INVALID_RESPONSE", summary="fixture"
         ),
         ModelTurnRecorded: ModelTurnRecorded(
             **_event_fields(24),

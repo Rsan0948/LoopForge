@@ -661,7 +661,8 @@ def _evidence_for(
     from the code-owned ``binding.checks`` (never scraped from the durable
     stream — see ``_check_names_from_checks``);
     ``passing_verification_summaries`` carries only the ``VerificationPassed``
-    summaries (the anti-forgery split the hook-evidence re-check trusts);
+    summary if the latest verification confirms whole-task completion. Earlier
+    passes and checkpoints remain diagnostic, never final acceptance receipts;
     ``naive_solution`` binds the known-wrong patch for the ambiguous-success
     category.
     """
@@ -688,7 +689,19 @@ def _evidence_for(
         for event in events
         if isinstance(event, VerificationPassed | VerificationFailed)
     )
-    passing = tuple(event.summary for event in events if isinstance(event, VerificationPassed))
+    latest_verification = next(
+        (
+            event
+            for event in reversed(events)
+            if isinstance(event, VerificationPassed | VerificationFailed)
+        ),
+        None,
+    )
+    passing = (
+        (latest_verification.summary,)
+        if isinstance(latest_verification, VerificationPassed) and latest_verification.task_complete
+        else ()
+    )
     naive: tuple[FixtureFile, ...] = ()
     if binding.spec.category is BenchmarkCategory.AMBIGUOUS_SUCCESS:
         naive = AMBIGUOUS_NAIVE_SOLUTION

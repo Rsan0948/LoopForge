@@ -21,6 +21,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -229,7 +230,9 @@ class Runtime:
         apply on entry and the same per-run drive state persists between
         cycles — so stepped and blocking drives are interchangeable.
         """
-        current = self._heal_for_drive(run_id)
+        current = (
+            self.state_for(run_id) if run_id in self._drive_states else self._heal_for_drive(run_id)
+        )
         if current.status.is_terminal or current.status is RunStatus.WAITING_FOR_APPROVAL:
             return current
         drive = self._drive_states.setdefault(run_id, _DriveState())
@@ -249,7 +252,7 @@ class Runtime:
         elif current.status is RunStatus.REFLECTING:
             self._persist_plan(
                 run_id,
-                "Resume after failed verification; choose a new bounded action.",
+                "Resume after verification; continue remaining work using its evidence.",
             )
         return self.state_for(run_id)
 
@@ -364,7 +367,7 @@ class Runtime:
             # post-execution path below.
             self._persist_plan(
                 run_id,
-                "Resume after failed verification; choose a new bounded action.",
+                "Resume after verification; continue remaining work using its evidence.",
             )
             current = self.state_for(run_id)
         action = self._approved_pending_action(current)
@@ -457,7 +460,7 @@ class Runtime:
             if verification_state.status is RunStatus.REFLECTING:
                 self._persist_plan(
                     run_id,
-                    "Previous verification failed; choose a new bounded action.",
+                    "Verification recorded; continue remaining work using its evidence.",
                 )
             return self.state_for(run_id)
 
@@ -482,7 +485,7 @@ class Runtime:
             return state.current_proposal
         return None
 
-    def _propose_turn(self, run_id: RunId, drive: _DriveState) -> ActionProposal | None:  # noqa: PLR0912, PLR0915 - the proposal path is intentionally one flat orchestration; span instrumentation pushes it over the thresholds
+    def _propose_turn(self, run_id: RunId, drive: _DriveState) -> ActionProposal | None:  # noqa: PLR0911, PLR0912, PLR0915 - the proposal path is intentionally one flat orchestration; span instrumentation pushes it over the thresholds
         """Run the routing/context/model/proposal half of one drive cycle.
 
         Returns the durably proposed action, or ``None`` when the run was
@@ -577,6 +580,36 @@ class Runtime:
                     turn.usage.cached_input_tokens
                 )
         except ModelTurnError as error:
+            failure_code, failure_summary = error.reason_code[:200], error.summary[:1000]
+            self._persist(
+                run_id,
+                lambda event_id, rid, occurred_at, sequence, admission=error.context_admission: (
+                    ModelAttemptFailed(
+                        event_id=event_id,
+                        run_id=rid,
+                        occurred_at=occurred_at,
+                        sequence=sequence,
+                        reason_code=failure_code,
+                        summary=failure_summary,
+                        context_admission=admission,
+                    )
+                ),
+            )
+            if error.usage is not None:
+                self._persist(
+                    run_id,
+                    lambda event_id, rid, occurred_at, sequence, usage=error.usage: BudgetDebited(
+                        event_id=event_id,
+                        run_id=rid,
+                        occurred_at=occurred_at,
+                        sequence=sequence,
+                        usage=usage,
+                    ),
+                )
+                decision = self.control.evaluate(self.state_for(run_id), now=self.clock.now())
+                if decision.stop_reason is not None:
+                    self._stop(run_id, decision.stop_reason, decision.reason_code)
+                    return None
             # Provider failures arrive normalized and classified by the
             # adapter; the runtime owns the stopping decision. Permanent
             # failures stop the run explicitly; transient failures retry
@@ -650,6 +683,7 @@ class Runtime:
                     provider=caps.provider,
                     model=caps.model,
                     action_id=aid,
+                    context_admission=turn.context_admission,
                 )
             ),
         )
@@ -1076,6 +1110,8 @@ class Runtime:
                     occurred_at=occurred_at,
                     sequence=sequence,
                     summary=verification.summary,
+                    task_complete=verification.task_complete,
+                    score=1.0 if verification.task_complete else verification.score,
                 ),
             )
         else:

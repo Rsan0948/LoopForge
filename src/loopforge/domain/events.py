@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.admission import ContextAdmission
 from loopforge.domain.artifacts import (
     ArtifactKind,
     validate_artifact_content,
@@ -156,6 +157,22 @@ class CircuitOpened(DomainEvent):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class VerificationPassed(DomainEvent):
     summary: str
+    task_complete: bool = True
+    score: float | None = 1.0
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if not isinstance(self.task_complete, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "verification task_complete must be a bool"
+            raise TypeError(msg)
+        if self.score is not None and (
+            isinstance(self.score, bool)
+            or not isinstance(self.score, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not 0.0 <= self.score <= 1.0
+            or not math.isfinite(self.score)
+        ):
+            msg = "verification score must be a finite fraction in [0, 1]"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -237,6 +254,26 @@ class BudgetDebited(DomainEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ModelAttemptFailed(DomainEvent):
+    """A normalized unsuccessful inference attempt, independent of tool actions."""
+
+    reason_code: str
+    summary: str
+    context_admission: ContextAdmission | None = None
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if self.context_admission is not None and not isinstance(
+            self.context_admission, ContextAdmission
+        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model context admission must be typed"
+            raise TypeError(msg)
+        if not self.reason_code.strip() or len(self.reason_code) > 200 or len(self.summary) > 1000:
+            msg = "model attempt failure fields exceed contract"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ModelTurnRecorded(DomainEvent):
     """Durable per-turn model-identity record (PACS-015).
 
@@ -251,9 +288,15 @@ class ModelTurnRecorded(DomainEvent):
     provider: str
     model: str
     action_id: ActionId
+    context_admission: ContextAdmission | None = None
 
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
+        if self.context_admission is not None and not isinstance(
+            self.context_admission, ContextAdmission
+        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model context admission must be typed"
+            raise TypeError(msg)
         if not isinstance(self.provider, str) or not self.provider.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             msg_11 = "model turn provider cannot be empty"
             raise ValueError(msg_11)
@@ -482,6 +525,7 @@ Event = (
     | ContextAssembled
     | ArtifactRecorded
     | BudgetDebited
+    | ModelAttemptFailed
     | ModelTurnRecorded
     | ShadowDecisionRecorded
     | ApprovalRequested

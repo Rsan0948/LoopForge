@@ -204,6 +204,8 @@ class DeepSeekModel(OllamaModel):
                     "tool_calls": normalized_calls,
                 },
                 "done": True,
+                "prompt_eval_count": response.usage.prompt_tokens,
+                "eval_count": response.usage.completion_tokens,
             }
         )
         action = self._parse_action(context, normalized)

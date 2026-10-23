@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any, Final, cast
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.admission import ContextAdmission, InputMeasurementBasis
 from loopforge.domain.artifacts import ArtifactKind
 from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
@@ -23,6 +24,7 @@ from loopforge.domain.events import (
     ContextAssembled,
     DomainEvent,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -66,6 +68,7 @@ from loopforge.domain.types import (
 )
 
 SCHEMA_VERSION: Final[int] = 1
+CHECKPOINT_SCHEMA_VERSION: Final[int] = 2
 
 _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
     cls.__name__: cls
@@ -86,6 +89,7 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         ContextAssembled,
         ArtifactRecorded,
         BudgetDebited,
+        ModelAttemptFailed,
         ModelTurnRecorded,
         ShadowDecisionRecorded,
         ApprovalRequested,
@@ -117,7 +121,11 @@ class JsonEventCodec:
 
     def encode(self, event: Event) -> str:
         envelope = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": (
+                CHECKPOINT_SCHEMA_VERSION
+                if isinstance(event, VerificationPassed) and not event.task_complete
+                else SCHEMA_VERSION
+            ),
             "event_type": type(event).__name__,
             "event": _to_jsonable(asdict(event)),
         }
@@ -131,7 +139,14 @@ class JsonEventCodec:
         raw = cast(dict[str, Any], parsed)
 
         version = raw.get("schema_version")
-        if not isinstance(version, int) or isinstance(version, bool) or version != SCHEMA_VERSION:
+        is_checkpoint = (
+            raw.get("event_type") == "VerificationPassed" and version == CHECKPOINT_SCHEMA_VERSION
+        )
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or (version != SCHEMA_VERSION and not is_checkpoint)
+        ):
             msg = f"unsupported event schema version: {version!r}"
             raise UnsupportedEventSchemaError(msg)
 
@@ -141,6 +156,13 @@ class JsonEventCodec:
             raise UnknownEventTypeError(msg)
 
         event_data = _required_object(raw, "event")
+        checkpoint_flag = event_data.get("task_complete")
+        if event_type == "VerificationPassed" and (
+            (is_checkpoint and checkpoint_flag is not False)
+            or (version == SCHEMA_VERSION and checkpoint_flag is False)
+        ):
+            msg = "passing checkpoints require schema version 2 and task_complete=false"
+            raise UnsupportedEventSchemaError(msg)
         return _construct_event(event_type, event_data)
 
 
@@ -280,7 +302,14 @@ def _construct_circuit_opened(base: dict[str, Any], data: dict[str, Any]) -> Eve
 
 
 def _construct_verification_passed(base: dict[str, Any], data: dict[str, Any]) -> Event:
-    return VerificationPassed(**base, summary=_required_str(data, "summary"))
+    return VerificationPassed(
+        **base,
+        summary=_required_str(data, "summary"),
+        task_complete=_optional_bool(data, "task_complete", default=True),
+        score=(None if data.get("score", 1.0) is None else _required_number(data, "score"))
+        if "score" in data
+        else 1.0,
+    )
 
 
 def _construct_verification_failed(base: dict[str, Any], data: dict[str, Any]) -> Event:
@@ -367,6 +396,36 @@ def _construct_artifact_recorded(base: dict[str, Any], data: dict[str, Any]) -> 
     )
 
 
+def _context_admission(data: dict[str, Any]) -> ContextAdmission | None:
+    if data.get("context_admission") is None:
+        return None
+    record = _required_object(data, "context_admission")
+    counts = {
+        "input_token_bound",
+        "serialized_request_bytes",
+        "context_window_tokens",
+        "output_reserve_tokens",
+        "framing_reserve_tokens",
+        "compacted_turns",
+    }
+    if set(record) != counts | {"measurement_basis"}:
+        msg = "invalid context admission fields"
+        raise ValueError(msg)
+    return ContextAdmission(
+        measurement_basis=InputMeasurementBasis(_required_str(record, "measurement_basis")),
+        **{name: _required_int(record, name) for name in counts},
+    )
+
+
+def _construct_model_attempt_failed(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ModelAttemptFailed(
+        **base,
+        reason_code=_required_str(data, "reason_code"),
+        summary=_required_str(data, "summary"),
+        context_admission=_context_admission(data),
+    )
+
+
 def _construct_budget_debited(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return BudgetDebited(**base, usage=_usage(_required_object(data, "usage")))
 
@@ -449,6 +508,7 @@ def _construct_model_turn_recorded(base: dict[str, Any], data: dict[str, Any]) -
         provider=_required_str(data, "provider"),
         model=_required_str(data, "model"),
         action_id=ActionId(_required_str(data, "action_id")),
+        context_admission=_context_admission(data),
     )
 
 
@@ -480,6 +540,7 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "ContextAssembled": _construct_context_assembled,
     "ArtifactRecorded": _construct_artifact_recorded,
     "BudgetDebited": _construct_budget_debited,
+    "ModelAttemptFailed": _construct_model_attempt_failed,
     "ModelTurnRecorded": _construct_model_turn_recorded,
     "ShadowDecisionRecorded": _construct_shadow_decision_recorded,
     "ApprovalRequested": _construct_approval_requested,

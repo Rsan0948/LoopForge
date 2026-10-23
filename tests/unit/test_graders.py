@@ -14,6 +14,7 @@ contract). All streams are hand-built durable event tuples in the
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
@@ -686,3 +687,34 @@ def test_trial_without_success_stop_is_neither_success_nor_false_success() -> No
 def test_trial_success_requires_at_least_one_grader_result() -> None:
     assert trial_is_success((), _success_stream()) is False
     assert trial_is_false_success((), _success_stream()) is False
+
+
+def test_verified_success_rejects_a_forged_success_after_only_a_passing_checkpoint() -> None:
+    checkpoint = replace(_passed(2), task_complete=False, score=0.5)
+    events = (_started(1), checkpoint, _stop(3, StopReason.SUCCESS_VERIFIED, "claimed complete"))
+    result = _grade(GraderId.VERIFIED_SUCCESS, events, _evidence())
+    assert result.verdict is GraderVerdict.FAIL
+
+
+@pytest.mark.parametrize("latest", ["checkpoint", "failed"])
+def test_verified_success_rejects_superseded_whole_task_verification(latest: str) -> None:
+    final = (
+        replace(_passed(3), task_complete=False, score=0.5)
+        if latest == "checkpoint"
+        else _failed_verification(3, "acceptance fails")
+    )
+    events = (_started(1), _passed(2), final, _stop(4, StopReason.SUCCESS_VERIFIED))
+    result = _grade(GraderId.VERIFIED_SUCCESS, events, _evidence())
+    assert result.verdict is GraderVerdict.FAIL
+
+
+@pytest.mark.parametrize("receipt", ["foreign_run", "after_stop"])
+def test_verified_success_rejects_unrelated_or_future_receipts(receipt: str) -> None:
+    verification = _passed(2)
+    if receipt == "foreign_run":
+        verification = replace(verification, run_id=RunId("other-run"))
+    else:
+        verification = replace(verification, sequence=4)
+    events = (_started(1), verification, _stop(3, StopReason.SUCCESS_VERIFIED))
+    result = _grade(GraderId.VERIFIED_SUCCESS, events, _evidence())
+    assert result.verdict is GraderVerdict.FAIL

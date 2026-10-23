@@ -14,7 +14,7 @@ model-supplied pattern can cause regex denial of service.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
@@ -91,6 +91,7 @@ class WorkspaceFileTools:
         root: str | Path,
         *,
         limits: FileToolLimits | None = None,
+        path_allowed: Callable[[str], bool] | None = None,
     ) -> None:
         self._sandbox = sandbox
         self._root = Path(root).resolve()
@@ -98,6 +99,7 @@ class WorkspaceFileTools:
             msg = "file tools root must be an existing directory"
             raise ValueError(msg)
         self._limits = limits or FileToolLimits()
+        self._path_allowed = path_allowed
         self._metadata = {
             _READ_FILE: _tool_metadata(
                 _READ_FILE,
@@ -175,6 +177,9 @@ class WorkspaceFileTools:
         truncated = False
         unreadable = 0
         for candidate in self._iter_workspace_files():
+            relative = candidate.relative_to(self._root).as_posix()
+            if self._path_allowed is not None and not self._path_allowed(relative):
+                continue
             try:
                 if candidate.stat().st_size > self._limits.max_file_bytes:
                     continue
@@ -188,7 +193,6 @@ class WorkspaceFileTools:
                 if query not in line:
                     continue
                 rendered = line[:_MAX_LINE_RENDER]
-                relative = candidate.relative_to(self._root).as_posix()
                 matches.append(f"{relative}:{line_number}: {rendered}")
                 if len(matches) >= self._limits.max_results:
                     truncated = True

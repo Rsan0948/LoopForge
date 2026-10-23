@@ -25,12 +25,16 @@ from __future__ import annotations
 
 import json
 import math
-from typing import Final
+import re
+from collections.abc import Callable
+from typing import Final, Literal, cast
 
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
+from loopforge.adapters.ollama_usage import ProviderRequestTracker, known_usage
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.admission import ContextAdmission, InputMeasurementBasis
 from loopforge.domain.context import ContextItem, ModelContext
 from loopforge.domain.prompts import PromptTemplate, RenderedPrompt, render_prompt
 from loopforge.domain.routing import ModelCapabilities
@@ -52,33 +56,40 @@ class _FunctionCall(BaseModel):
     # strictness applies to the semantic contract validated below. Models
     # routinely omit ``arguments`` (or emit null) for zero-parameter tools;
     # both normalize to an empty argument mapping.
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     name: str
     arguments: dict[StrictStr, StrictStr] | None = None
 
 
 class _ToolCall(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     function: _FunctionCall
 
 
 class _ResponseMessage(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     role: str
     content: str = ""
     tool_calls: list[_ToolCall] | None = None
+    thinking: str = Field(default="", max_length=100_000)
 
 
 class ChatResponse(BaseModel):
-    model_config = ConfigDict(extra="ignore")
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     message: _ResponseMessage
     done: bool
-    prompt_eval_count: int = Field(default=0, ge=0)
-    eval_count: int = Field(default=0, ge=0)
+    prompt_eval_count: int = Field(ge=0)
+    eval_count: int = Field(ge=0)
+
+
+class _ProviderError(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    error: str = Field(max_length=8192)
 
 
 class OllamaModel:
@@ -92,7 +103,7 @@ class OllamaModel:
     runtime's synchronous control loop.
     """
 
-    def __init__(  # noqa: PLR0913 - keyword-only wiring keeps every adapter dependency explicit
+    def __init__(  # noqa: PLR0912, PLR0913, PLR0915 - explicit provider wiring and validation
         self,
         *,
         model: str,
@@ -103,8 +114,28 @@ class OllamaModel:
         timeout_seconds: float = 300.0,
         capabilities: ModelCapabilities | None = None,
         temperature: float = 0.0,
+        max_output_tokens: int | None = None,
+        thinking: bool | None = None,
+        max_history_chars: int | None = None,
+        history_overflow: Literal["trim", "fail"] = "trim",
+        context_window_tokens: int | None = None,
         transport: httpx.BaseTransport | None = None,
+        sampling_options: dict[str, float | int] | None = None,
+        preserve_thinking: bool = False,
+        keep_alive: str = "5m",
+        request_token_counter: Callable[[dict[str, object]], int] | None = None,
+        conversation_mode: Literal["history", "state"] = "history",
+        tool_filter: Callable[[ModelContext], frozenset[str]] | None = None,
+        tool_spec_filter: Callable[[ModelContext, ModelToolSpec], ModelToolSpec] | None = None,
     ) -> None:
+        if conversation_mode not in {"history", "state"}:
+            msg = "conversation_mode must be history or state"
+            raise ValueError(msg)
+        if conversation_mode == "state" and preserve_thinking:
+            msg = "state mode cannot retain model thinking"
+            raise ValueError(msg)
+        self._conversation_mode = conversation_mode
+        self._protocol_feedback: dict[RunId, str] = {}
         if not model.strip():
             msg = "ollama model name cannot be empty"
             raise ValueError(msg)
@@ -121,6 +152,15 @@ class OllamaModel:
         if not math.isfinite(temperature) or temperature < 0:
             msg_5 = "ollama temperature must be finite and non-negative"
             raise ValueError(msg_5)
+        _validate_generation(max_output_tokens, thinking, max_history_chars)
+        if history_overflow not in {"trim", "fail"}:
+            msg = "history_overflow must be trim or fail"
+            raise ValueError(msg)
+        if context_window_tokens is not None and (
+            type(context_window_tokens) is not int or context_window_tokens < 1024
+        ):
+            msg = "context_window_tokens must be an integer of at least 1024"
+            raise ValueError(msg)
         try:
             parsed_url = httpx.URL(base_url)
         except httpx.InvalidURL as exc:
@@ -154,9 +194,39 @@ class OllamaModel:
             context_window_tokens=131_072,
         )
         self._tools = tools
+        self._tool_filter = tool_filter
+        self._tool_spec_filter = tool_spec_filter
         self._template = template
+        self.request_tracker = ProviderRequestTracker()
+        self.request_recorder: Callable[[dict[str, object]], None] | None = None
+        self.request_timeout_seconds = timeout_seconds
         self._turn_count = 0
+        allowed_options = {"top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"}
+        if sampling_options is not None and (
+            set(sampling_options) - allowed_options
+            or any(
+                type(v) not in {int, float} or not math.isfinite(v) or v < 0
+                for v in sampling_options.values()
+            )
+        ):
+            msg = "invalid code-owned sampling options"
+            raise ValueError(msg)
+        self._sampling_options = dict(sampling_options or {})
+        self._preserve_thinking = preserve_thinking
+        self._keep_alive = keep_alive
+        self._request_token_counter = request_token_counter
+        self._history_compactions: dict[RunId, int] = {}
         self._temperature = temperature
+        self._max_output_tokens = max_output_tokens
+        self._thinking = thinking
+        self._max_history_chars = max_history_chars
+        self._history_overflow = history_overflow
+        self._context_window_tokens = context_window_tokens
+        if context_window_tokens is not None and (
+            context_window_tokens > self._capabilities.context_window_tokens
+        ):
+            msg = "requested context exceeds model capability window"
+            raise ValueError(msg)
         # Per-run conversation state. Tool results must reach the provider as
         # structured tool messages — a flattened text observation makes models
         # re-issue the same read instead of acting on the result. State is
@@ -166,6 +236,7 @@ class OllamaModel:
         self._conversations: dict[RunId, list[dict[str, object]]] = {}
         self._seen_items: dict[RunId, set[tuple[str, str]]] = {}
         self._pending_calls: dict[RunId, str] = {}
+        self._thinking_exhausted: set[RunId] = set()
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         self._client = httpx.Client(
             base_url=base_url,
@@ -179,12 +250,37 @@ class OllamaModel:
         return self._capabilities
 
     def close(self) -> None:
+        self._protocol_feedback.clear()
         self._conversations.clear()
         self._seen_items.clear()
         self._pending_calls.clear()
+        self._thinking_exhausted.clear()
         self._client.close()
 
+    def _selected_tools(self, context: ModelContext) -> tuple[ModelToolSpec, ...]:
+        selected_tools = self._tools
+        if self._tool_filter is not None:
+            names = self._tool_filter(context)
+            if not names or not names <= {tool.name for tool in self._tools}:
+                raise ModelTurnError(
+                    ModelFailureClass.PERMANENT,
+                    "MODEL_TOOL_FILTER_INVALID",
+                    "Code-owned tool filtering must select a nonempty registered subset",
+                )
+            selected_tools = tuple(tool for tool in self._tools if tool.name in names)
+        if self._tool_spec_filter is not None:
+            filtered = tuple(self._tool_spec_filter(context, spec) for spec in selected_tools)
+            if tuple(spec.name for spec in filtered) != tuple(s.name for s in selected_tools):
+                raise ModelTurnError(
+                    ModelFailureClass.PERMANENT,
+                    "MODEL_TOOL_FILTER_INVALID",
+                    "Code-owned schema filtering must preserve registered tool identities",
+                )
+            selected_tools = filtered
+        return selected_tools
+
     def propose_action(self, context: ModelContext) -> ModelTurn:
+        selected_tools = self._selected_tools(context)
         rendered = self._render(context)
         messages = self._conversation(context, rendered)
         self._turn_count += 1
@@ -201,28 +297,217 @@ class OllamaModel:
                         "parameters": spec.parameters,
                     },
                 }
-                for spec in self._tools
+                for spec in selected_tools
             ],
             "options": {"temperature": self._temperature},
         }
-        response = self._post(payload)
-        action = self._parse_action(context, response)
+        if self._max_output_tokens is not None:
+            payload["options"] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_output_tokens,
+            }
+        if self._thinking is not None:
+            payload["think"] = self._thinking and context.run_id not in self._thinking_exhausted
+        if self._context_window_tokens is not None:
+            options = {"temperature": self._temperature, "num_ctx": self._context_window_tokens}
+            options["num_predict"] = self._max_output_tokens or 2048
+            payload["options"] = options
+        payload["keep_alive"] = self._keep_alive
+        options = payload["options"]
+        assert isinstance(options, dict)
+        cast("dict[str, object]", options).update(self._sampling_options)
+        effective_output_limit = self._max_output_tokens or (
+            2048 if self._context_window_tokens is not None else None
+        )
+        admission = self._admit_request(payload, messages, context)
+        try:
+            response = self._post(payload)
+        except ModelTurnError as error:
+            if self._conversation_mode == "state":
+                self._protocol_feedback[context.run_id] = (
+                    "Previous provider response failed validation; no action executed. "
+                    "Return exactly ONE schema-valid native tool call. Authority is unchanged."
+                )
+            error.context_admission = admission
+            if error.reason_code == "MODEL_TOOL_PARSE":
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Protocol correction: the provider rejected the previous tool-call "
+                            "syntax; no action executed. Return exactly ONE well-formed native "
+                            "tool call with schema-valid arguments. Do not emit hand-written "
+                            "XML tags, prose or multiple tool calls. Tool permissions, budgets "
+                            "and checks are unchanged."
+                        ),
+                    }
+                )
+            raise
         usage = UsageDelta(
             cost_usd=self._cost(response),
             input_tokens=response.prompt_eval_count,
             output_tokens=response.eval_count,
         )
-        return ModelTurn(action=action, usage=usage)
+        try:
+            action = self._parse_action(context, response)
+        except ModelTurnError as error:
+            if self._conversation_mode == "state":
+                self._protocol_feedback[context.run_id] = (
+                    "Previous response did not contain exactly one valid native action; "
+                    "no action executed. Return ONE schema-valid tool call, then wait."
+                )
+            summary = error.summary
+            if (
+                self._thinking is True
+                and effective_output_limit is not None
+                and response.eval_count >= effective_output_limit
+                and not response.message.tool_calls
+            ):
+                self._thinking_exhausted.add(context.run_id)
+                self.request_tracker.note("thinking_disabled_after_output_exhaustion")
+                summary += (
+                    "; output allowance exhausted without an action; next calls disable thinking"
+                )
+            raise ModelTurnError(
+                error.failure_class,
+                error.reason_code,
+                summary,
+                usage=usage,
+                context_admission=admission,
+            ) from error
+        self._protocol_feedback.pop(context.run_id, None)
+        return ModelTurn(action=action, usage=usage, context_admission=admission)
+
+    def _admit_request(
+        self, payload: dict[str, object], messages: list[dict[str, object]], context: ModelContext
+    ) -> ContextAdmission | None:
+        """Measure the final request and compact complete turns inside its fixed envelope."""
+        if self._context_window_tokens is None:
+            return None
+        output_reserve = self._max_output_tokens or 2048
+        while True:
+            serialized_bytes = len(
+                json.dumps(
+                    payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
+                ).encode()
+            )
+            count = (
+                serialized_bytes
+                if self._request_token_counter is None
+                else self._request_token_counter(payload)
+            )
+            if type(count) is not int or count < 0:
+                msg = "request token counter returned invalid occupancy"
+                raise ValueError(msg)
+            admission = ContextAdmission(
+                measurement_basis=(
+                    InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND
+                    if self._request_token_counter is None
+                    else InputMeasurementBasis.TOKEN_COUNTER
+                ),
+                input_token_bound=count,
+                serialized_request_bytes=serialized_bytes,
+                context_window_tokens=self._context_window_tokens,
+                output_reserve_tokens=output_reserve,
+                framing_reserve_tokens=1024,
+                compacted_turns=self._history_compactions.get(context.run_id, 0),
+            )
+            if admission.admitted:
+                self.request_tracker.record_admission(admission)
+                return admission
+            if (
+                self._conversation_mode == "state"
+                or self._history_overflow == "fail"
+                or not self._compact_history(messages, context)
+            ):
+                self.request_tracker.record_admission(admission)
+                raise ModelTurnError(
+                    ModelFailureClass.PERMANENT,
+                    "MODEL_CONTEXT_LIMIT",
+                    "Required prompt, tools and latest complete turn exceed context envelope",
+                    context_admission=admission,
+                )
+            payload["messages"] = list(messages)
+
+    def _compact_history(self, history: list[dict[str, object]], context: ModelContext) -> bool:
+        """Drop complete older turns, preserving authority and current blockers.
+
+        This uses the actual serialized request envelope, including tools and
+        UTF-8 expansion. No model-written summary replaces source evidence.
+        """
+        assistants = [i for i in range(2, len(history)) if history[i].get("role") == "assistant"]
+        if len(assistants) < 2:
+            return False
+        del history[assistants[0] : assistants[1]]
+        self._history_compactions[context.run_id] = (
+            self._history_compactions.get(context.run_id, 0) + 1
+        )
+        prefix = "Runtime history compaction: "
+        preserved = "\n".join(
+            f"- ({item.trust.value}) {item.content}"
+            for item in context.items
+            if item.trust in {TrustClass.RUNTIME_POLICY, TrustClass.AUTHORIZED_HUMAN}
+            or str(item.item_id).rsplit(":", 1)[-1]
+            in {
+                "blockers",
+                "coding-contract",
+                "coding-progress",
+                "verifier-failure",
+                "confirmed-fact",
+                "pending-approval",
+                "irreversible-action",
+            }
+        )
+        notice: dict[str, object] = {
+            "role": "user",
+            "content": prefix + "older complete action/result turns were omitted to fit "
+            "the unchanged request envelope. Original objective and latest turn remain. "
+            "Earlier source observations may be absent: reread needed source; never infer "
+            "unseen evidence. Permissions, checks, approvals and budgets are unchanged. "
+            "Current runtime facts retain their trust labels:\n" + preserved,
+        }
+        if (
+            len(history) > 2
+            and history[2].get("role") == "user"
+            and str(history[2].get("content", "")).startswith(prefix)
+        ):
+            history[2] = notice
+        else:
+            history.insert(2, notice)
+        return True
 
     def drop_conversation(self, run_id: RunId) -> None:
         """Discard conversation state for a finished run (memory hygiene)."""
+        self._protocol_feedback.pop(run_id, None)
         self._conversations.pop(run_id, None)
         self._seen_items.pop(run_id, None)
         self._pending_calls.pop(run_id, None)
+        self._history_compactions.pop(run_id, None)
 
     def _conversation(
         self, context: ModelContext, rendered: RenderedPrompt
     ) -> list[dict[str, object]]:
+        if self._conversation_mode == "state":
+            # The request is rebuilt from the current projection, not prior chat.
+            # Audit history remains in the event store; no model summary replaces it.
+            messages: list[dict[str, object]] = [
+                {"role": "system", "content": rendered.stable_prefix},
+                {"role": "user", "content": rendered.dynamic_suffix or "No current state items."},
+            ]
+            correction = self._protocol_feedback.get(context.run_id)
+            if correction is not None:
+                messages.append({"role": "user", "content": correction})
+            if (
+                self._max_history_chars is not None
+                and len(json.dumps(messages, ensure_ascii=False)) > self._max_history_chars
+            ):
+                raise ModelTurnError(
+                    ModelFailureClass.PERMANENT,
+                    "MODEL_CONTEXT_LIMIT",
+                    "Current state packet exceeds its fixed envelope; narrow the node",
+                )
+            self.request_tracker.note("fresh_state_request_no_chat_replay")
+            return messages
         history: list[dict[str, object]] | None = self._conversations.get(context.run_id)
         seen = self._seen_items.setdefault(context.run_id, set())
         new_items = [item for item in context.items if (item.item_id, item.content) not in seen]
@@ -238,6 +523,20 @@ class OllamaModel:
         else:
             self._append_turn_delta(context, history, new_items)
         seen.update((item.item_id, item.content) for item in context.items)
+        if self._max_history_chars is not None:
+            while len(json.dumps(history, ensure_ascii=False)) > self._max_history_chars:
+                if self._history_overflow == "fail":
+                    raise ModelTurnError(
+                        ModelFailureClass.PERMANENT,
+                        "MODEL_CONTEXT_LIMIT",
+                        "Append-only conversation exceeds history limit; start a smaller unit",
+                    )
+                if not self._compact_history(history, context):
+                    raise ModelTurnError(
+                        ModelFailureClass.PERMANENT,
+                        "MODEL_CONTEXT_LIMIT",
+                        "System prompt, current facts and latest turn exceed history limit",
+                    )
         return history
 
     def _append_turn_delta(
@@ -266,7 +565,7 @@ class OllamaModel:
                 if observations
                 else "No new observation was recorded for the proposed action."
             )
-            history.append({"role": "tool", "name": pending, "content": result})
+            history.append({"role": "tool", "tool_name": pending, "content": result})
             new_items = [item for item in new_items if item not in observations]
         if new_items:
             lines = "\n".join(f"- ({item.trust.value}) {item.content}" for item in new_items)
@@ -287,8 +586,16 @@ class OllamaModel:
         return render_prompt(self._template, context, role=context.role)
 
     def _post(self, payload: dict[str, object]) -> ChatResponse:
+        if self.request_recorder is not None:
+            self.request_recorder(payload)
         try:
-            raw = self._client.post(_CHAT_PATH, json=payload)
+            self.request_tracker.begin(self.request_timeout_seconds, "controller")
+            try:
+                raw = self._client.post(
+                    _CHAT_PATH, json=payload, timeout=self.request_timeout_seconds
+                )
+            finally:
+                self.request_tracker.end()
         except httpx.TimeoutException as exc:
             msg = f"provider request timed out: {type(exc).__name__}"
             raise ModelTurnError(
@@ -311,6 +618,24 @@ class OllamaModel:
                 ModelFailureClass.TRANSIENT, "MODEL_UNAVAILABLE", _bounded(msg)
             ) from exc
         if raw.status_code != 200:
+            if raw.status_code == 500 and len(raw.content) <= 8192:
+                try:
+                    error = _ProviderError.model_validate_json(raw.content).error.lower()
+                except ValueError:
+                    error = ""
+                if ("pars" in error and "tool call" in error) or re.fullmatch(
+                    r"xml syntax error on line [1-9][0-9]*: "
+                    r"element <function> closed by </parameter>",
+                    error,
+                ):
+                    # Inspect only for a fixed error category. Never echo the
+                    # provider body, which may include prompt or secret text.
+                    raise ModelTurnError(
+                        ModelFailureClass.TRANSIENT,
+                        "MODEL_TOOL_PARSE",
+                        "Provider rejected generated tool-call syntax (HTTP 500); "
+                        "no action executed; usage unavailable",
+                    )
             self._raise_for_status(raw.status_code)
         try:
             data = raw.json()
@@ -320,15 +645,24 @@ class OllamaModel:
                 ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg
             ) from exc
         try:
+            self.request_tracker.record(data)
             parsed = ChatResponse.model_validate(data)
         except ValidationError as exc:
             msg = f"provider response violated the chat schema: {exc.error_count()} errors"
             raise ModelTurnError(
-                ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", _bounded(msg)
+                ModelFailureClass.TRANSIENT,
+                "MODEL_INVALID_RESPONSE",
+                _bounded(msg),
+                usage=known_usage(data),
             ) from exc
         if not parsed.done:
             msg_2 = "provider response was not a completed generation"
-            raise ModelTurnError(ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg_2)
+            raise ModelTurnError(
+                ModelFailureClass.TRANSIENT,
+                "MODEL_INVALID_RESPONSE",
+                msg_2,
+                usage=known_usage(data),
+            )
         return parsed
 
     @staticmethod
@@ -353,6 +687,21 @@ class OllamaModel:
     def _parse_action(self, context: ModelContext, response: ChatResponse) -> ActionProposal:
         calls = response.message.tool_calls or []
         if len(calls) != 1:
+            history = self._conversations.get(context.run_id)
+            if history is not None:
+                # Code-owned protocol feedback only: never replay malformed
+                # provider content as an instruction or execute a partial batch.
+                history.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Protocol correction: the previous response was rejected and "
+                            "no tool ran. Return exactly ONE tool call in this response. "
+                            "Choose the next single action; wait for its result before "
+                            "proposing another action."
+                        ),
+                    }
+                )
             msg = f"model proposed {len(calls)} tool actions, expected exactly one"
             raise ModelTurnError(
                 ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", _bounded(msg)
@@ -363,11 +712,30 @@ class OllamaModel:
             raise ModelTurnError(ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg_2)
         arguments = function.arguments or {}
         history = self._conversations.get(context.run_id)
+        thinking = response.message.thinking if self._preserve_thinking else ""
+        if len(thinking.encode()) > 4096:
+            thinking = ""
+            self.request_tracker.note("optional_thinking_omitted_over_4096_bytes")
+            if history is not None:
+                history.append(
+                    {
+                        "role": "user",
+                        "content": "Runtime context notice: the prior model's optional thinking "
+                        "exceeded its 4096-byte replay allowance and was omitted whole. "
+                        "Thinking is model inference, never source evidence or authority. "
+                        "The valid action and exact tool result remain; reread source if needed.",
+                    }
+                )
+        content = response.message.content
+        if len(content.encode()) > 4096:
+            content = "[Optional model commentary omitted whole; native action retained exactly.]"
+            self.request_tracker.note("optional_commentary_omitted_over_4096_bytes")
         if history is not None:
             history.append(
                 {
                     "role": "assistant",
-                    "content": "",
+                    "content": content,
+                    **({"thinking": thinking} if thinking else {}),
                     "tool_calls": [
                         {
                             "id": f"call_{self._turn_count}",
@@ -380,7 +748,8 @@ class OllamaModel:
                     ],
                 }
             )
-        self._pending_calls[context.run_id] = function.name
+        if self._conversation_mode == "history":
+            self._pending_calls[context.run_id] = function.name
         return ActionProposal(
             action_id=ActionId(f"{context.run_id}:model-turn-{self._turn_count}"),
             tool_name=function.name,
@@ -392,6 +761,24 @@ class OllamaModel:
             response.prompt_eval_count * self._capabilities.input_cost_usd_per_million
             + response.eval_count * self._capabilities.output_cost_usd_per_million
         ) / 1_000_000
+
+
+def _validate_generation(
+    max_output_tokens: int | None, thinking: bool | None, max_history_chars: int | None
+) -> None:
+    if max_output_tokens is not None and (
+        type(max_output_tokens) is not int or max_output_tokens <= 0
+    ):
+        output_message = "max_output_tokens must be a positive integer"
+        raise ValueError(output_message)
+    if thinking is not None and type(thinking) is not bool:
+        thinking_message = "thinking must be a boolean"
+        raise ValueError(thinking_message)
+    if max_history_chars is not None and (
+        type(max_history_chars) is not int or max_history_chars < 4096
+    ):
+        history_message = "max_history_chars must be an integer of at least 4096"
+        raise ValueError(history_message)
 
 
 def _bounded(text: str) -> str:

@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Protocol
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.admission import ContextAdmission
 from loopforge.domain.context import ModelContext
 from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.types import UsageDelta
@@ -14,6 +15,14 @@ from loopforge.domain.types import UsageDelta
 class ModelTurn:
     action: ActionProposal
     usage: UsageDelta
+    context_admission: ContextAdmission | None = None
+
+    def __post_init__(self) -> None:
+        if self.context_admission is not None and not isinstance(
+            self.context_admission, ContextAdmission
+        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model context admission must be typed"
+            raise TypeError(msg)
 
 
 class ModelContractError(TypeError):
@@ -48,7 +57,15 @@ class ModelTurnError(RuntimeError):
     runtime records as the stop reason when the failure is terminal.
     """
 
-    def __init__(self, failure_class: ModelFailureClass, reason_code: str, summary: str) -> None:
+    def __init__(
+        self,
+        failure_class: ModelFailureClass,
+        reason_code: str,
+        summary: str,
+        *,
+        usage: UsageDelta | None = None,
+        context_admission: ContextAdmission | None = None,
+    ) -> None:
         super().__init__(summary)
         # Coerce through the enum so plain-string classes ("permanent") cannot
         # bypass identity checks at the runtime boundary.
@@ -58,6 +75,11 @@ class ModelTurnError(RuntimeError):
             raise ValueError(msg)
         self.reason_code = reason_code
         self.summary = summary
+        self.usage = usage
+        if context_admission is not None and not isinstance(context_admission, ContextAdmission):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model context admission must be typed"
+            raise TypeError(msg)
+        self.context_admission = context_admission
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

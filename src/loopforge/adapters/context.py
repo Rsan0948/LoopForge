@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime
 
 from loopforge.domain.context import ContextItem, ContextSource, ModelContext, ModelRole
@@ -46,6 +47,8 @@ class BasicContextBuilder:
         items: list[ContextItem] = []
 
         def item(key: str, content: str, trust: TrustClass, detail: str) -> ContextItem:
+            if key == "observation" and state.last_observation_sequence is not None:
+                key = f"{state.last_observation_sequence}:observation"
             return ContextItem(
                 item_id=ContextItemId(f"{state.run_id}:{key}"),
                 content=content,
@@ -185,6 +188,8 @@ class BudgetedContextBuilder:
         candidates: list[ContextCandidate] = []
 
         def item(key: str, content: str, trust: TrustClass, detail: str) -> ContextItem:
+            if key == "observation" and state.last_observation_sequence is not None:
+                key = f"{state.last_observation_sequence}:observation"
             return ContextItem(
                 item_id=ContextItemId(f"{state.run_id}:{key}"),
                 content=content,
@@ -414,3 +419,64 @@ class AdaptiveContextBuilder:
                 utilization_fraction=accounting.used_tokens / accounting.usable_tokens,
             )
         return context
+
+
+class StateContextBuilder(BudgetedContextBuilder):
+    """Rebuild whole current facts without selection, truncation or model summaries.
+
+    Historical observations stay in the event store. All current facts and human
+    instructions must fit or assembly fails; source/verification content retains
+    lower trust even when it contains instruction-shaped text.
+    """
+
+    def build_context(
+        self,
+        state: RunState,
+        *,
+        role: ModelRole = ModelRole.CONTROLLER,
+        token_budget: ContextTokenBudget | None = None,
+    ) -> ModelContext:
+        from loopforge.domain.context_lifecycle import ContextBudgetError  # noqa: PLC0415
+
+        self._last_accounting = None
+        now = self._clock.now()
+        items = [
+            candidate.item for candidate in self._candidates(state, now) if role in candidate.roles
+        ]
+        items = [
+            replace(
+                item,
+                trust=TrustClass.UNTRUSTED_CONTENT,
+                source=replace(item.source, origin=TrustClass.UNTRUSTED_CONTENT),
+            )
+            if item.trust is TrustClass.DETERMINISTIC_OBSERVATION
+            else item
+            for item in items
+        ]
+        for index, instruction in enumerate(state.operator_instructions):
+            items.append(
+                ContextItem(
+                    item_id=ContextItemId(f"{state.run_id}:operator:{index}"),
+                    content=instruction,
+                    trust=TrustClass.AUTHORIZED_HUMAN,
+                    source=ContextSource(
+                        origin=TrustClass.AUTHORIZED_HUMAN,
+                        reference=f"run:{state.run_id}:operator:{index}",
+                    ),
+                    created_at=now,
+                )
+            )
+        budget = token_budget or self._default_budget
+        used = self._counter.count_tokens(self._template.static_text()) + sum(
+            self._counter.count_tokens(item.content) for item in items
+        )
+        if used > budget.max_tokens - budget.reserve_tokens:
+            msg = "Whole current state exceeds context budget; no compaction is permitted"
+            raise ContextBudgetError(msg)
+        return ModelContext(
+            run_id=state.run_id,
+            items=tuple(items),
+            assembled_at=now,
+            role=role,
+            prompt_template=self._template.reference(),
+        )

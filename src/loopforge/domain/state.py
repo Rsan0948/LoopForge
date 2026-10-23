@@ -17,6 +17,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -81,9 +82,11 @@ class RunState:
     retry_not_before: datetime | None = None
     execution_in_flight: bool = False
     last_observation: str | None = None
+    last_observation_sequence: int | None = None
     last_tool_failure_class: ToolFailureClass | None = None
     last_verification: str | None = None
     last_verification_passed: bool | None = None
+    last_verification_task_complete: bool = True
     last_verification_score: float | None = None
     best_verification_score: float | None = None
     consecutive_no_progress: int = 0
@@ -148,6 +151,7 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
         RunStatus.VERIFYING,
         RunStatus.REFLECTING,
     },
+    ModelAttemptFailed: {RunStatus.READY},
     ModelTurnRecorded: {RunStatus.READY},
     # Evidence-only shadow records (PACS-017): routing/context-budget advice
     # is journaled while the run is READY (the propose-turn decision points);
@@ -355,6 +359,7 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             return replace(
                 base,
                 last_observation=observation,
+                last_observation_sequence=event.sequence,
                 last_tool_failure_class=None,
                 current_attempt=attempt,
                 execution_in_flight=False,
@@ -378,6 +383,7 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             return replace(
                 base,
                 last_observation=message,
+                last_observation_sequence=event.sequence,
                 last_tool_failure_class=failure_class,
                 current_attempt=attempt,
                 execution_in_flight=False,
@@ -412,15 +418,17 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 base,
                 open_circuit_tools=tuple(sorted(set(base.open_circuit_tools) | {tool_name})),
             )
-        case VerificationPassed(summary=summary):
+        case VerificationPassed(summary=summary, task_complete=task_complete, score=score):
+            best_score, no_progress = _verification_progress(base, summary=summary, score=score)
             return replace(
                 base,
                 last_verification=summary,
                 last_verification_passed=True,
-                last_verification_score=1.0,
-                best_verification_score=max(base.best_verification_score or 0.0, 1.0),
-                consecutive_no_progress=0,
-                status=RunStatus.VERIFYING,
+                last_verification_task_complete=task_complete,
+                last_verification_score=score,
+                best_verification_score=best_score,
+                consecutive_no_progress=0 if task_complete else no_progress,
+                status=RunStatus.VERIFYING if task_complete else RunStatus.REFLECTING,
             )
         case VerificationFailed(summary=summary, score=score):
             best_score, no_progress = _verification_progress(base, summary=summary, score=score)
@@ -428,6 +436,7 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 base,
                 last_verification=summary,
                 last_verification_passed=False,
+                last_verification_task_complete=False,
                 last_verification_score=score,
                 best_verification_score=best_score,
                 consecutive_no_progress=no_progress,
@@ -452,6 +461,8 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 output_tokens=base.output_tokens + usage.output_tokens,
                 cached_input_tokens=base.cached_input_tokens + usage.cached_input_tokens,
             )
+        case ModelAttemptFailed():
+            return base
         case ModelTurnRecorded():
             # Evidence-only model-identity record (PACS-015): the provenance
             # graph attributes the turn's action to this provider/model. No
@@ -594,6 +605,8 @@ def status_after_event(event: Event) -> RunStatus | None:
     """
     if isinstance(event, RunStopped):
         return _TERMINAL_STATUS_BY_REASON[event.reason]
+    if isinstance(event, VerificationPassed) and not event.task_complete:
+        return RunStatus.REFLECTING
     return _STATUS_AFTER_EVENT.get(type(event))
 
 

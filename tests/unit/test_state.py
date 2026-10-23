@@ -1546,3 +1546,16 @@ def test_model_turn_recorded_is_rejected_on_a_terminal_run() -> None:
         InvalidTransitionError, match="terminal run cannot accept ModelTurnRecorded"
     ):
         reduce_event(terminal, _model_turn_recorded(4))
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_observation_identity_comes_from_result_event_and_survives_denial(success: bool) -> None:
+    state = replay(RUN, (_started(1), _planned(2), _proposed(3), _authorized(4), _tool_started(5)))
+    result = _tool_succeeded(6) if success else _tool_failed(6)
+    state = reduce_event(state, result)
+    assert state.last_observation_sequence == 6
+    state = reduce_event(state, _verification_failed(7))
+    state = reduce_event(state, _planned(8))
+    state = reduce_event(state, _proposed(9, proposal=_proposal("a2")))
+    state = reduce_event(state, _rejected(10, proposal=_proposal("a2")))
+    assert state.last_observation_sequence == 6

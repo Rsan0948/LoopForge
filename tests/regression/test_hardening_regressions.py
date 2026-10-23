@@ -1118,6 +1118,8 @@ def _no_arg_payload(arguments: object) -> str:
         {
             "message": {"role": "assistant", "content": "", "tool_calls": [{"function": function}]},
             "done": True,
+            "prompt_eval_count": 17,
+            "eval_count": 3,
         }
     )
 

@@ -11,6 +11,7 @@ shadow records can never manufacture a divergence.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 
@@ -35,12 +36,14 @@ from loopforge.application.counterfactual import (
 )
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.admission import ContextAdmission, InputMeasurementBasis
 from loopforge.domain.context_lifecycle import ContextTokenBudget
 from loopforge.domain.events import (
     ActionProposed,
     ApprovalGranted,
     ApprovalRequested,
     Event,
+    ModelTurnRecorded,
     PlanCreated,
     ShadowDecisionRecorded,
     ToolExecutionStarted,
@@ -621,3 +624,23 @@ def test_scripted_verifier_replays_in_order_then_fails_closed() -> None:
     assert verifier.verify(state).passed is True
     with pytest.raises(RuntimeError, match="exhausted"):
         verifier.verify(state)
+
+
+def test_admission_diagnostics_do_not_manufacture_counterfactual_behavior_divergence() -> None:
+    historical, run_id = _two_turn_run()
+    measured = ContextAdmission(
+        measurement_basis=InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND,
+        input_token_bound=1000,
+        serialized_request_bytes=1000,
+        context_window_tokens=32768,
+        output_reserve_tokens=8192,
+        framing_reserve_tokens=1024,
+    )
+    historical = tuple(
+        replace(event, context_admission=measured)
+        if isinstance(event, ModelTurnRecorded)
+        else event
+        for event in historical
+    )
+    result = _redrive(historical, run_id, prefix_length=_prefix_after(historical, PlanCreated))
+    assert result.outcome is ReplayOutcome.MATCHED

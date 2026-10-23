@@ -16,6 +16,13 @@ class CheckOutcome:
     distinct from "ran and failed": the workspace was never measured."""
 
     def __post_init__(self) -> None:
+        if type(self.executed) is not bool:
+            msg = "check outcome executed must be a bool"
+            raise TypeError(msg)
+
+        if self.passed and not self.executed:
+            msg = "an unexecuted check cannot pass"
+            raise ValueError(msg)
         if not isinstance(self.passed, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             msg_2 = "check outcome passed must be a bool"
             raise TypeError(msg_2)

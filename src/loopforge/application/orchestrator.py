@@ -263,6 +263,15 @@ class Orchestrator:
         if current.status.is_terminal:
             # Fail-closed artifact recording may have already stopped the run.
             return current
+        if verification.passed and not verification.task_complete:
+            self._stop(
+                run_id,
+                StopReason.FAILURE,
+                "MERGED_TASK_INCOMPLETE",
+                summary="MERGED_TASK_INCOMPLETE: merged checks passed, "
+                "but workload obligations remain incomplete",
+            )
+            return self.state_for(run_id)
         if verification.passed:
             decision = ControlPolicy(self.budget).evaluate(current, now=self.clock.now())
             if decision.stop_reason is not None:
@@ -369,6 +378,8 @@ class Orchestrator:
                     occurred_at=occurred_at,
                     sequence=sequence,
                     summary=verification.summary,
+                    task_complete=verification.task_complete,
+                    score=1.0 if verification.task_complete else verification.score,
                 ),
             )
         else:
@@ -381,6 +392,7 @@ class Orchestrator:
                     sequence=sequence,
                     summary=verification.summary,
                     score=verification.score,
+                    inconclusive=verification.inconclusive,
                 ),
             )
         return verification

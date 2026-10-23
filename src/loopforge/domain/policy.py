@@ -36,7 +36,7 @@ class ControlPolicy:
     def evaluate(  # noqa: PLR0911 - flat prioritized rule chain keeps stop precedence explicit
         self, state: RunState, *, now: datetime | None = None
     ) -> ControlDecision:
-        if state.last_verification_passed is True:
+        if state.last_verification_passed is True and state.last_verification_task_complete:
             return ControlDecision(
                 ControlDecisionKind.STOP_SUCCESS,
                 "STOP_SUCCESS_VERIFIED",

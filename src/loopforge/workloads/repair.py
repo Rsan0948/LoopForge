@@ -23,6 +23,7 @@ Everything in this module is code-owned workload authority:
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -227,18 +228,32 @@ class RepairVerifier:
     ``expected_observation``) can never influence the verdict.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit immutable verification contracts
         self,
         sandbox: SandboxPort,
         workspace: WorkspacePort,
         criteria: AcceptanceCriteria,
         *,
         hooks: tuple[RepairCheck, ...] = (),
+        command_detail_budget: int = _DETAIL_BUDGET,
+        completion_markers: tuple[tuple[str, str], ...] = (),
     ) -> None:
+        if not 64 <= command_detail_budget <= 8000:
+            msg = "command detail budget must be between 64 and 8000 characters"
+            raise ValueError(msg)
         self._sandbox = sandbox
         self._workspace = workspace
         self._criteria = criteria
         self._hooks = hooks
+        self._command_detail_budget = command_detail_budget
+        self._completion_markers = dict(completion_markers)
+        if (
+            len(self._completion_markers) != len(completion_markers)
+            or any(not name or not marker for name, marker in completion_markers)
+            or not set(self._completion_markers) <= set(criteria.required_commands)
+        ):
+            msg = "completion marker contracts must be nonempty and unique"
+            raise ValueError(msg)
 
     def verify(self, state: RunState) -> VerificationResult:
         del state  # verification truth comes from the workspace, never model-claimed state
@@ -252,6 +267,7 @@ class RepairVerifier:
             summary=composite.summary,
             score=composite.score,
             inconclusive=composite.inconclusive,
+            outcomes=tuple(outcomes),
         )
 
     def _hook_outcome(self, index: int, hook: RepairCheck) -> CheckOutcome:
@@ -293,12 +309,21 @@ class RepairVerifier:
                 executed=False,
             )
         detail = f"exit_code={result.exit_code}"
+        marker = self._completion_markers.get(name)
+        completed = marker is None or result.stdout.splitlines()[-1:] == [marker]
+        if not completed:
+            detail += "; trusted acceptance completion marker missing"
+        if not result.succeeded and (result.stdout or result.stderr):
+            detail += (
+                f"; stdout={_bounded(result.stdout, self._command_detail_budget)}; "
+                f"stderr={_bounded(result.stderr, self._command_detail_budget)}"
+            )
         if result.resource_limits_skipped:
             skipped = ", ".join(result.resource_limits_skipped)
             detail += f"; resource limits not enforced by this platform: {skipped}"
         return CheckOutcome(
             name=f"command:{name}",
-            passed=result.succeeded,
+            passed=result.succeeded and completed,
             detail=detail,
         )
 
@@ -515,14 +540,18 @@ def scripted_repair_actions(task: RepairTask) -> list[ActionProposal]:
     return actions
 
 
-def _bounded(text: str) -> str:
+def _bounded(text: str, budget: int = _DETAIL_BUDGET) -> str:
+    # Terminal style is presentation, not check evidence. Remove only SGR
+    # sequences before budgeting so colored test output cannot consume the
+    # diagnostic allowance; other controls still receive visible escaping.
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     # Sanitize first: details embed model-influenced content (file names,
     # sandbox error text), and control characters must never forge lines in
     # verifier summaries, durable events, logs, or context items.
     sanitized = "".join(char if char.isprintable() else f"\\x{ord(char):02x}" for char in text)
-    if len(sanitized) <= _DETAIL_BUDGET:
+    if len(sanitized) <= budget:
         return sanitized
-    return sanitized[: _DETAIL_BUDGET - 3] + "..."
+    return sanitized[: budget - 3] + "..."
 
 
 def _path_allowed(path: str, allowed_prefixes: tuple[str, ...]) -> bool:

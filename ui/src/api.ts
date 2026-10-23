@@ -68,6 +68,7 @@ export interface SessionDetail extends SessionEntry {
   total_tokens: number;
   last_verification: string | null;
   last_verification_passed: boolean | null;
+  last_verification_task_complete: boolean;
   last_verification_score: number | null;
   last_verification_inconclusive: boolean;
   plan: string | null;

@@ -32,6 +32,7 @@ from loopforge.adapters.scripted import (
     RecordingSleeper,
     ScriptedModel,
     ScriptedTools,
+    ScriptedVerifier,
 )
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
@@ -2169,3 +2170,32 @@ def test_fs_routes_are_read_only(tmp_path: Path) -> None:
         assert client.post("/api/fs/detect").status_code == 405
         assert client.delete("/api/fs/browse").status_code == 405
         assert client.put("/api/fs/detect").status_code == 405
+
+
+@pytest.mark.parametrize("task_complete", [True, False])
+def test_passing_verification_clears_historical_inconclusive_status(
+    tmp_path: Path, task_complete: bool
+) -> None:
+    factory = FakeBundleFactory(
+        actions=[
+            _proposal("first", "probe"),
+            _proposal("second", "probe"),
+            _proposal("gate", "deploy"),
+        ],
+        results=[ToolResult(ok=True, observation="observed")] * 2,
+        verifier_override=ScriptedVerifier(
+            [
+                VerificationResult(False, "command unavailable", score=0, inconclusive=True),
+                VerificationResult(True, "measured", score=0.5, task_complete=task_complete),
+            ]
+        ),
+    )
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, factory) as client:
+        run_id = _create(client, repo)
+        client.post(f"/api/sessions/{run_id}/start")
+        _wait_for_status(client, run_id, "succeeded" if task_complete else "waiting_for_approval")
+        detail = _detail(client, run_id)
+        assert detail["last_verification_passed"] is True
+        assert detail["last_verification_task_complete"] is task_complete
+        assert detail["last_verification_inconclusive"] is False

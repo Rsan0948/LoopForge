@@ -30,6 +30,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -114,6 +115,9 @@ def _node_for(event: Event) -> ProvenanceNode:  # noqa: PLR0912, PLR0915 - the f
                 prompt_template_id=template_id,
                 prompt_template_version=template_version,
             )
+        case ModelAttemptFailed(reason_code=reason_code, summary=detail):
+            kind = ProvenanceNodeKind.MODEL_TURN
+            summary = _truncate(f"failed {reason_code}: {detail}")
         case ModelTurnRecorded(provider=provider, model=model, action_id=action_id):
             kind = ProvenanceNodeKind.MODEL_TURN
             summary = f"{provider}/{model}"
@@ -187,10 +191,10 @@ def _node_for(event: Event) -> ProvenanceNode:  # noqa: PLR0912, PLR0915 - the f
             kind = ProvenanceNodeKind.RELIABILITY
             summary = f"circuit opened for {tool_name}: {reason_code}"
             attributes = _attributes(tool_name=tool_name, reason_code=reason_code)
-        case VerificationPassed(summary=text):
+        case VerificationPassed(summary=text, task_complete=task_complete):
             kind = ProvenanceNodeKind.VERIFICATION
             summary = _truncate(text)
-            attributes = _attributes(outcome="passed")
+            attributes = _attributes(outcome="passed", task_complete=task_complete)
         case VerificationFailed(summary=text, score=score):
             kind = ProvenanceNodeKind.VERIFICATION
             summary = _truncate(text)
@@ -383,7 +387,7 @@ def build_provenance_graph(events: tuple[Event, ...]) -> ProvenanceGraph:  # noq
                 key = str(worker_id)
                 link(last_worker_node_of.get(key), node.node_id, ProvenanceEdgeKind.CORRELATES)
                 last_worker_node_of[key] = node.node_id
-            case BudgetDebited():
+            case BudgetDebited() | ModelAttemptFailed():
                 pass  # Backbone-only evidence: cost attribution stays in the stream.
             case ShadowDecisionRecorded():
                 # Backbone-only evidence (PACS-017): shadow advice is never

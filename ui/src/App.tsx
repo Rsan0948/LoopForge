@@ -1,4 +1,5 @@
 import { useEffect, useState, type ReactElement } from "react";
+import GoalsView from "./views/GoalsView";
 import EvalsView from "./views/EvalsView";
 import EvalView from "./views/EvalView";
 import PoliciesView from "./views/PoliciesView";
@@ -11,6 +12,8 @@ import SessionsView from "./views/SessionsView";
 // `#/evals/:reportId`, `#/policies`, and `#/policies/:policyId`.
 
 type Route =
+  | { kind: "goals" }
+  | { kind: "goal"; goalId: string }
   | { kind: "sessions" }
   | { kind: "session"; runId: string }
   | { kind: "evals" }
@@ -21,6 +24,9 @@ type Route =
 function parseHash(hash: string): Route {
   const path = hash.replace(/^#/, "");
   const parts = path.split("/").filter((part) => part.length > 0);
+  if (parts[0] === "goals") {
+    return parts.length === 2 ? { kind: "goal", goalId: decodeURIComponent(parts[1]) } : { kind: "goals" };
+  }
   if (parts.length === 2 && parts[0] === "sessions") {
     return { kind: "session", runId: decodeURIComponent(parts[1]) };
   }
@@ -82,6 +88,7 @@ export default function App(): ReactElement {
           ⬡ loopforge operator console
         </a>
         <nav className="app-nav">
+          <a href="#/goals" className={route.kind === "goals" || route.kind === "goal" ? "active" : ""}>goals</a>
           <a
             href="#/sessions"
             className={route.kind === "sessions" || route.kind === "session" ? "active" : ""}
@@ -100,7 +107,7 @@ export default function App(): ReactElement {
         </nav>
       </header>
       <main className="app-main">
-        {route.kind === "sessions" ? (
+        {route.kind === "goals" ? <GoalsView key="goals" /> : route.kind === "goal" ? <GoalsView key={route.goalId} goalId={route.goalId} /> : route.kind === "sessions" ? (
           <SessionsView />
         ) : route.kind === "session" ? (
           // Keyed by runId: switching sessions must remount the view so no

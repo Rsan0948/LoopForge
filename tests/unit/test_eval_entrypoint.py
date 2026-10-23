@@ -16,6 +16,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -310,8 +311,8 @@ def test_evidence_collects_hook_names_naive_solution_and_fixture_truth(tmp_path:
     assert evidence.required_check_names == ("edge_cases",)
     assert evidence.naive_solution == AMBIGUOUS_NAIVE_SOLUTION
     assert evidence.verification_summaries == tuple(event.summary for event in events)
-    # The anti-forgery split: only the VerificationPassed summaries.
-    assert evidence.passing_verification_summaries == (events[0].summary, events[2].summary)
+    # Only the latest complete passing verdict can certify the final candidate.
+    assert evidence.passing_verification_summaries == (events[2].summary,)
     fixture = binding.task.fixture
     expected = tuple(item for item in fixture.files if item.path.startswith(_TESTS_PREFIX))
     assert evidence.expected_test_files == expected
@@ -754,3 +755,37 @@ def test_policy_for_fails_closed_on_an_unresolvable_reference() -> None:
     )
     with pytest.raises(UnknownPolicyError):
         _policy_for(config)
+
+
+@_REQUIRES_GIT
+def test_evidence_excludes_checkpoint_markers_from_whole_task_acceptance(tmp_path: Path) -> None:
+    binding, workspace = _materialize("bench-ambiguous-success", tmp_path)
+    checkpoint = replace(
+        _verification(VerificationPassed, "edge_cases: passed", 1), task_complete=False, score=0.5
+    )
+    final = _verification(VerificationPassed, "project tests passed; hook not measured", 2)
+    evidence = _evidence_for(binding, workspace, (checkpoint, final))
+    assert evidence.verification_summaries == (checkpoint.summary, final.summary)
+    assert evidence.passing_verification_summaries == (final.summary,)
+
+
+@_REQUIRES_GIT
+@pytest.mark.parametrize("latest", ["checkpoint", "failed", "complete"])
+def test_evidence_cannot_reuse_superseded_acceptance_hook_markers(
+    tmp_path: Path, latest: str
+) -> None:
+    binding, workspace = _materialize("bench-ambiguous-success", tmp_path)
+    earlier = _verification(VerificationPassed, "edge_cases: passed", 1)
+    final = (
+        _verification(VerificationFailed, "final acceptance failed", 2)
+        if latest == "failed"
+        else replace(
+            _verification(VerificationPassed, "no final edge-case measurement", 2),
+            task_complete=latest == "complete",
+        )
+    )
+    evidence = _evidence_for(binding, workspace, (earlier, final))
+    assert all(
+        "edge_cases: passed" not in summary for summary in evidence.passing_verification_summaries
+    )
+    assert evidence.verification_summaries == (earlier.summary, final.summary)

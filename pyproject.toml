@@ -26,6 +26,7 @@ dependencies = [
   "psycopg[binary,pool]>=3.2",
   "pydantic>=2.8,<3",
   "uvicorn[standard]>=0.30",
+  "websockets>=15,<18",
 ]
 
 [project.urls]
@@ -51,6 +52,9 @@ dev = [
 [project.scripts]
 loopforge = "loopforge.entrypoints.cli:main"
 loopforge-console = "loopforge.entrypoints.cli:main"
+loopforge-campaign = "loopforge.entrypoints.campaign:main"
+loopforge-supervisor = "loopforge.entrypoints.supervisor:main"
+loopforge-repository-supervisor = "loopforge.entrypoints.repository_supervisor:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/loopforge"]
