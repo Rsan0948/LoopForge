@@ -41,10 +41,29 @@ def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inferenc
     state_driven: bool = False,
     session: bool = False,
     native: bool = False,
+    model: str = "",
 ) -> OllamaProfile:
     if native and role == "coding":
         # Append-only native tool chat (prefix KV cache reuse), reasoning enabled,
         # and Qwen's recommended thinking-mode sampling instead of greedy decoding.
+        if model == "qwen3.6:35b-a3b":
+            # Vendor sampling for this MoE model. Without presence_penalty its
+            # thinking cycles through the same reasoning; measured on a captured
+            # 25K-token request: 720 output tokens with 1.5 versus a long, looping
+            # trace with 0.0. The 32K allowance keeps long reasoning from being
+            # cut off before the action; 457 tok/s prefill, ~15 tok/s decode on M1 Max.
+            return OllamaProfile(
+                "coding-native-a3b-v1",
+                1.0,
+                0.95,
+                1.5,
+                True,
+                32768,
+                context_tokens=131072,
+                keep_alive="30m",
+                conversation_mode="history",
+                thinking_policy="on_evidence",
+            )
         return OllamaProfile(
             "coding-native-v1",
             0.6,

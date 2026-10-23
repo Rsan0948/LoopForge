@@ -62,7 +62,9 @@ def native_run(
         return real(**kwargs, transport=httpx.MockTransport(transport))  # type: ignore[arg-type]
 
     monkeypatch.setattr(coding, "OllamaModel", factory)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-native-v1"})
+    config = campaign_config(repo).model_copy(
+        update={"inference_profile": "qwen-native-v1", "model": "qwen3.8:27b-q4_K_M"}
+    )
     runtime, _ = coding.build_coding(config, contract(), repo, store=InMemoryEventStore())
     result = runtime.run("Fix addition")
     assert source != (repo.root / "src/add.py").read_text()
@@ -134,3 +136,45 @@ def test_evidence_driven_thinking_requires_append_only_conversation() -> None:
             thinking_policy="on_evidence",
             conversation_mode="state",
         )
+
+
+def test_a3b_model_gets_vendor_sampling_and_room_for_long_reasoning() -> None:
+    from loopforge.adapters.ollama_profiles import profile_for  # noqa: PLC0415
+
+    a3b = profile_for("coding", native=True, model="qwen3.6:35b-a3b")
+    assert (a3b.temperature, a3b.top_p, a3b.presence_penalty) == (1.0, 0.95, 1.5)
+    assert a3b.output_tokens == 32768
+    assert a3b.context_tokens == 131072
+    assert a3b.options()["presence_penalty"] == 1.5
+    assert a3b.thinking_policy == "on_evidence"
+    dense = profile_for("coding", native=True, model="qwen3.8:27b-q4_K_M")
+    assert (dense.temperature, dense.presence_penalty, dense.output_tokens) == (0.6, 0.0, 8192)
+    # The model never changes non-native profiles.
+    assert profile_for("coding", session=True, model="qwen3.6:35b-a3b") == profile_for(
+        "coding", session=True
+    )
+
+
+def test_a3b_settings_reach_the_provider_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
+    captured: dict[str, object] = {}
+
+    def factory(**kwargs: object) -> ollama_model.OllamaModel:
+        captured.update(kwargs)
+        return ollama_model.OllamaModel(**kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(coding, "OllamaModel", factory)
+    repo = workspace(tmp_path)
+    config = campaign_config(repo).model_copy(
+        update={"inference_profile": "qwen-native-v1", "model": "qwen3.6:35b-a3b"}
+    )
+    coding.build_coding(config, contract(), repo, store=InMemoryEventStore())
+    assert captured["temperature"] == 1.0
+    assert captured["max_output_tokens"] == 32768
+    assert captured["context_window_tokens"] == 131072
+    sampling = captured["sampling_options"]
+    assert isinstance(sampling, dict)
+    assert sampling["presence_penalty"] == 1.5
+    assert "32768-token" in str(captured["template"])

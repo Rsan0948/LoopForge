@@ -1117,6 +1117,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
         state_driven=config.inference_profile == "qwen-state-v1",
         session=config.inference_profile == "qwen-session-v1",
         native=native,
+        model=config.model,
         candidate=config.inference_profile == "qwen-coding-v1",
         app_workload=config.inference_profile
         in {"qwen-app-v1", "qwen-state-v1", "qwen-session-v1"},
