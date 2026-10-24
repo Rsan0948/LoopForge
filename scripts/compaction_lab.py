@@ -55,7 +55,7 @@ class Handoff(BaseModel):
         }
 
 
-def pack_history(messages):
+def pack_history(messages: list[dict[str, object]]) -> list[dict[str, object]]:
     return [{"id": f"m{i}", "message": m} for i, m in enumerate(messages)]
 
 
@@ -67,7 +67,9 @@ class GeminiCompactor:
         )
         self.client = client
 
-    def summarize(self, messages, operation: str, timeout: float = 120) -> Handoff:
+    def summarize(
+        self, messages: list[dict[str, object]], operation: str, timeout: float = 120
+    ) -> Handoff:
         if datetime.now(UTC) >= PRICE_VALID_UNTIL:
             raise ValueError("Compactor price lock expired")
         records = pack_history(messages)

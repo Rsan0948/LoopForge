@@ -10,7 +10,7 @@ from loopforge.adapters.paid_budget import SQLitePaidBudget
 from scripts.compaction_lab import GeminiCompactor, checkpoint_summarizer
 
 KEY = "test-gemini-key-not-real-0123456789"
-MESSAGES = [
+MESSAGES: list[dict[str, object]] = [
     {"role": "assistant", "content": "Plan", "tool_calls": []},
     {"role": "tool", "content": "edited app/x.py; check_project failed (assert 422 == 409)"},
 ]
@@ -93,7 +93,7 @@ def test_http_failure_charges_the_full_reservation(tmp_path: Path) -> None:
 
 def test_credential_in_the_evidence_is_never_sent(tmp_path: Path) -> None:
     compactor, _, sent = _compactor(tmp_path, _reply(json.dumps(_handoff())))
-    leaked = [{"role": "tool", "content": f"env: GEMINI_API_KEY={KEY}"}]
+    leaked: list[dict[str, object]] = [{"role": "tool", "content": f"env: GEMINI_API_KEY={KEY}"}]
     with pytest.raises(ValueError, match="admission"):
         compactor.summarize(leaked, "trial:1")
     assert sent == []
