@@ -23,14 +23,15 @@ CONTROL_STOPS = {
     "STOP_MAX_ITERATIONS": "hard budget: iterations",
 }
 
-# Workload rules raised as permanent model failures from model wrappers. Each one ends
-# the run as a model failure, whatever the real cause (F11).
+# Workload rules raised from model wrappers: as a typed gate stop (stalled or failed,
+# recorded honestly) or, for the reviewer still, as a permanent model failure.
 WRAPPER_STOPS = {
     "CODING_REQUIRED_CHECK_CIRCUIT_OPEN": "a required check failed to run N times "
     "(infrastructure; a check that ran and failed is a measured result)",
     "CODING_AUTOMATIC_CHECK_BLOCKED": "checks could not run (inconclusive), or the frozen "
     "contract changed",
-    "CODING_NO_NEW_EVIDENCE": "N turns with an unchanged patch and no new read",
+    "CODING_NO_NEW_EVIDENCE": "N turns with an unchanged patch and no new tool result, "
+    "then one warning, then N more: stalled",
     "MODEL_DEADLINE": "run deadline reached before a model call",
     "REVIEW_NO_NEW_EVIDENCE": "reviewer repeats itself",
     "REVIEW_SOURCE_CIRCUIT_OPEN": "reviewer source tool circuit opened",
@@ -70,6 +71,9 @@ def test_every_control_stop_is_inventoried() -> None:
 def test_every_permanent_wrapper_stop_is_inventoried() -> None:
     found: set[str] = set()
     for path in (SOURCE / "entrypoints").glob("*.py"):
+        for call in _calls(path, "RunGateStop"):
+            if len(call.args) > 1 and (code := _literal(call.args[1])):
+                found.add(code)
         for call in _calls(path, "ModelTurnError"):
             if (
                 len(call.args) > 1

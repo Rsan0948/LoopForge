@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Protocol
+from typing import Final, Protocol
 
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.admission import ContextAdmission
 from loopforge.domain.context import ModelContext
 from loopforge.domain.routing import ModelCapabilities
-from loopforge.domain.types import UsageDelta
+from loopforge.domain.types import StopReason, UsageDelta
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +47,31 @@ class ModelFailureClass(StrEnum):
 
     TRANSIENT = "transient"
     PERMANENT = "permanent"
+
+
+class RunGateStop(RuntimeError):
+    """A workload rule ends the run before the next model call, with a code-owned reason.
+
+    Raised by a model wrapper that has decided, from journaled facts and workspace
+    measurement, that the run must stop (for example the model has produced no new
+    information for several turns). The runtime records ``RunStopped`` with this
+    reason instead of a model failure. A gate can only end a run as stalled or
+    failed: success is decided by verification alone.
+    """
+
+    _ALLOWED: Final = frozenset({StopReason.STALLED, StopReason.FAILURE})
+
+    def __init__(self, stop_reason: StopReason, reason_code: str, summary: str) -> None:
+        super().__init__(summary)
+        if StopReason(stop_reason) not in self._ALLOWED:
+            msg = "a gate may only stop a run as stalled or failed"
+            raise ValueError(msg)
+        if not reason_code.strip():
+            msg = "gate stop reason_code cannot be empty"
+            raise ValueError(msg)
+        self.stop_reason = StopReason(stop_reason)
+        self.reason_code = reason_code
+        self.summary = summary
 
 
 class ModelTurnError(RuntimeError):

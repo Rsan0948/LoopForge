@@ -153,14 +153,8 @@ def test_a_long_run_is_charged_for_new_work_not_the_repeated_prompt(
 
 
 def test_searches_with_new_results_are_not_repetition(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(
-        request,
-        profile,
-        "no-new-evidence counts only read_file results, so searches that return new "
-        "information still count as repetition",
-    )
     turns: list[Turn] = [call("search_files", query=f"term{index}") for index in range(12)]
     turns += feature_by_feature(SMALL)
     outcome = run(tmp_path, monkeypatch, profile, turns, SMALL)

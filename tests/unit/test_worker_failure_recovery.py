@@ -128,3 +128,38 @@ def test_latest_measurement_wins_over_earlier_provider_failure() -> None:
         summary="real failing criterion",
     )
     assert worker_failure([provider, behavior]) == FailureKind.VERIFICATION
+
+
+def _stop(reason: StopReason, code: str, sequence: int = 2) -> RunStopped:
+    return RunStopped(
+        event_id=EventId(f"s{sequence}"),
+        run_id=RunId("r"),
+        occurred_at=NOW,
+        sequence=sequence,
+        reason=reason,
+        summary=f"{code}: gate",
+    )
+
+
+def _verification(*, inconclusive: bool) -> VerificationFailed:
+    return VerificationFailed(
+        event_id=EventId("v"),
+        run_id=RunId("r"),
+        occurred_at=NOW,
+        sequence=1,
+        summary="checks",
+        inconclusive=inconclusive,
+    )
+
+
+def test_gate_stops_are_classified_by_their_honest_cause() -> None:
+    stalled = [
+        _verification(inconclusive=False),
+        _stop(StopReason.STALLED, "CODING_NO_NEW_EVIDENCE"),
+    ]
+    assert worker_failure(stalled) == FailureKind.NO_PROGRESS
+    broken_checks = [
+        _verification(inconclusive=True),
+        _stop(StopReason.FAILURE, "CODING_REQUIRED_CHECK_CIRCUIT_OPEN"),
+    ]
+    assert worker_failure(broken_checks) == FailureKind.ENVIRONMENT

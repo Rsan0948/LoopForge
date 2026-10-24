@@ -361,14 +361,43 @@ def test_coding_stops_cached_read_loop_without_running_redundant_checks(
         ),
     )
     result = runtime.run("Fix addition; do not loop over identical source")
-    assert result.status == RunStatus.FAILED
-    assert any("CODING_NO_NEW_EVIDENCE" in str(e) for e in store.events_for(result.run_id))
-    assert (
-        len(
-            [e for e in store.events_for(result.run_id) if e.__class__.__name__ == "ActionProposed"]
-        )
-        < 12
+    assert result.status == RunStatus.STALLED
+    events = store.events_for(result.run_id)
+    assert any("CODING_NO_NEW_EVIDENCE" in str(e) for e in events)
+    assert not any(e.__class__.__name__ == "ModelAttemptFailed" for e in events)
+    # The first read is new; then eight repeats, one warning, eight more.
+    assert len([e for e in events if e.__class__.__name__ == "ActionProposed"]) == 17
+
+
+def test_a_repeating_model_is_warned_once_before_the_run_stalls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
+    repo = workspace(tmp_path)
+    contexts: list[ModelContext] = []
+
+    class RecordingModel(ScriptedModel):
+        def propose_action(self, context: ModelContext) -> ModelTurn:
+            contexts.append(context)
+            return super().propose_action(context)
+
+    actions = [ActionProposal(ActionId(f"s-{i}"), "workspace_status", {}) for i in range(30)]
+    runtime, _ = coding.build_coding(
+        campaign_config(repo),
+        contract(),
+        repo,
+        store=InMemoryEventStore(),
+        model=RecordingModel(actions),
     )
+    assert runtime.run("Fix addition").status == RunStatus.STALLED
+    warned = [
+        index
+        for index, context in enumerate(contexts)
+        for item in context.items
+        if item.item_id.endswith(":coding-progress") and '"warning"' in item.content
+    ]
+    assert len(warned) == 1
+    assert warned[0] < len(contexts) - 1
 
 
 def test_new_source_resets_coding_progress_and_bookkeeping_has_no_authority(
@@ -847,16 +876,16 @@ def test_rewriting_an_unchanged_candidate_ends_as_a_loop_not_a_check_verdict(
             "write_file",
             {"path": "src/add.py", "content": "def add(a,b): return 0\n"},
         )
-        for i in range(12)
+        for i in range(24)
     ]
     store = InMemoryEventStore()
     runtime, _ = coding.build_coding(
         campaign_config(ws), contract(), ws, store=store, model=ScriptedModel(actions)
     )
     state = runtime.run("Fix addition")
-    assert state.status == RunStatus.FAILED
+    assert state.status == RunStatus.STALLED
     events = store.events_for(state.run_id)
-    assert sum(type(e).__name__ == "ActionProposed" for e in events) == 8
+    assert sum(type(e).__name__ == "ActionProposed" for e in events) == 17
     assert any("CODING_NO_NEW_EVIDENCE" in str(e) for e in events)
     assert not any("CODING_AUTOMATIC_CHECK_BLOCKED" in str(e) for e in events)
     failed = [e for e in events if isinstance(e, VerificationFailed)]

@@ -53,6 +53,7 @@ from loopforge.domain.types import (
     ContextItemId,
     Permission,
     RiskLevel,
+    StopReason,
     WorkspaceId,
 )
 from loopforge.domain.workspace import (
@@ -84,11 +85,11 @@ from loopforge.entrypoints.campaign_review import (
 )
 from loopforge.entrypoints.repair import repair_command_bindings, repair_command_specs
 from loopforge.ports.model import (
-    ModelFailureClass,
     ModelPort,
     ModelToolSpec,
     ModelTurn,
     ModelTurnError,
+    RunGateStop,
 )
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolError
@@ -1025,6 +1026,7 @@ class RequiredChecksAwareModel:
         self.inherited_failure = inherited_failure
         self.verifier = verifier
         self.progress: dict[str, tuple[tuple[str, frozenset[str]], int]] = {}
+        self.nudged: set[str] = set()
 
     @property
     def capabilities(self) -> ModelCapabilities:
@@ -1034,14 +1036,15 @@ class RequiredChecksAwareModel:
         events = self.store.events_for(context.run_id)
         state = replay(context.run_id, events)
         if set(self.checks).intersection(state.open_circuit_tools):
-            raise ModelTurnError(
-                ModelFailureClass.PERMANENT,
+            raise RunGateStop(
+                StopReason.FAILURE,
                 "CODING_REQUIRED_CHECK_CIRCUIT_OPEN",
-                "Required check circuit is open; preserve candidate and stop this attempt",
+                "A required check failed to run repeatedly (infrastructure); "
+                "preserve candidate and stop this attempt",
             )
         if self.verifier is not None and self.verifier.blocked:
-            raise ModelTurnError(
-                ModelFailureClass.PERMANENT,
+            raise RunGateStop(
+                StopReason.FAILURE,
                 "CODING_AUTOMATIC_CHECK_BLOCKED",
                 "Checks could not run, or the frozen contract changed; "
                 "preserve diagnostics for operator attention",
@@ -1052,15 +1055,18 @@ class RequiredChecksAwareModel:
                 for event in events
                 if isinstance(event, ActionProposed)
             }
-            reads: set[str] = set()
+            # Every distinct tool result is information: a new read, a search with new
+            # matches, a check whose output changed. Repeating a call that returns the
+            # same result adds nothing.
+            observed: set[str] = set()
             # Insertion-ordered (oldest first) so truncation keeps the most recent reads.
             selectors: dict[tuple[str, str], None] = {}
             for event in events:
                 if not isinstance(event, ToolSucceeded):
                     continue
+                observed.add(hashlib.sha256(event.observation.encode()).hexdigest())
                 proposal = proposals.get(event.action_id)
                 if proposal is not None and proposal.tool_name == "read_file":
-                    reads.add(hashlib.sha256(event.observation.encode()).hexdigest())
                     selector = (
                         proposal.arguments.get("path", ""),
                         proposal.arguments.get("start_line", "1"),
@@ -1068,20 +1074,32 @@ class RequiredChecksAwareModel:
                     selectors.pop(selector, None)
                     selectors[selector] = None
             identity = patch_identity(self.verifier.workspace)
-            signature = (identity, frozenset(reads))
+            signature = (identity, frozenset(observed))
             key = str(context.run_id)
             previous, stale = self.progress.get(key, (signature, -1))
             stale = stale + 1 if previous == signature else 0
-            self.progress[key] = (signature, stale)
+            nudge: str | None = None
             if stale >= self.no_new_evidence_turns:
-                raise ModelTurnError(
-                    ModelFailureClass.PERMANENT,
-                    "CODING_NO_NEW_EVIDENCE",
-                    "Eight turns without a changed patch or new source/specialist evidence; "
-                    "preserve the candidate and diagnose instead of replaying reads",
+                if key in self.nudged:
+                    raise RunGateStop(
+                        StopReason.STALLED,
+                        "CODING_NO_NEW_EVIDENCE",
+                        f"{self.no_new_evidence_turns} more turns without a changed patch or "
+                        "any new tool result after a warning; preserve the candidate",
+                    )
+                # Stuck means recover first: one explicit warning, then a fresh window.
+                self.nudged.add(key)
+                stale = 0
+                nudge = (
+                    f"Your last {self.no_new_evidence_turns} actions changed nothing and "
+                    "returned nothing new. Repeating them will end this attempt. Change "
+                    "approach: edit the source for the current failure, or read something "
+                    "you have not read."
                 )
+            self.progress[key] = (signature, stale)
             inherited = self.inherited_failure() if self.inherited_failure else None
             bookkeeping: dict[str, object] = {
+                **({"warning": nudge} if nudge else {}),
                 "meaning": "Current check failure; not source truth or new authority",
                 # The latest verification result is already in the conversation;
                 # restating it here doubled every failure in the same tool result.
@@ -1097,6 +1115,7 @@ class RequiredChecksAwareModel:
                 if self.conversation_bookkeeping
                 else json.dumps(
                     {
+                        **({"warning": nudge} if nudge else {}),
                         "meaning": "Read bookkeeping, not source truth or new authority",
                         "completed_source_reads": sorted(selectors),
                         "completed_source_read_count": len(selectors),

@@ -69,6 +69,7 @@ from loopforge.ports.model import (
     ModelPort,
     ModelTurn,
     ModelTurnError,
+    RunGateStop,
 )
 from loopforge.ports.routing import RoutingDecision, RoutingPolicyPort, RoutingSignals
 from loopforge.ports.shadow import ShadowAdvice, ShadowPolicyPort
@@ -579,6 +580,15 @@ class Runtime:
                 model_span.attributes["loopforge.usage.cached_input_tokens"] = (
                     turn.usage.cached_input_tokens
                 )
+        except RunGateStop as gate:
+            # A workload rule decided before any model call: no attempt failed.
+            self._stop(
+                run_id,
+                gate.stop_reason,
+                gate.reason_code[:200],
+                summary=_bounded_stop_text(gate.reason_code, gate.summary),
+            )
+            return None
         except ModelTurnError as error:
             failure_code, failure_summary = error.reason_code[:200], error.summary[:1000]
             self._persist(
