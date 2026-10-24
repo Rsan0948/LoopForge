@@ -171,9 +171,7 @@ class Transport(httpx.BaseTransport):
 
 
 def task_inputs():
-    config = RepositoryGoalConfig.model_validate_json(
-        INTAKE.read_text()
-    )
+    config = RepositoryGoalConfig.model_validate_json(INTAKE.read_text())
     campaign = config.campaign.model_copy(
         update={
             "max_iterations": TURNS,

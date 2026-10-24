@@ -110,6 +110,7 @@ def test_the_recorded_drive_gives_gemini_the_evidence_store(
         raise RuntimeError(msg)
 
     monkeypatch.setattr(goal_launch, "GeminiSupervisor", Provider)
+
     def key(_path: Path) -> str:
         return "k"
 

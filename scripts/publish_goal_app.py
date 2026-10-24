@@ -68,7 +68,7 @@ def main() -> None:
         entry.chmod(0o755)
         wrapper = (
             f"#!/usr/bin/env bash\n# {name} launcher, managed by LoopForge ({goal.name}).\n"
-            f"exec /bin/bash {shlex.quote(str(entry))} \"$@\"\n"
+            f'exec /bin/bash {shlex.quote(str(entry))} "$@"\n'
         )
         installed = []
         command = Path(launcher).name
