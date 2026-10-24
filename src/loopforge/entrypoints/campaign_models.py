@@ -27,21 +27,15 @@ class DispatchRequest(StrictRecord):
 
 class CampaignConfig(StrictRecord):
     repository: str
-    project: Literal["brook", "helicops-cloud", "snake", "reconciliation"]
+    # Free-form label for the target repository; it carries no behaviour or authority.
+    project: str = Field(pattern=r"^[a-z0-9][a-z0-9._-]{0,62}$")
     revision: str = Field(pattern=r"^[0-9a-f]{40}$")
     scope: list[str] = Field(min_length=1, max_length=30)
     rounds: int = Field(default=3, ge=1, le=20)
     model: Literal["qwen3.8:27b-q4_K_M", "qwen3.6:35b-a3b"] = "qwen3.6:35b-a3b"
-    inference_profile: Literal[
-        "baseline-v1",
-        "qwen-coding-v1",
-        "qwen-bounded-v2",
-        "qwen-bounded-v3",
-        "qwen-app-v1",
-        "qwen-state-v1",
-        "qwen-session-v1",
-        "qwen-native-v1",
-    ] = "baseline-v1"
+    # qwen-native-v1 is the production worker; qwen-bounded-v3 is the known-good control
+    # (thinking off, plain history). Other profiles were retired on 2026-10-24 (ADR-0021).
+    inference_profile: Literal["qwen-bounded-v3", "qwen-native-v1"] = "qwen-bounded-v3"
     # Local inference engine for the coding worker. MLX serves the same native protocol
     # through adapters.mlx_transport; endpoint, model revision and renderer are code-owned.
     engine: Literal["ollama", "mlx"] = "ollama"
@@ -50,32 +44,15 @@ class CampaignConfig(StrictRecord):
     max_seconds: int = Field(default=7200, ge=30, le=14_400)
     model_timeout_seconds: int = Field(default=600, ge=30, le=1200)
     review_provider: Literal["local", "gemini"] = "local"
-    repair_escalation: bool = False
-    repair_budget_microusd: int = Field(default=500_000, ge=1, le=500_000)
-    repair_recovery_run_id: str | None = Field(default=None, pattern=r"^run_[a-z0-9]{1,64}$")
-    repair_decisions: bool = False
-    force_repair_attempt: bool = False
-    revisable_repair_decisions: bool = False
 
     @model_serializer(mode="wrap")
     def serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, object]:
         data = cast("dict[str, object]", handler(self))
-        if not self.revisable_repair_decisions:
-            data.pop("revisable_repair_decisions", None)
-        if not self.force_repair_attempt:
-            data.pop("force_repair_attempt", None)
+        # Omit defaults so frozen intake hashes from before these fields existed hold.
         if self.review_provider == "local":
             data.pop("review_provider", None)
         if self.engine == "ollama":
             data.pop("engine", None)
-        if not self.repair_decisions:
-            data.pop("repair_decisions", None)
-        if self.repair_recovery_run_id is None:
-            data.pop("repair_recovery_run_id", None)
-        if not self.repair_escalation:
-            # Preserve canonical authority hashes of pre-escalation intakes.
-            data.pop("repair_escalation", None)
-            data.pop("repair_budget_microusd", None)
         return data
 
     @model_validator(mode="after")
@@ -84,21 +61,6 @@ class CampaignConfig(StrictRecord):
             self.model != "qwen3.6:35b-a3b" or self.inference_profile != "qwen-native-v1"
         ):
             msg = "The MLX engine serves only the native qwen3.6:35b-a3b profile"
-            raise ValueError(msg)
-        if self.repair_escalation and self.inference_profile != "qwen-state-v1":
-            msg = "Repair escalation requires the fresh-state profile"
-            raise ValueError(msg)
-        if self.repair_recovery_run_id is not None and not self.repair_escalation:
-            msg = "A recovery reference requires frozen repair escalation authority"
-            raise ValueError(msg)
-        if self.repair_decisions and not self.repair_escalation:
-            msg = "Repair decisions require frozen repair escalation authority"
-            raise ValueError(msg)
-        if self.revisable_repair_decisions and not self.repair_decisions:
-            msg = "Revisable decisions require frozen repair decision authority"
-            raise ValueError(msg)
-        if self.force_repair_attempt and not self.repair_decisions:
-            msg = "Forced repair attempts require frozen repair decision authority"
             raise ValueError(msg)
         for prefix in self.scope:
             if not prefix or prefix.startswith("/") or ".." in prefix.split("/"):

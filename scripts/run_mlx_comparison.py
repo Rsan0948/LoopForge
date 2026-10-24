@@ -284,9 +284,6 @@ def child(plan_path, job_index):
             "max_seconds": SECONDS,
             "max_tokens": 1000000,
             "model_timeout_seconds": 240,
-            "repair_escalation": False,
-            "repair_decisions": False,
-            "force_repair_attempt": False,
         }
     )
     workspace = coding.prepare_checkout(

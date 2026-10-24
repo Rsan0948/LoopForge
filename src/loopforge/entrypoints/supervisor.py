@@ -4,7 +4,6 @@ import argparse
 import hashlib
 import json
 import os
-import sqlite3
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -16,7 +15,6 @@ from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, mod
 from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
 from loopforge.adapters.paid_budget import SQLitePaidBudget
-from loopforge.adapters.repair_journal import RepairJournal
 from loopforge.adapters.research_store import ResearchStore
 from loopforge.application.paid_supervisor import BudgetedSupervisor
 from loopforge.application.supervisor import GoalCoordinator
@@ -53,11 +51,9 @@ class PreparedGoalConfig(StrictRecord):
         return data
 
     @model_validator(mode="after")
-    def repair_requires_remote_authority(self) -> "PreparedGoalConfig":
-        if (
-            self.campaign.repair_escalation or self.campaign.review_provider == "gemini"
-        ) and self.remote_data == "none":
-            msg = "Repair escalation requires explicit remote data authority"
+    def frontier_review_requires_remote_authority(self) -> "PreparedGoalConfig":
+        if self.campaign.review_provider == "gemini" and self.remote_data == "none":
+            msg = "Frontier review requires explicit remote data authority"
             raise ValueError(msg)
         return self
 
@@ -95,17 +91,7 @@ class BaseGoalService:
         assert root_state.policy is not None
         path = directory / "paid-budget.sqlite"
         budget = SQLitePaidBudget(path, root_state.policy.max_cost_microusd)
-        known = root_state.spent_microusd
-        reserved = root_state.reserved_microusd
-
-        for ledger in (directory / "worker" / "repair").glob("*/ledger.sqlite"):
-            with sqlite3.connect(f"file:{ledger}?mode=ro", uri=True) as db:
-                cap = db.execute("SELECT ceiling FROM policy").fetchone()[0]
-                account = RepairJournal(ledger, cap).load(db)
-                unknown = sum(p[1] for p in account.pending)
-                known += account.spent - unknown
-                reserved += unknown
-        budget.bootstrap(known, reserved)
+        budget.bootstrap(root_state.spent_microusd, root_state.reserved_microusd)
         self.harness.coding.parent_budget = budget
         return budget
 

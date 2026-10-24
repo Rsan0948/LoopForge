@@ -45,15 +45,12 @@ class OllamaProfile:
 MLX_WORKING_BUDGET_TOKENS: Final = 49152
 
 
-def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inference profiles
+def profile_for(  # noqa: PLR0913 - explicit role and profile selectors
     role: Literal["coding", "review", "reporter"],
     *,
-    candidate: bool = False,
     bounded_v2: bool = False,
     report_v3: bool = False,
     app_workload: bool = False,
-    state_driven: bool = False,
-    session: bool = False,
     native: bool = False,
     model: str = "",
 ) -> OllamaProfile:
@@ -106,29 +103,6 @@ def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inferenc
             conversation_mode="history",
             thinking_policy="on_evidence",
         )
-    if session:
-        return OllamaProfile(
-            f"{role}-session-v1",
-            0.0,
-            0.95,
-            0.0,
-            False,
-            4096 if role == "coding" else 2048,
-            context_tokens=98304,
-            conversation_mode="state",
-        )
-    if state_driven:
-        return OllamaProfile(
-            f"{role}-state-v1",
-            0.0,
-            0.95,
-            0.0,
-            False,
-            4096 if role == "coding" else 2048,
-            False,
-            196608 if role == "reporter" else 65536,
-            conversation_mode="state",
-        )
     if app_workload:
         return OllamaProfile(
             f"{role}-app-v1",
@@ -152,15 +126,9 @@ def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inferenc
             98304 if role == "reporter" and report_v3 else 65536,
         )
     if role == "coding":
-        return OllamaProfile(
-            "coding-qwen-v1" if candidate else "coding-baseline-v1",
-            0.6 if candidate else 0.0,
-            0.95,
-            0.0 if candidate else 1.5,
-            True,
-            8192,
-            candidate,
-        )
+        # Only qwen-native-v1 and qwen-bounded-v3 code; the others were retired (ADR-0021).
+        msg = "coding requires the native or bounded-v3 profile"
+        raise ValueError(msg)
     return OllamaProfile(
         "reporter-bounded-v2" if role == "reporter" else "review-bounded-v1",
         0.0,

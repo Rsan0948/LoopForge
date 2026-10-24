@@ -49,8 +49,6 @@ from loopforge.entrypoints.campaign_models import (
     CodingTaskConfig,
     ReviewReport,
 )
-from loopforge.entrypoints.campaign_repair_decisions import RepairDecisionTools
-from loopforge.entrypoints.campaign_repair_escalation import RepairGuidanceTools
 from loopforge.entrypoints.campaign_review import ReviewTools, build_review, tool_specs
 from loopforge.entrypoints.campaign_store import CampaignStore
 from loopforge.ports.model import ModelPort
@@ -129,6 +127,40 @@ def prepared_check_model(
         raise ValueError(msg)
     return ScriptedModel(
         [ActionProposal(ActionId("prepared-fixed-check"), contract.checks[0].name, {})]
+    )
+
+
+def coding_objective(config: CampaignConfig, contract: CodingTaskConfig) -> str:
+    """The coding run objective: the frozen task objective plus profile working rules."""
+    if config.inference_profile == "qwen-native-v1":
+        return (
+            contract.objective
+            + "\nThis is one continuous conversation: your earlier tool calls and "
+            "their results stay above. Call review_feedback once for earlier "
+            "attempts' check evidence. Choose reads, edits and registered checks "
+            "to complete the task, and run the failing check after a coherent "
+            "change. Use current source hashes for edits. The supervisor "
+            "assignment is guidance; original acceptance, allowed paths, protected "
+            "files, commands and budgets remain mandatory. No merge or deployment."
+        )
+    return (
+        contract.objective + "\nMake the smallest scoped patch, including documentation "
+        "corrections and regression tests when relevant. Fixed registered checks "
+        "and protected test directories are immutable. Repository test files "
+        "expressly permitted by allowed_paths may be edited when writable; "
+        "new permitted regression tests may be added. The objective never "
+        "overrides runtime path protection. "
+        "Call review_feedback FIRST to read immutable check definitions "
+        "and previous failures. "
+        "Make the patch satisfy those fixed "
+        "assertions; do not guess documentation paths or titles. "
+        "Use the completed-read progress record; repeat reads are not progress. "
+        "If a patch already exists, run its fixed check before rereading "
+        "sources. On check failure, inspect the named failing allowed file "
+        "and correct it; do not repeatedly inspect unrelated implementation files. "
+        "Run only registered checks. No merge or deployment. "
+        "For launch work implement only this LAUNCH.md task "
+        "and respect its freeze list."
     )
 
 
@@ -302,11 +334,6 @@ class CodingCoordinator:
                     )
                 ]
                 previous_ids = [rid for rid, _ in linked]
-                prior_guidance = {
-                    RunId(rid): str(cast("dict[str, object]", detail)["guidance_objective_sha256"])
-                    for rid, detail in linked
-                    if isinstance(detail, dict) and "guidance_objective_sha256" in detail
-                }
                 used = sum(
                     replay(RunId(rid), events.events_for(RunId(rid))).total_tokens
                     for rid in previous_ids
@@ -372,13 +399,6 @@ class CodingCoordinator:
                     workspace,
                     store=events,
                     model=prepared_check_model(contract, workspace, prepared),
-                    prior_runs=tuple(RunId(rid) for rid in previous_ids),
-                    prior_guidance=prior_guidance,
-                    guidance_objective_sha256=guidance_objective_sha256(
-                        self.assignment_guidance.get(task)
-                    ),
-                    repair_ledger=self.directory / "repair" / task / "ledger.sqlite",
-                    parent_budget=self.parent_budget,
                     require_revision=any(
                         json.loads(detail).get("command") == "request_changes"
                         for detail in feedback
@@ -387,70 +407,9 @@ class CodingCoordinator:
                 acceptance_verifier = (
                     runtime.verifier if isinstance(runtime.verifier, CodingVerifier) else None
                 )
-                coding_tools = runtime.tools
-                while isinstance(coding_tools, (RepairGuidanceTools, RepairDecisionTools)):
-                    coding_tools = coding_tools.delegate
-                if isinstance(coding_tools, ConfinedCodingTools):
-                    coding_tools.feedback = coding_feedback(list(reversed(feedback)))
-                objective = (
-                    contract.objective
-                    + "\nMake the smallest scoped patch, including documentation "
-                    "corrections and regression tests when relevant. Fixed registered checks "
-                    "and protected test directories are immutable. Repository test files "
-                    "expressly permitted by allowed_paths may be edited when writable; "
-                    "new permitted regression tests may be added. The objective never "
-                    "overrides runtime path protection. "
-                    + (
-                        "Current versioned feedback and startup completion are already in "
-                        "each state packet. Follow its current phase; do not restart startup. "
-                        if config.inference_profile in {"qwen-state-v1", "qwen-session-v1"}
-                        else "Call review_feedback FIRST to read immutable check definitions "
-                        "and previous failures. "
-                    )
-                    + "Make the patch satisfy those fixed "
-                    "assertions; do not guess documentation paths or titles. "
-                    "Use the completed-read progress record; repeat reads are not progress. "
-                    + (
-                        "In verify phase, run the current candidate's required check. "
-                        "In repair phase, inspect the named failing allowed file and make "
-                        "a real correction using current exact source. Do not repeat an "
-                        "unchanged check or restart evidence retrieval already completed. "
-                        if config.inference_profile in {"qwen-state-v1", "qwen-session-v1"}
-                        else "If a patch already exists, run its fixed check before rereading "
-                        "sources. On check failure, inspect the named failing allowed file "
-                        "and correct it; do not repeatedly inspect unrelated implementation files. "
-                    )
-                    + "Run only registered checks. No merge or deployment. "
-                    + (
-                        ""
-                        if config.inference_profile in {"qwen-state-v1", "qwen-session-v1"}
-                        else "For launch work implement only this LAUNCH.md task "
-                        "and respect its freeze list."
-                    )
-                )
-                if config.inference_profile == "qwen-session-v1":
-                    objective = (
-                        contract.objective
-                        + "\nYou have a persistent working session: historical actions, edits and "
-                        "results are included. Choose useful reads, edits and registered checks "
-                        "to complete the task. Track which approaches failed and build on "
-                        "existing work. Historical source/results may be stale; use current "
-                        "source hashes for edits and fresh checks to establish success. "
-                        "The supervisor assignment is guidance. Original acceptance, allowed "
-                        "paths, protected files, commands and budgets remain mandatory. "
-                        "No merge or deployment."
-                    )
-                if config.inference_profile == "qwen-native-v1":
-                    objective = (
-                        contract.objective
-                        + "\nThis is one continuous conversation: your earlier tool calls and "
-                        "their results stay above. Call review_feedback once for earlier "
-                        "attempts' check evidence. Choose reads, edits and registered checks "
-                        "to complete the task, and run the failing check after a coherent "
-                        "change. Use current source hashes for edits. The supervisor "
-                        "assignment is guidance; original acceptance, allowed paths, protected "
-                        "files, commands and budgets remain mandatory. No merge or deployment."
-                    )
+                if isinstance(runtime.tools, ConfinedCodingTools):
+                    runtime.tools.feedback = coding_feedback(list(reversed(feedback)))
+                objective = coding_objective(config, contract)
                 review_tools = None
                 before = None
             else:

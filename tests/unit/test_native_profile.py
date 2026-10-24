@@ -154,9 +154,9 @@ def test_a3b_model_gets_vendor_sampling_and_room_for_long_reasoning() -> None:
     dense = profile_for("coding", native=True, model="qwen3.8:27b-q4_K_M")
     assert (dense.temperature, dense.presence_penalty, dense.output_tokens) == (0.6, 0.0, 8192)
     assert (dense.observation_format, dense.read_page_chars) == ("plain", 3000)
-    # The model never changes non-native profiles.
-    assert profile_for("coding", session=True, model="qwen3.6:35b-a3b") == profile_for(
-        "coding", session=True
+    # The model never changes the bounded-v3 control profile.
+    assert profile_for("coding", bounded_v2=True, model="qwen3.6:35b-a3b") == profile_for(
+        "coding", bounded_v2=True
     )
 
 

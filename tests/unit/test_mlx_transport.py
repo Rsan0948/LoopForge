@@ -231,7 +231,7 @@ def test_mlx_engine_is_opt_in_and_keeps_existing_intake_hashes() -> None:
 @pytest.mark.parametrize(
     "update",
     [
-        {"engine": "mlx", "inference_profile": "qwen-session-v1"},
+        {"engine": "mlx", "inference_profile": "qwen-bounded-v3"},
         {"engine": "mlx", "model": "qwen3.8:27b-q4_K_M"},
         {"engine": "vllm"},
     ],

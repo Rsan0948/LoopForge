@@ -72,15 +72,11 @@ def test_specialist_worker_keeps_coordinator_responsive(
     config = config.model_copy(
         update={
             "remote_data": "synthetic-fixture",
-            "campaign": config.campaign.model_copy(
-                update={
-                    "inference_profile": "qwen-state-v1",
-                    "repair_escalation": nonblocking,
-                }
-            ),
+            "campaign": config.campaign.model_copy(update={"inference_profile": "qwen-native-v1"}),
         }
     )
     service = PreparedGoalService(tmp_path / "nonblocking")
+    service.harness.nonblocking_goals = nonblocking
     entered, release, returned = threading.Event(), threading.Event(), threading.Event()
     errors: list[BaseException] = []
 
@@ -125,28 +121,6 @@ def test_specialist_worker_keeps_coordinator_responsive(
             caller.join(3)
         service.close()
     assert not errors
-
-
-def test_repair_authority_cannot_be_added_to_an_existing_goal(
-    tmp_path: Path, config: PreparedGoalConfig
-) -> None:
-    service = PreparedGoalService(tmp_path / "frozen")
-    try:
-        service.create(config)
-        raw = config.model_dump(mode="json")
-        raw["campaign"] = config.campaign.model_dump() | {
-            "inference_profile": "qwen-state-v1",
-            "repair_escalation": True,
-        }
-        with pytest.raises(ValueError, match="remote data authority"):
-            PreparedGoalConfig.model_validate(raw)
-        raw["remote_data"] = "synthetic-fixture"
-        replacement = PreparedGoalConfig.model_validate(raw)
-        (service.directory / "intake.json").write_text(replacement.model_dump_json())
-        with pytest.raises(ValueError, match="binding"):
-            service.worker()
-    finally:
-        service.close()
 
 
 def test_cancel_reconciles_unknown_call_and_keeps_spend(

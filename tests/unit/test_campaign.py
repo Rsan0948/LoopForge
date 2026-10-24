@@ -431,7 +431,8 @@ def test_review_context_tuning_preserves_authority_and_hard_budgets(
     assert live is not None
     assert live._max_history_chars == history_chars  # pyright: ignore[reportPrivateUsage]
     assert live._history_overflow == "trim"  # pyright: ignore[reportPrivateUsage]
-    assert live._context_window_tokens == 32768  # pyright: ignore[reportPrivateUsage]
+    # The default bounded-v3 control reviews in a 64K window.
+    assert live._context_window_tokens == 65536  # pyright: ignore[reportPrivateUsage]
     assert runtime.control.budget.max_total_tokens == cfg.max_tokens
     assert runtime.control.budget.max_iterations == cfg.max_iterations
     assert tools.max_source_reads == 10

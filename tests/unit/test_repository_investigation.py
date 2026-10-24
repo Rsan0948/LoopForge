@@ -421,7 +421,9 @@ def test_record_cannot_claim_wrong_checkpoint_or_environment(
         )
 
 
-@pytest.mark.parametrize("payload", [b"binary\x00source", b"x" * 262145])
+@pytest.mark.parametrize(
+    "payload", [b"binary\x00source", b"x" * 262145], ids=["binary", "oversized"]
+)
 def test_unsupported_source_fails_before_artifact_admission(
     service: RepositoryGoalService, monkeypatch: pytest.MonkeyPatch, payload: bytes
 ) -> None:

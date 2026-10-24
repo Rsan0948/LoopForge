@@ -16,10 +16,8 @@ from loopforge.ports.model import ModelTurnError
 
 
 @pytest.mark.parametrize("role", ["coding", "review", "reporter"])
-def test_bounded_profile_is_explicit_and_preserves_legacy(role: str) -> None:
-    baseline = profile_for(role)  # type: ignore[arg-type]
+def test_bounded_profile_is_explicit_and_bounded(role: str) -> None:
     selected = profile_for(role, bounded_v2=True)  # type: ignore[arg-type]
-    assert baseline.context_tokens == 32768
     assert selected.context_tokens == 65536
     assert not selected.thinking
     assert not selected.preserve_thinking
@@ -183,15 +181,3 @@ def test_app_envelope_preserves_multi_file_evidence_and_legacy_bounds(app: bool)
         with pytest.raises(ModelTurnError, match="immutable reporting envelope"):
             build_report_packet(tools, context, "Review every required byte")
     assert tools.excerpts == before
-
-
-@pytest.mark.parametrize("role", ["coding", "review", "reporter"])
-def test_state_profile_opts_in_without_changing_legacy(role: str) -> None:
-    legacy = profile_for(role, app_workload=True)  # type: ignore[arg-type]
-    fresh = profile_for(role, state_driven=True)  # type: ignore[arg-type]
-    assert legacy.conversation_mode == "history"
-    assert fresh.conversation_mode == "state"
-    assert fresh.thinking is False
-    assert fresh.preserve_thinking is False
-    assert fresh.context_tokens == (196608 if role == "reporter" else 65536)
-    assert fresh.output_tokens == (4096 if role == "coding" else 2048)

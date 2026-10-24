@@ -64,7 +64,7 @@ def fixture_config(directory: Path, image: str) -> RepositoryGoalConfig:
             max_iterations=32,
             max_seconds=300,
             model_timeout_seconds=120,
-            inference_profile="qwen-coding-v1",
+            inference_profile="qwen-bounded-v3",
         ),
         task=CodingTaskConfig(
             objective=(

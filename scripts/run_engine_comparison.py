@@ -178,9 +178,6 @@ def task_inputs():
             "max_seconds": SECONDS,
             "max_tokens": 2_000_000,
             "model_timeout_seconds": 1200,
-            "repair_escalation": False,
-            "repair_decisions": False,
-            "force_repair_attempt": False,
         }
     )
     assert campaign.model == MODEL and campaign.inference_profile == "qwen-native-v1"

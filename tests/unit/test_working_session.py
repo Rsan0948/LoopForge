@@ -7,13 +7,11 @@ from datetime import UTC, datetime
 
 import pytest
 
-from loopforge.adapters.ollama_profiles import profile_for
 from loopforge.adapters.working_evidence import working_evidence
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.events import ActionProposed, Event, ToolFailed, ToolSucceeded
 from loopforge.domain.investigation import ResearchRecord
 from loopforge.domain.types import ActionId, EventId, RunId
-from loopforge.entrypoints.campaign_session_context import session_history
 from loopforge.ports.tools import ToolFailureClass
 
 
@@ -103,36 +101,3 @@ def events() -> list[Event]:
                 )
             )
     return result
-
-
-def test_session_keeps_attempts_failures_and_results_across_reconstruction() -> None:
-    original = events()
-    packet = json.loads(session_history(original))
-    assert len(packet["actions"]) == 6
-    assert packet["actions"][0]["arguments"]["old"] == "old0"
-    assert packet["actions"][2]["error_code"] == "STALE"
-    assert "no edit applied" in packet["actions"][2]["result"]
-    assert packet["trust"] == "untrusted_content"
-    assert "Earlier source may have changed" in packet["meaning"]
-    assert packet["omitted_event_sequences"] == []
-    assert session_history(tuple(original)) == session_history(original)
-    tiny = json.loads(session_history(original, max_bytes=500))
-    assert tiny["omitted_event_sequences"]
-    assert tiny["actions"][-1]["sequence"] == 12
-
-
-def test_session_profile_has_capacity_without_changing_old_profiles() -> None:
-    assert profile_for("coding", session=True).context_tokens == 98304
-    assert profile_for("coding", session=True).conversation_mode == "state"
-    assert profile_for("coding", state_driven=True).context_tokens == 65536
-
-
-def test_current_observation_is_not_paid_for_twice_in_history() -> None:
-    original = events()
-    current = "Applied edit 5; historical source \u03b1"
-    packet = json.loads(session_history(original, present=frozenset({current})))
-    results = {a["sequence"]: a["result"] for a in packet["actions"]}
-    assert results[12] == "(identical to the current observation item; not repeated)"
-    assert results[10] == "Applied edit 4; historical source \u03b1"
-    assert results[6] == "Rejected stale source; no edit applied"
-    assert json.loads(session_history(original))["actions"][-1]["result"] == current

@@ -13,6 +13,7 @@ from hypothesis import strategies as st
 from loopforge.adapters.git_workspace import GitWorkspaceManager
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.ollama_model import OllamaModel
+from loopforge.adapters.ollama_reporting import LARGE_REPORT_MAX_BYTES
 from loopforge.adapters.scripted import FixedClock, ScriptedModel
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.coding import CodingEvent, CodingState, reduce_coding
@@ -283,7 +284,8 @@ def test_report_finalization_uses_native_schema_and_validates_references(
     captured: list[str] = []
 
     class Reporter:
-        def __init__(self, model: str, *, timeout_seconds: float) -> None:
+        def __init__(self, model: str, *, timeout_seconds: float, **profile: bool) -> None:
+            del profile
             assert model == cfg.model
             assert timeout_seconds > 0
 
@@ -365,7 +367,8 @@ def test_full_controller_context_only_reports_with_mandatory_evidence(
     packets: list[str] = []
 
     class Reporter:
-        def __init__(self, model: str, *, timeout_seconds: float) -> None:
+        def __init__(self, model: str, *, timeout_seconds: float, **profile: bool) -> None:
+            del profile
             del model, timeout_seconds
 
         def generate(
@@ -426,7 +429,8 @@ def test_covered_review_can_read_missing_consumer_before_reporting(
     packets: list[str] = []
 
     class Reporter:
-        def __init__(self, model: str, *, timeout_seconds: float) -> None:
+        def __init__(self, model: str, *, timeout_seconds: float, **profile: bool) -> None:
+            del profile
             del model, timeout_seconds
 
         def generate(
@@ -477,7 +481,8 @@ def test_patch_review_rejects_repeated_report_without_new_source(
     packets: list[str] = []
 
     class Reporter:
-        def __init__(self, model: str, *, timeout_seconds: float) -> None:
+        def __init__(self, model: str, *, timeout_seconds: float, **profile: bool) -> None:
+            del profile
             del model, timeout_seconds
 
         def generate(
@@ -528,7 +533,8 @@ def test_cached_replay_loop_finalizes_or_stops_without_inventing_coverage(
     captured: list[str] = []
 
     class Reporter:
-        def __init__(self, model: str, *, timeout_seconds: float) -> None:
+        def __init__(self, model: str, *, timeout_seconds: float, **profile: bool) -> None:
+            del profile
             del model, timeout_seconds
 
         def generate(
@@ -616,7 +622,8 @@ def test_exhausted_source_sample_finalizes_without_bypassing_mandatory_coverage(
     captured: list[str] = []
 
     class Reporter:
-        def __init__(self, model: str, *, timeout_seconds: float) -> None:
+        def __init__(self, model: str, *, timeout_seconds: float, **profile: bool) -> None:
+            del profile
             del model, timeout_seconds
 
         def generate(
@@ -678,25 +685,26 @@ def test_patch_review_exposes_missing_diff_before_report_submission() -> None:
 
 @pytest.mark.parametrize("case", ["sample", "mandatory", "oversized_objective", "context_only"])
 def test_report_envelope_compacts_samples_but_never_drops_mandatory_source(case: str) -> None:
-    files = {f"source{i}.py": f"observed{i} " + "界" * 700 for i in range(10)}
-    tools = ReviewTools(files, "prior report " * 1000)
+    # Sized against the bounded-v3 reporting envelope (the default control profile).
+    files = {f"source{i}.py": f"observed{i} " + "界" * 3500 for i in range(10)}
+    tools = ReviewTools(files, "prior report " * 4000)
     for path in files:
         assert call(tools, "read_file", path=path).ok
     if case == "mandatory":
         tools.required_intervals = {path: [(1, 1)] for path in files}
     if case == "context_only":
-        tools = ReviewTools({"a.py": "source()"}, "context " * 4000)
+        tools = ReviewTools({"a.py": "source()"}, "context " * 16000)
         assert call(tools, "read_file", path="a.py").ok
     cfg = CampaignConfig(repository="/fixture", project="brook", revision="a" * 40, scope=["."])
     model = ReportingReviewModel(ScriptedModel([]), tools, cfg, InMemoryEventStore())
     now = datetime(2026, 10, 10, tzinfo=UTC)
-    objective = "界" * 10000 if case == "oversized_objective" else "Inspect observed sources"
+    objective = "界" * 40000 if case == "oversized_objective" else "Inspect observed sources"
     context = ModelContext(
         run_id=RunId("packet-fixture"),
         items=(
             ContextItem(
                 item_id=ContextItemId("packet-fixture:prior"),
-                content="repeated lower-trust context " * 3000,
+                content="repeated lower-trust context " * 4000,
                 trust=TrustClass.UNTRUSTED_CONTENT,
                 source=ContextSource(origin=TrustClass.UNTRUSTED_CONTENT, reference="fixture"),
                 created_at=now,
@@ -716,7 +724,10 @@ def test_report_envelope_compacts_samples_but_never_drops_mandatory_source(case:
         return
     packet = model.report_packet(context, "packet-fixture", objective)
     schema = review_module.ShortReferencedReport.model_json_schema()
-    assert len(packet.encode()) + len(str(schema).encode()) + len(objective.encode()) <= 26000
+    assert (
+        len(packet.encode()) + len(str(schema).encode()) + len(objective.encode())
+        <= LARGE_REPORT_MAX_BYTES
+    )
     data = json.loads(packet)
     assert data["context_omitted_for_envelope"] is True
     assert data["task_context"] == []

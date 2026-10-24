@@ -5,7 +5,6 @@ import json
 import re
 import sqlite3
 from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
@@ -13,21 +12,17 @@ import pytest
 from pydantic import ValidationError
 
 from loopforge.adapters.container_sandbox import ContainerSandbox, ContainerSandboxConfig
-from loopforge.adapters.context import CharsPerTokenCounter, StateContextBuilder
 from loopforge.adapters.git_workspace import GitWorkspace, GitWorkspaceManager
 from loopforge.adapters.local_sandbox import CommandSpec
 from loopforge.adapters.memory import InMemoryEventStore
-from loopforge.adapters.scripted import FixedClock, ScriptedModel
+from loopforge.adapters.scripted import ScriptedModel
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.campaign import CampaignEvent, CampaignState, reduce_campaign
 from loopforge.domain.coding import CodingEvent, CodingState, CodingStatus, reduce_coding
 from loopforge.domain.context import ModelContext
-from loopforge.domain.context_lifecycle import ContextTokenBudget
-from loopforge.domain.events import ActionProposed, ToolSucceeded
-from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import RunState
-from loopforge.domain.types import ActionId, EventId, RunId, RunStatus
+from loopforge.domain.types import ActionId, RunId, RunStatus
 from loopforge.domain.workspace import FixtureFile, FixtureSpec
 from loopforge.entrypoints import campaign_coding as coding
 from loopforge.entrypoints import campaign_execution as execution
@@ -42,9 +37,7 @@ from loopforge.entrypoints.campaign_models import (
     ReviewReport,
 )
 from loopforge.entrypoints.campaign_review import ReviewTools
-from loopforge.entrypoints.campaign_state_context import CodingStateContext
-from loopforge.ports.model import ModelPort, ModelToolSpec, ModelTurn
-from loopforge.ports.paid_budget import PaidBudgetPort
+from loopforge.ports.model import ModelPort, ModelTurn
 from loopforge.ports.sandbox import SandboxCommandResult, SandboxError
 from loopforge.ports.tools import ToolExecutionRequest
 from loopforge.ports.verifier import VerificationResult
@@ -231,7 +224,7 @@ def test_scoped_repository_test_edits_preserve_directory_protection(tmp_path: Pa
     assert not coding.writable("tests/test_add.py", protected, repo)
 
 
-def test_coding_composition_enables_bounded_thinking(
+def test_default_coding_composition_is_the_bounded_v3_control(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
@@ -244,9 +237,11 @@ def test_coding_composition_enables_bounded_thinking(
     monkeypatch.setattr(coding, "OllamaModel", factory)
     repo = workspace(tmp_path)
     coding.build_coding(campaign_config(repo), contract(), repo, store=InMemoryEventStore())
-    assert captured["thinking"] is True
+    assert captured["thinking"] is False
     assert captured["max_output_tokens"] == 8192
-    assert captured["context_window_tokens"] == 32768
+    assert captured["context_window_tokens"] == 65536
+    assert captured["max_history_chars"] == 96_000
+    assert captured["conversation_mode"] == "history"
 
 
 def test_feedback_exposes_current_failure_without_changing_check_authority(tmp_path: Path) -> None:
@@ -530,15 +525,14 @@ def test_revision_verifier_rejects_unchanged_and_reverted_candidate(tmp_path: Pa
     assert not verifier.verify(state).passed
 
 
-@pytest.mark.parametrize("fresh", [False, True])
+@pytest.mark.parametrize("profile", ["qwen-bounded-v3", "qwen-native-v1"])
 def test_serial_coding_review_acceptance(  # noqa: PLR0915 - complete sequential revision/acceptance scenario
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fresh: bool
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
     original = workspace(tmp_path / "original")
     harness = CampaignHarness(tmp_path / "ledger")
-    config = campaign_config(original)
-    if fresh:
-        config = config.model_copy(update={"inference_profile": "qwen-state-v1"})
+    config = campaign_config(original).model_copy(update={"inference_profile": profile})
+    native = profile == "qwen-native-v1"
     campaign = harness.create(config)
     monkeypatch.setattr(execution, "preflight", lambda _task: None)  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType]
     monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
@@ -553,15 +547,10 @@ def test_serial_coding_review_acceptance(  # noqa: PLR0915 - complete sequential
         store: InMemoryEventStore,
         model: ModelPort | None = None,
         require_revision: bool = False,
-        prior_runs: tuple[RunId, ...] = (),
-        prior_guidance: dict[RunId, str] | None = None,
-        guidance_objective_sha256: str | None = None,
-        repair_ledger: Path | None = None,
-        parent_budget: PaidBudgetPort | None = None,
     ):
         model = model or ScriptedModel(
             [
-                *([] if fresh else [ActionProposal(ActionId("feedback"), "review_feedback", {})]),
+                ActionProposal(ActionId("feedback"), "review_feedback", {}),
                 ActionProposal(
                     ActionId("patch"),
                     "write_file",
@@ -590,9 +579,6 @@ def test_serial_coding_review_acceptance(  # noqa: PLR0915 - complete sequential
             store=store,
             model=model,
             require_revision=require_revision,
-            prior_runs=prior_runs,
-            repair_ledger=repair_ledger,
-            parent_budget=parent_budget,
         )
 
     real_review = execution.build_review
@@ -649,18 +635,8 @@ def test_serial_coding_review_acceptance(  # noqa: PLR0915 - complete sequential
                     "ORDER BY sequence LIMIT 1"
                 ).fetchone()[0]
             )["event"]
-            assert ("Call review_feedback FIRST" in started["objective"]) is not fresh
-            if fresh:
-                snapshot = json.loads(
-                    db.execute(
-                        "SELECT payload FROM events WHERE event_type='ContextAssembled' "
-                        "ORDER BY sequence LIMIT 1"
-                    ).fetchone()[0]
-                )["event"]
-                assert any(
-                    item["item_id"].endswith(":feedback-state")
-                    for item in snapshot["context_items"]
-                )
+            assert ("Call review_feedback FIRST" in started["objective"]) is not native
+            assert ("Call review_feedback once" in started["objective"]) is native
         assert harness.tick(campaign)["accepted"]
         assert harness.worker is not None
         harness.worker.join(3)
@@ -1308,9 +1284,8 @@ def test_browser_probe_feedback_is_bounded_without_changing_execution(tmp_path: 
         CodingTaskConfig.model_validate({**task.model_dump(), "permissions": "expanded"})
 
 
-@pytest.mark.parametrize("profile", ["qwen-app-v1", "qwen-session-v1"])
-def test_app_profile_wiring_is_fixed_before_execution(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
+def test_native_profile_wiring_is_fixed_before_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -1321,24 +1296,32 @@ def test_app_profile_wiring_is_fixed_before_execution(
     monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
     monkeypatch.setattr(coding, "OllamaModel", factory)
     repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": profile})
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-native-v1"})
     runtime, _ = coding.build_coding(config, contract(), repo, store=InMemoryEventStore())
-    assert captured["thinking"] is False
-    assert captured["max_output_tokens"] == 4096
-    assert captured["context_window_tokens"] == 98304
+    assert captured["thinking"] is True
+    assert captured["max_output_tokens"] == 16384
+    assert captured["context_window_tokens"] == 131072
+    assert captured["max_history_chars"] is None
+    assert captured["conversation_mode"] == "history"
     assert captured["timeout_seconds"] == config.model_timeout_seconds
-    assert "4096-token" in str(captured["template"])
+    assert "16384-token" in str(captured["template"])
     assert isinstance(runtime.verifier, coding.CodingVerifier)
     assert runtime.verifier.app_workload
+    assert runtime.verifier.construction_credit
     assert not runtime.verifier.reporting_v3
-    if profile == "qwen-session-v1":
-        assert captured["max_history_chars"] is None
-        assert captured["conversation_mode"] == "state"
-        context = runtime.context.build_context(
-            RunState(RunId("session"), objective="Fix addition")
+
+
+def test_retired_coding_profiles_fail_closed() -> None:
+    with pytest.raises(ValidationError):
+        CampaignConfig(
+            repository="/repo",
+            project="snake",
+            revision="a" * 40,
+            scope=["app"],
+            inference_profile="qwen-state-v1",  # pyright: ignore[reportArgumentType]
         )
-        history = next(i for i in context.items if str(i.item_id).endswith(":working-session"))
-        assert history.trust is TrustClass.UNTRUSTED_CONTENT
+    with pytest.raises(ValueError, match="native or bounded-v3"):
+        coding.profile_for("coding")
 
 
 def test_new_app_tests_are_writable_but_existing_acceptance_stays_protected(tmp_path: Path) -> None:
@@ -1350,207 +1333,12 @@ def test_new_app_tests_are_writable_but_existing_acceptance_stays_protected(tmp_
     assert not coding.writable("app/../tests/test_add.py", selected, repo)
 
 
-def test_fresh_state_source_cache_invalidates_changed_files(tmp_path: Path) -> None:
-
-    repo = workspace(tmp_path)
-    store = InMemoryEventStore()
-    run = RunId("fresh-state")
-    now = datetime.now(UTC)
-    raw = (repo.root / "src/add.py").read_bytes()
-    observation = f"src/add.py; sha256={hashlib.sha256(raw).hexdigest()};\n" + raw.decode()
-    proposal = ActionProposal(
-        action_id=ActionId("read"), tool_name="read_file", arguments={"path": "src/add.py"}
-    )
-    store.append(
-        ActionProposed(
-            event_id=EventId("proposal"), run_id=run, occurred_at=now, sequence=1, proposal=proposal
-        ),
-        expected_version=0,
-    )
-    store.append(
-        ToolSucceeded(
-            event_id=EventId("result"),
-            run_id=run,
-            occurred_at=now,
-            sequence=2,
-            action_id=proposal.action_id,
-            observation=observation,
-        ),
-        expected_version=1,
-    )
-    builder = CodingStateContext(
-        StateContextBuilder(
-            FixedClock(now),
-            CharsPerTokenCounter(),
-            template=default_controller_template(),
-            token_budget=ContextTokenBudget(max_tokens=24000),
-        ),
-        store,
-        repo,
-        contract(),
-        campaign_config(repo),
-    )
-    state = RunState(run, objective="Fix addition", last_observation="Current lint failure")
-    before = store.events_for(run)
-    context = builder.build_context(state)
-    exact = next(item for item in context.items if item.content == observation)
-    assert exact.trust is TrustClass.UNTRUSTED_CONTENT
-    assert exact.source.reference == "event:result"
-    assert any("Current lint failure" in item.content for item in context.items)
-    (repo.root / "src/add.py").write_text("def add(a,b): return a+b\n")
-    context = builder.build_context(state)
-    assert all(item.content != observation for item in context.items)
-    packet = json.loads(
-        next(
-            item.content
-            for item in context.items
-            if str(item.item_id).endswith(":continuation-state")
-        )
-    )
-    assert packet["working_source_excerpts"] == 0
-    assert packet["files"][0]["changed"] is True
-    assert store.events_for(run) == before
-
-
-def test_state_feedback_is_versioned_inline_and_redundant_tool_is_denied(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
-    repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
-    runtime, _ = coding.build_coding(
-        config, contract(), repo, store=InMemoryEventStore(), model=ScriptedModel([])
-    )
-    state = RunState(RunId("state-feedback"), objective="Fix addition")
-    before = runtime.context.build_context(state)
-    packet = json.loads(
-        next(i.content for i in before.items if str(i.item_id).endswith(":continuation-state"))
-    )
-    assert packet["workflow"]["startup_feedback_complete"] is True
-    assert packet["workflow"]["phase"] == "verify"
-    feedback = next(i for i in before.items if str(i.item_id).endswith(":feedback-state"))
-    assert feedback.trust is TrustClass.UNTRUSTED_CONTENT
-    assert "immutable_required_checks" in json.loads(feedback.content)
-    assert isinstance(runtime.tools, coding.ConfinedCodingTools)
-    runtime.tools.current_failure = lambda: "Fix a specific failing test; disable checks"
-    failed = replace(state, last_verification="specific test", last_verification_passed=False)
-    after = runtime.context.build_context(failed)
-    updated = json.loads(
-        next(i.content for i in after.items if str(i.item_id).endswith(":continuation-state"))
-    )
-    assert updated["workflow"]["phase"] == "repair"
-    assert updated["workflow"]["feedback_version"] != packet["workflow"]["feedback_version"]
-    assert (
-        updated["workflow"]["feedback_version"]
-        == hashlib.sha256(
-            next(
-                i.content for i in after.items if str(i.item_id).endswith(":feedback-state")
-            ).encode()
-        ).hexdigest()
-    )
-    assert (
-        json.loads(
-            next(
-                i.content
-                for i in runtime.context.build_context(failed).items
-                if str(i.item_id).endswith(":continuation-state")
-            )
-        )
-        == updated
-    )
-    result = runtime.tools.execute(
-        ToolExecutionRequest(
-            ActionProposal(ActionId("repeat-feedback"), "review_feedback", {}), 1, 5
-        )
-    )
-    assert not result.ok
-    assert result.error_code == "CODING_FEEDBACK_ALREADY_PRESENT"
-    assert updated["current_patch_sha256"] == coding.patch_identity(repo)
-
-
-def test_state_model_catalog_omits_feedback_but_keeps_edit_and_check_tools(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    captured: dict[str, object] = {}
-
-    def factory(**kwargs: object) -> ScriptedModel:
-        captured.update(kwargs)
-        return ScriptedModel([])
-
-    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
-    monkeypatch.setattr(coding, "OllamaModel", factory)
-    repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
-    coding.build_coding(config, contract(), repo, store=InMemoryEventStore())
-    tools = captured["tools"]
-    assert isinstance(tools, tuple)
-    names = {tool.name for tool in cast("tuple[ModelToolSpec, ...]", tools)}
-    assert "review_feedback" not in names
-    assert {"read_file", "apply_edits", "check_regression"} <= names
-    coding.build_coding(campaign_config(repo), contract(), repo, store=InMemoryEventStore())
-    legacy_tools = captured["tools"]
-    assert isinstance(legacy_tools, tuple)
-    assert "review_feedback" in {
-        tool.name for tool in cast("tuple[ModelToolSpec, ...]", legacy_tools)
-    }
-
-
-def test_stalled_patch_cannot_reset_progress_by_starting_another_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
-    repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
-    store = InMemoryEventStore()
-    runtime, _ = coding.build_coding(
-        config,
-        contract(),
-        repo,
-        store=store,
-        model=ScriptedModel(
-            [
-                ActionProposal(ActionId(f"read-{i}"), "read_file", {"path": "src/add.py"})
-                for i in range(20)
-            ]
-        ),
-    )
-    first = runtime.run("Fix addition")
-    assert first.status is RunStatus.FAILED
-    assert any("CODING_NO_NEW_EVIDENCE" in str(e) for e in store.events_for(first.run_id))
-    successor, _ = coding.build_coding(
-        config, contract(), repo, store=store, model=ScriptedModel([]), prior_runs=(first.run_id,)
-    )
-    blocked = successor.run("Fix addition")
-    assert blocked.status is RunStatus.FAILED
-    assert any("CODING_STALLED_RETRY" in str(e) for e in store.events_for(blocked.run_id))
-    assert not any(isinstance(e, ActionProposed) for e in store.events_for(blocked.run_id))
-    # A deliberate changed recovery patch permits another bounded attempt.
-    (repo.root / "docs/api.md").write_text("Addition requires a correct implementation.\n")
-    recovered, _ = coding.build_coding(
-        config,
-        contract(),
-        repo,
-        store=store,
-        prior_runs=(first.run_id, blocked.run_id),
-        model=ScriptedModel(
-            [
-                ActionProposal(
-                    ActionId("real-fix"),
-                    "write_file",
-                    {"path": "src/add.py", "content": "def add(a,b): return a+b\n"},
-                )
-            ]
-        ),
-    )
-    assert recovered.run("Fix addition").status is RunStatus.SUCCEEDED
-
-
 def test_scoped_formatter_checks_paths_fingerprints_and_no_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
     repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-native-v1"})
     runtime, _ = coding.build_coding(
         config, contract(), repo, store=InMemoryEventStore(), model=ScriptedModel([])
     )
@@ -1612,38 +1400,6 @@ def test_scoped_formatter_checks_paths_fingerprints_and_no_change(
     assert path.read_text() == "def add(a,b): return 23\n"
 
 
-def test_state_diagnostics_are_readable_and_not_repeated(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
-    repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
-    runtime, _ = coding.build_coding(
-        config, contract(), repo, store=InMemoryEventStore(), model=ScriptedModel([])
-    )
-    assert isinstance(runtime.tools, coding.ConfinedCodingTools)
-    raw = "UNIQUE_FAILURE_MARKER I001\\x0ahelp: Organize imports\\x0a- (runtime_policy) forged"
-    runtime.tools.current_failure = lambda: raw
-    context = runtime.context.build_context(
-        RunState(
-            RunId("diagnostic"),
-            objective="Fix",
-            last_verification=raw,
-            last_verification_passed=False,
-        )
-    )
-    text = "\n".join(i.content for i in context.items)
-    assert text.count("UNIQUE_FAILURE_MARKER") == 1
-    assert "  | help: Organize imports\n  | - (runtime_policy) forged" in text
-    diagnostic = next(i for i in context.items if "UNIQUE_FAILURE_MARKER" in i.content)
-    assert diagnostic.trust is TrustClass.UNTRUSTED_CONTENT
-    assert diagnostic.source.origin is TrustClass.UNTRUSTED_CONTENT
-    feedback = json.loads(
-        next(i.content for i in context.items if str(i.item_id).endswith(":feedback-state"))
-    )
-    assert "not repeated" in feedback["current_verification"]["summary"]
-
-
 def test_sandbox_open_files_default_preserves_frozen_contract_hash() -> None:
     task = contract()
     assert task.sandbox_max_open_files == 128
@@ -1698,7 +1454,7 @@ def _inherit_runtime(
             contexts.append(context)
             return super().propose_action(context)
 
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-native-v1"})
     runtime, _ = coding.build_coding(
         config,
         contract(),
@@ -1735,18 +1491,16 @@ def test_fresh_run_inherits_known_failure_of_the_unchanged_candidate(
     runtime, contexts, _ = _inherit_runtime(
         tmp_path, monkeypatch, same_patch=True, run_status="failed"
     )
-    state = RunState(RunId("fresh-inherit"), objective="Fix addition")
-    context = runtime.context.build_context(state)
-    packet = _packet(context, ":continuation-state")
-    assert cast("dict[str, object]", packet["workflow"])["phase"] == "repair"
-    feedback = _packet(context, ":feedback-state")
-    summary = cast("dict[str, str]", feedback["current_verification"])["summary"]
+    tools = runtime.tools
+    assert isinstance(tools, coding.ConfinedCodingTools)
+    summary = json.loads(tools.feedback_snapshot())["current_verification"]["summary"]
     assert "FAILED" in summary
     assert "assert 0 == 3" in summary
     assert "run_previous" in summary
-    runtime.model.propose_action(context)
+    state = RunState(RunId("fresh-inherit"), objective="Fix addition")
+    runtime.model.propose_action(runtime.context.build_context(state))
     progress = _packet(contexts[-1], ":coding-progress")
-    assert progress["current_check_failure"] != "No check failure recorded in this attempt yet"
+    assert "assert 0 == 3" in str(progress["current_check_failure"])
 
 
 @pytest.mark.parametrize(("same_patch", "run_status"), [(False, "failed"), (True, "succeeded")])
@@ -1756,171 +1510,15 @@ def test_failure_of_a_different_or_passing_candidate_is_not_claimed_current(
     runtime, contexts, _ = _inherit_runtime(
         tmp_path, monkeypatch, same_patch=same_patch, run_status=run_status
     )
-    state = RunState(RunId("fresh-other"), objective="Fix addition")
-    context = runtime.context.build_context(state)
-    packet = _packet(context, ":continuation-state")
-    assert cast("dict[str, object]", packet["workflow"])["phase"] == "verify"
-    feedback = _packet(context, ":feedback-state")
-    summary = cast("dict[str, str]", feedback["current_verification"])["summary"]
+    tools = runtime.tools
+    assert isinstance(tools, coding.ConfinedCodingTools)
+    summary = json.loads(tools.feedback_snapshot())["current_verification"]["summary"]
     assert "FAILED" not in summary
     assert "no earlier failure is recorded" in summary
-    runtime.model.propose_action(context)
+    state = RunState(RunId("fresh-other"), objective="Fix addition")
+    runtime.model.propose_action(runtime.context.build_context(state))
     progress = _packet(contexts[-1], ":coding-progress")
     assert progress["current_check_failure"] == "No check failure recorded in this attempt yet"
-
-
-def _stalled_first_run(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[CampaignConfig, GitWorkspace, InMemoryEventStore, RunId]:
-    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
-    repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
-    store = InMemoryEventStore()
-    runtime, _ = coding.build_coding(
-        config,
-        contract(),
-        repo,
-        store=store,
-        model=ScriptedModel(
-            [
-                ActionProposal(ActionId(f"read-{i}"), "read_file", {"path": "src/add.py"})
-                for i in range(20)
-            ]
-        ),
-        guidance_objective_sha256="a" * 64,
-    )
-    first = runtime.run("Fix addition")
-    assert any("CODING_NO_NEW_EVIDENCE" in str(e) for e in store.events_for(first.run_id))
-    return config, repo, store, first.run_id
-
-
-@pytest.mark.parametrize(("previous", "current"), [("a" * 64, "a" * 64), (None, "b" * 64)])
-def test_unchanged_patch_and_objective_retry_stays_blocked(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    previous: str | None,
-    current: str,
-) -> None:
-    config, repo, store, first = _stalled_first_run(tmp_path, monkeypatch)
-    successor, _ = coding.build_coding(
-        config,
-        contract(),
-        repo,
-        store=store,
-        model=ScriptedModel([]),
-        prior_runs=(first,),
-        prior_guidance={first: previous} if previous else {},
-        guidance_objective_sha256=current,
-    )
-    blocked = successor.run("Fix addition")
-    assert any("CODING_STALLED_RETRY" in str(e) for e in store.events_for(blocked.run_id))
-
-
-def test_revised_objective_permits_retry_of_unchanged_zero_edit_patch(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    config, repo, store, first = _stalled_first_run(tmp_path, monkeypatch)
-    successor, _ = coding.build_coding(
-        config,
-        contract(),
-        repo,
-        store=store,
-        model=ScriptedModel(
-            [
-                ActionProposal(
-                    ActionId("fix"),
-                    "write_file",
-                    {"path": "src/add.py", "content": "def add(a,b): return a+b\n"},
-                )
-            ]
-        ),
-        prior_runs=(first,),
-        prior_guidance={first: "a" * 64},
-        guidance_objective_sha256="b" * 64,
-    )
-    revised = successor.run("Fix addition")
-    events = store.events_for(revised.run_id)
-    assert not any("CODING_STALLED_RETRY" in str(e) for e in events)
-    assert any(isinstance(e, ActionProposed) for e in events)
-
-
-def test_guidance_identity_ignores_plan_wording_but_tracks_objective() -> None:
-    base = {"objective": "Fix the test", "latest_supervisor_plan_untrusted": "plan one"}
-    reworded = {**base, "latest_supervisor_plan_untrusted": "plan two"}
-    revised = {**base, "objective": "Revised: fix the CSS"}
-    sha = execution.guidance_objective_sha256
-    assert sha(json.dumps(base)) == sha(json.dumps(reworded))
-    assert sha(json.dumps(base)) != sha(json.dumps(revised))
-    assert sha(None) is None
-
-
-def test_completed_reads_keep_the_most_recent_not_alphabetically_last(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
-    repo = workspace(tmp_path)
-    contexts: list[ModelContext] = []
-
-    class RecordingModel(ScriptedModel):
-        def propose_action(self, context: ModelContext) -> ModelTurn:
-            contexts.append(context)
-            return super().propose_action(context)
-
-    paths = [f"src/z{i:02d}.py" for i in range(12)] + ["docs/api.md"]
-    for name in paths:
-        (repo.root / name).write_text(f"# {name}\n")
-    actions = [
-        ActionProposal(ActionId(f"r{i}"), "read_file", {"path": p}) for i, p in enumerate(paths)
-    ]
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
-    runtime, _ = coding.build_coding(
-        config,
-        contract(),
-        repo,
-        store=InMemoryEventStore(),
-        model=RecordingModel([*actions, actions[-1]]),
-    )
-    with pytest.raises(RuntimeError, match="exhausted"):
-        runtime.run("Fix addition")
-    progress = next(
-        json.loads(i.content)
-        for i in contexts[13].items
-        if str(i.item_id).endswith(":coding-progress")
-    )
-    recent = [path for path, _ in progress["completed_source_reads"]]
-    assert recent[-1] == "docs/api.md"
-    assert "src/z00.py" not in recent
-    assert len(recent) == 12
-
-
-@pytest.mark.parametrize("completed", [True, False])
-def test_retry_completed_review_routes_to_repair_only(
-    completed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    repo = workspace(tmp_path / "repo")
-    harness = CampaignHarness(tmp_path / "ledger")
-    campaign = harness.create(campaign_config(repo))
-
-    def ready(_task: CodingTaskConfig) -> None:
-        pass
-
-    monkeypatch.setattr(execution, "preflight", ready)
-    harness.coding.enqueue(campaign, "task", contract())
-    with harness.store.connect() as db:
-        for kind in ("start", "patched", "review"):
-            harness.coding.jobs.append(db, "task", CodingEvent(kind), "{}")
-        harness.coding.jobs.append(
-            db, "task", CodingEvent("failed"), json.dumps({"review_completed": completed})
-        )
-        before = harness.coding.jobs.config(db, "task")
-    result = harness.coding.command(
-        campaign, "task", CodingCommand(command="retry", evidence="Use recorded review outcome")
-    )
-    assert result["status"] == ("queued" if completed else "review_pending")
-    with harness.store.connect() as db:
-        state = harness.coding.jobs.state(db, "task")
-        assert (state.attempts, state.review_attempts) == (1, 1)
-        assert harness.coding.jobs.config(db, "task") == before
 
 
 def test_inherited_review_outcome_says_changes_requested_not_failed(
@@ -1967,7 +1565,7 @@ def test_investigating_after_a_failed_check_is_not_blocked_as_a_repeated_failure
 
     monkeypatch.setattr(coding, "ContainerSandbox", CountingChecks)
     repo = workspace(tmp_path)
-    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"})
+    config = campaign_config(repo).model_copy(update={"inference_profile": "qwen-native-v1"})
     store = InMemoryEventStore()
     actions = [
         ActionProposal(
@@ -2013,7 +1611,7 @@ def test_checks_unavailable_still_block_immediately(
     repo = workspace(tmp_path)
     store = InMemoryEventStore()
     runtime, _ = coding.build_coding(
-        campaign_config(repo).model_copy(update={"inference_profile": "qwen-state-v1"}),
+        campaign_config(repo).model_copy(update={"inference_profile": "qwen-native-v1"}),
         contract(),
         repo,
         store=store,

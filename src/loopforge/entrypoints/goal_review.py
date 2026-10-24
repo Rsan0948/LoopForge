@@ -13,7 +13,6 @@ from pydantic import Field
 from loopforge.adapters.git_workspace import GitWorkspaceManager
 from loopforge.adapters.goal_journal import SQLiteGoalJournal, encode_goal_event
 from loopforge.adapters.paid_budget import SQLitePaidBudget
-from loopforge.adapters.repair_journal import RepairJournal
 from loopforge.domain.goal_review import ControlRequested, QuestionAnswered, ReviewRecorded
 from loopforge.domain.goals import reduce_goal
 from loopforge.entrypoints.campaign_coding import patch_identity
@@ -45,13 +44,6 @@ def morning_report(directory: Path) -> dict[str, object]:  # noqa: PLR0915 - exp
     else:
         known = state.spent_microusd
         reserved = state.reserved_microusd
-        for ledger in (directory / "worker" / "repair").glob("*/ledger.sqlite"):
-            with sqlite3.connect(f"file:{ledger}?mode=ro", uri=True) as db:
-                ceiling = db.execute("SELECT ceiling FROM policy").fetchone()[0]
-                account = RepairJournal(ledger, ceiling).load(db)
-                pending = sum(p[1] for p in account.pending)
-                known += account.spent - pending
-                reserved += pending
     result["paid_spent_microusd"] = known
     result["paid_reserved_microusd"] = reserved
     result["paid_remaining_microusd"] = cap - known - reserved

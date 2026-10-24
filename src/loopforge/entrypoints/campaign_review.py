@@ -1074,14 +1074,10 @@ class ReportingReviewModel:
         self, model: ModelPort, tools: ReviewTools, config: CampaignConfig, store: StateStorePort
     ) -> None:
         self.model, self.tools, self.config, self.store = model, tools, config, store
-        tools.bounded_reporting = config.inference_profile in {"qwen-bounded-v2", "qwen-bounded-v3"}
-        tools.app_workload = config.inference_profile in {
-            "qwen-app-v1",
-            "qwen-state-v1",
-            "qwen-session-v1",
-            "qwen-native-v1",
-        }
-        tools.reporting_v3 = config.inference_profile == "qwen-bounded-v3"
+        native = config.inference_profile == "qwen-native-v1"
+        tools.bounded_reporting = not native
+        tools.app_workload = native
+        tools.reporting_v3 = not native
         self.pending: dict[str, ActionProposal] = {}
         self.feedback: dict[str, dict[str, str]] = {}
         self.progress: dict[str, tuple[int, int]] = {}
@@ -1350,13 +1346,8 @@ def build_review(  # noqa: PLR0913 - explicit trusted workload context tuning
     max_source_reads: int = 10,
 ) -> tuple[Runtime, ReviewTools, OllamaModel | None]:
     tools = ReviewTools(files, previous, max_source_reads=max_source_reads)
-    profile = profile_for(
-        "review",
-        state_driven=config.inference_profile == "qwen-state-v1",
-        bounded_v2=config.inference_profile in {"qwen-bounded-v2", "qwen-bounded-v3"},
-        app_workload=config.inference_profile
-        in {"qwen-app-v1", "qwen-state-v1", "qwen-session-v1", "qwen-native-v1"},
-    )
+    native = config.inference_profile == "qwen-native-v1"
+    profile = profile_for("review", bounded_v2=not native, app_workload=native)
     live = (
         None
         if model

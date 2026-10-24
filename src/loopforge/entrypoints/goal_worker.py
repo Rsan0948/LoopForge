@@ -301,11 +301,7 @@ class CampaignGoalWorker:
         active = bool(self.harness.worker and self.harness.worker.is_alive())
         if should_dispatch and not active:
             self._dispatch(key)
-        with self.harness.store.connect() as db:
-            nonblocking = (
-                self.harness.nonblocking_goals
-                or self.harness.store.config(db, self.campaign).repair_escalation
-            )
+        nonblocking = self.harness.nonblocking_goals
         if self.harness.worker and not nonblocking:
             self.harness.worker.join()
         observation = self.observe()
