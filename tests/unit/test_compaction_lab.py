@@ -108,3 +108,23 @@ def test_summarizer_hook_anchors_on_the_previous_handoff(tmp_path: Path) -> None
     second_evidence = json.loads(sent[1]["contents"][0]["parts"][0]["text"])  # type: ignore[index]
     assert [r["message"]["role"] for r in first_evidence] == ["assistant", "tool"]
     assert second_evidence[0]["message"] == {"role": "previous_handoff", "content": first}
+
+
+def test_provider_schema_drops_item_counts_but_local_validation_keeps_them(tmp_path: Path) -> None:
+    long_note = {"text": "x" * 1601, "evidence": ["m1"]}
+    reply = _reply(json.dumps({**_handoff(), "next_steps": [long_note]}))
+    compactor, _, sent = _compactor(tmp_path, reply)
+    with pytest.raises(ValueError):  # noqa: PT011 - over-long note refused locally
+        compactor.summarize(MESSAGES, "trial:1")
+    schema = json.dumps(sent[0]["generationConfig"]["responseJsonSchema"])  # type: ignore[index]
+    assert "maxItems" not in schema
+    assert "maxLength" in schema
+    assert '"additionalProperties": false' in schema
+
+
+def test_evidence_values_are_constrained_to_this_requests_message_ids(tmp_path: Path) -> None:
+    compactor, _, sent = _compactor(tmp_path, _reply(json.dumps(_handoff())))
+    compactor.summarize(MESSAGES, "trial:1")
+    schema = sent[0]["generationConfig"]["responseJsonSchema"]  # type: ignore[index]
+    evidence = schema["$defs"]["Note"]["properties"]["evidence"]  # type: ignore[index]
+    assert evidence["items"] == {"type": "string", "enum": ["m0", "m1"]}

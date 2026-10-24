@@ -1,6 +1,7 @@
-# ruff: noqa: EM101, EM102, TRY003, TRY300, TRY301, PLR0915 - operator experiment script
+# ruff: noqa: EM101, EM102, TRY003, TRY300, TRY301, PLR0912, PLR0915 - operator experiment script
 """Experimental paid tier-2 handoffs for checkpoint compaction; no tool or policy authority."""
 
+import contextlib
 import hashlib
 import json
 import math
@@ -28,14 +29,16 @@ SYSTEM = (
     "Do not reproduce private reasoning traces: retain concise conclusions and uncertainties. "
     "Do not rewrite permissions, budgets, acceptance criteria or the user's goal. "
     "Original task, runtime authority and recent exact action/results are retained separately. "
-    "Write concise, actionable entries, normally under 2000 output tokens total."
+    "Write concise, actionable entries, normally under 2000 output tokens total. "
+    "Limits: at most 16 established_facts, 16 changes_and_results, 12 failed_approaches, "
+    "12 unresolved_questions and 1-8 next_steps; each entry cites 1-24 message IDs."
 )
 
 
 class Note(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     text: str = Field(min_length=1, max_length=1600)
-    evidence: list[str] = Field(min_length=1, max_length=8)
+    evidence: list[str] = Field(min_length=1, max_length=24)
 
 
 class Handoff(BaseModel):
@@ -53,6 +56,39 @@ class Handoff(BaseModel):
             for note in getattr(self, field)
             for identity in note.evidence
         }
+
+
+# Probed 2026-10-23: this model returns HTTP 400 for array item counts, accepts string lengths.
+_LENGTH_KEYWORDS = frozenset({"maxItems", "minItems"})
+
+
+def provider_schema(value: object) -> object:
+    """The Handoff schema without array item counts, which this model rejects (HTTP 400).
+
+    The counts are stated in the system instruction and enforced by local validation.
+    """
+    if isinstance(value, dict):
+        return {k: provider_schema(v) for k, v in value.items() if k not in _LENGTH_KEYWORDS}
+    if isinstance(value, list):
+        return [provider_schema(v) for v in value]
+    return value
+
+
+def cited_schema(ids: list[str]) -> object:
+    """Provider schema whose evidence values are exactly this request's message IDs."""
+    schema = provider_schema(Handoff.model_json_schema())
+    assert isinstance(schema, dict)
+    note = schema["$defs"]["Note"]["properties"]["evidence"]
+    note["items"] = {"type": "string", "enum": ids}
+    return schema
+
+
+def _error_message(response: httpx.Response) -> str:
+    with contextlib.suppress(ValueError):
+        error = response.json().get("error")
+        if isinstance(error, dict):
+            return str(error.get("message", ""))[:500]
+    return ""
 
 
 def pack_history(messages: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -82,7 +118,7 @@ class GeminiCompactor:
             "generationConfig": {
                 "maxOutputTokens": MAX_OUTPUT,
                 "responseMimeType": "application/json",
-                "responseJsonSchema": Handoff.model_json_schema(),
+                "responseJsonSchema": cited_schema([r["id"] for r in records]),
             },
         }
         body = json.dumps(payload, ensure_ascii=False)
@@ -107,6 +143,10 @@ class GeminiCompactor:
                 timeout=timeout,
             )
             if response.status_code != 200:
+                # Google's error message names the rejected field; bounded and credential-checked.
+                message = _error_message(response)
+                if message and self.api_key not in message:
+                    record["error_message"] = message
                 raise ValueError(f"Compactor HTTP {response.status_code}; maximum charged")
             if len(response.content) > 1000000:
                 raise ValueError("Compactor response too large")
