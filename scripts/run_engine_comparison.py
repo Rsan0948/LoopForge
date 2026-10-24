@@ -421,7 +421,25 @@ SCHEDULE = [  # alternate engine and mode order between repetitions
 ]
 
 
-def run(output: Path, only: str | None) -> None:
+SMOKE = [(1, "ollama", "cold"), (1, "mlx", "cold")]
+
+
+def ollama_kv_cache_type() -> str | None:
+    """The user's launch-agent setting for the shared Ollama service, if present."""
+    plist = Path.home() / "Library/LaunchAgents/local.ollama.serve.plist"
+    if not plist.exists():
+        return None
+    out = subprocess.run(
+        ["plutil", "-extract", "EnvironmentVariables.OLLAMA_KV_CACHE_TYPE", "raw", str(plist)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    return out.stdout.strip() or None
+
+
+def run(output: Path, only: str | None, *, smoke: bool = False) -> None:
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     pinned = [
@@ -445,11 +463,12 @@ def run(output: Path, only: str | None) -> None:
             .json()
             .get("details"),
         }
-    schedule = [s for s in SCHEDULE if only is None or s[1] == only]
+    schedule = [s for s in (SMOKE if smoke else SCHEDULE) if only is None or s[1] == only]
     plan = {
         "commit": commit,
         "pinned_hashes": hashes,
         "ollama": ollama_identity,
+        "ollama_kv_cache_type": ollama_kv_cache_type(),
         "mlx_model": mlx_lab.model_info(),
         "task_intake_sha256": sha(TRIAL / "repository-intake.json"),
         "seconds": SECONDS,
@@ -582,6 +601,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--only", choices=["ollama", "mlx"])
+    parser.add_argument("--smoke", action="store_true", help="one cold trial per engine")
     parser.add_argument("--child", nargs="+", metavar=("DIR", "ENGINE"))
     parser.add_argument(
         "--probe",
@@ -598,7 +618,7 @@ def main() -> None:
     elif args.probe and args.output:
         probe(args.output, args.probe[0], args.probe[1], int(args.probe[2]))
     elif args.output:
-        run(args.output, args.only)
+        run(args.output, args.only, smoke=args.smoke)
     else:
         parser.error("--output is required")
 
