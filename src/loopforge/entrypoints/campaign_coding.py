@@ -694,13 +694,23 @@ class ConfinedCodingTools:
             "refine query when results are truncated. Read exact source before editing.",
         )
 
-    def read_excerpt(
+    def read_excerpt(  # noqa: PLR0911 - one refusal per argument rule
         self, request: ToolExecutionRequest, page_chars: int | None = None
     ) -> ToolResult:
         """Keep source responses bounded while retaining the sandbox's path checks."""
         args = request.proposal.arguments
         if self.multi_read and "paths" in args:
             return self.read_several(request)
+        path = args.get("path", "")
+        if self.multi_read and len(path) > 1 and path[0] == path[-1] == '"':
+            # Seen live after JSON-list reads: the model JSON-quoted a single path.
+            return ToolResult(
+                ok=False,
+                observation="path is a plain string such as app/server.py, not JSON-quoted; "
+                "only paths takes a JSON list",
+                error_code="CODING_READ_ARGUMENTS",
+                failure_class=ToolFailureClass.PERMANENT,
+            )
         if not source_allowed(args.get("path", "")):
             return ToolResult(
                 ok=False,
@@ -776,6 +786,7 @@ class ConfinedCodingTools:
                 failure_class=ToolFailureClass.PERMANENT,
             )
         parts: list[str] = []
+        failures: list[ToolResult] = []
         remaining = MULTI_READ_CHARS
         for index, path in enumerate(paths):
             if remaining < _SINGLE_PAGE_CHARS:
@@ -788,9 +799,14 @@ class ConfinedCodingTools:
             single = replace(request, proposal=replace(request.proposal, arguments={"path": path}))
             result = self.read_excerpt(single, min(self.read_page_chars, remaining))
             if not result.ok:
-                return replace(result, observation=f"{path!r}: {result.observation}")
+                # One wrong path must not discard the files that were read.
+                failures.append(result)
+                parts.append(f"Not read {path!r}: {result.observation}")
+                continue
             parts.append(result.observation)
             remaining -= len(result.observation)
+        if len(failures) == len(paths):
+            return replace(failures[0], observation="\n".join(parts))
         return ToolResult(ok=True, observation="\n\n".join(parts))
 
 

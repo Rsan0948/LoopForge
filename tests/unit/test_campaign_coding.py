@@ -2181,12 +2181,26 @@ def test_malformed_multi_reads_are_refused_before_reading(
     assert result.error_code == "CODING_READ_ARGUMENTS"
 
 
-def test_multi_read_keeps_each_path_check(tmp_path: Path) -> None:
+def test_multi_read_keeps_each_path_check_and_the_files_it_could_read(tmp_path: Path) -> None:
     tools = _multi_reader(workspace(tmp_path), {"a.py": 3})
     result = _read(tools, paths='["src/a.py", ".git/config"]')
+    assert result.ok
+    assert result.observation.startswith("Source 'src/a.py', starting line 1")
+    assert "Not read '.git/config': source excluded by campaign evidence policy" in (
+        result.observation
+    )
+    denied = _read(tools, paths='[".git/config"]')
+    assert not denied.ok
+    assert denied.error_code == "CODING_SOURCE_DENIED"
+
+
+def test_a_json_quoted_single_path_gets_a_specific_correction(tmp_path: Path) -> None:
+    tools = _multi_reader(workspace(tmp_path), {"a.py": 3})
+    result = _read(tools, path='"src/a.py"')
     assert not result.ok
-    assert result.error_code == "CODING_SOURCE_DENIED"
-    assert result.observation.startswith("'.git/config': ")
+    assert result.error_code == "CODING_READ_ARGUMENTS"
+    assert "not JSON-quoted" in result.observation
+    assert _read(tools, path="src/a.py").ok
 
 
 def test_legacy_profiles_keep_single_file_reads(tmp_path: Path) -> None:
