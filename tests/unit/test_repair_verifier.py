@@ -17,7 +17,12 @@ from loopforge.domain.state import RunState
 from loopforge.domain.types import RunId, WorkspaceId
 from loopforge.domain.verification import CheckOutcome
 from loopforge.domain.workspace import AcceptanceCriteria, PatchConstraints, WorkspaceStatus
-from loopforge.ports.sandbox import SandboxCommandResult, SandboxPolicyError, SandboxPort
+from loopforge.ports.sandbox import (
+    SandboxCommandResult,
+    SandboxPolicyError,
+    SandboxPort,
+    SandboxTimeoutError,
+)
 from loopforge.ports.verifier import VerificationResult
 from loopforge.ports.workspace import WorkspaceError, WorkspacePort
 from loopforge.workloads.repair import (
@@ -479,3 +484,27 @@ def test_passing_probe_adds_no_hint() -> None:
     ).verify(_state())
     assert result.passed
     assert "failing acceptance line" not in result.summary
+
+
+class TimeoutSandbox(StubSandbox):
+    def run(
+        self, command_name: str, *, timeout_seconds: float | None = None
+    ) -> SandboxCommandResult:
+        del timeout_seconds
+        self.calls.append(command_name)
+        msg = f"command {command_name!r} exceeded 90s"
+        raise SandboxTimeoutError(msg)
+
+
+def test_a_check_timeout_is_a_measured_failure_not_an_inconclusive_verdict() -> None:
+    verifier = RepairVerifier(
+        TimeoutSandbox({}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+    )
+
+    result = verifier.verify(_state())
+
+    assert not result.passed
+    assert result.inconclusive is False
+    assert ": failed (timed out: command 'run_tests' exceeded 90s" in result.summary

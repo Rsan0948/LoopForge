@@ -43,7 +43,7 @@ from loopforge.domain.workspace import AcceptanceCriteria, FixtureSpec
 from loopforge.ports.artifacts import RunArtifact
 from loopforge.ports.context import ContextAccountingSource, ContextBuilderPort
 from loopforge.ports.model import ModelToolSpec
-from loopforge.ports.sandbox import SandboxError, SandboxPort
+from loopforge.ports.sandbox import SandboxError, SandboxPort, SandboxTimeoutError
 from loopforge.ports.verifier import VerificationResult
 from loopforge.ports.workspace import WorkspaceError, WorkspacePort
 
@@ -303,6 +303,16 @@ class RepairVerifier:
     def _command_outcome(self, name: str) -> CheckOutcome:
         try:
             result = self._sandbox.run(name)
+        except SandboxTimeoutError as exc:
+            # The check ran against this candidate and did not finish (for example a
+            # server that never became ready). That is a measured failure, not an
+            # infrastructure fault: it must not end the run as inconclusive.
+            return CheckOutcome(
+                name=f"command:{name}",
+                passed=False,
+                detail=f"timed out: {_bounded(str(exc))}; the command did not finish "
+                "against this candidate (a service that never becomes ready times out)",
+            )
         except SandboxError as exc:
             return CheckOutcome(
                 name=f"command:{name}",
