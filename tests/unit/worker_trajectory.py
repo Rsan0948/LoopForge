@@ -224,7 +224,7 @@ def drive(  # noqa: PLR0913 - explicit trajectory knobs
 ) -> Outcome:
     """Run one worker attempt to its stop and report where and why it stopped."""
     monkeypatch.setattr(coding, "ContainerSandbox", LocalChecks)
-    monkeypatch.setattr(coding, "SystemSleeper", _NoSleep)
+    monkeypatch.setattr(coding, "SystemSleeper", NoSleep)
     repo = build_workspace(tmp_path / "repo")
     real = ollama_model.OllamaModel
 
@@ -261,6 +261,6 @@ def config_objective(task: CodingTaskConfig) -> str:
     return task.objective
 
 
-class _NoSleep:
+class NoSleep:
     def sleep(self, seconds: float) -> None:
         del seconds

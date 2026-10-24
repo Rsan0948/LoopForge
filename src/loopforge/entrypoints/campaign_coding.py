@@ -840,6 +840,8 @@ class CodingVerifier:
         self.last_failure: tuple[str, str] | None = None
         self.blocked = False
         self.checked: tuple[str, VerificationResult] | None = None
+        # Notified of each newly judged candidate and its score (checkpointing).
+        self.on_verified: Callable[[str, float], None] | None = None
         self.starting_patch = patch_identity(workspace) if require_revision else None
 
     def verify(self, state: RunState) -> VerificationResult:
@@ -860,6 +862,8 @@ class CodingVerifier:
                 repeat=True,
             )
         result = self._judge(state, identity)
+        if self.on_verified is not None and result.score is not None and not result.inconclusive:
+            self.on_verified(identity, result.score)
         if result.passed:
             self.last_failure = None
         else:

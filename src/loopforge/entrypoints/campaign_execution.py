@@ -1,5 +1,6 @@
 """Serial coding/review driver sharing the campaign execution slot."""
 
+import functools
 import hashlib
 import json
 import subprocess
@@ -25,6 +26,7 @@ from loopforge.domain.investigation import FailureKind
 from loopforge.domain.state import RunState, replay
 from loopforge.domain.types import ActionId, RunId, RunStatus
 from loopforge.entrypoints.agent_config import agent_settings, worker_profile
+from loopforge.entrypoints.campaign_checkpoints import CheckpointStore
 from loopforge.entrypoints.campaign_coding import (
     PROTECTED,
     AssignmentGuidanceModel,
@@ -393,22 +395,39 @@ class CodingCoordinator:
                     ),
                     None,
                 )
+                revision = any(
+                    json.loads(detail).get("command") == "request_changes" for detail in feedback
+                )
+                checkpoints = CheckpointStore(self.directory / "checkpoints" / f"{task}.json")
+                # A retry resumes from the best verified candidate, not a later regression.
+                restored = (
+                    checkpoints.restore_best(workspace)
+                    if prepared is None and not revision
+                    else None
+                )
                 runtime, live = build_coding(
                     config,
                     contract,
                     workspace,
                     store=events,
                     model=prepared_check_model(contract, workspace, prepared),
-                    require_revision=any(
-                        json.loads(detail).get("command") == "request_changes"
-                        for detail in feedback
-                    ),
+                    require_revision=revision,
                 )
                 acceptance_verifier = (
                     runtime.verifier if isinstance(runtime.verifier, CodingVerifier) else None
                 )
+                if acceptance_verifier is not None:
+                    acceptance_verifier.on_verified = functools.partial(
+                        checkpoints.record, workspace
+                    )
                 if isinstance(runtime.tools, ConfinedCodingTools):
                     runtime.tools.feedback = coding_feedback(list(reversed(feedback)))
+                    if restored is not None:
+                        runtime.tools.feedback = (
+                            "The workspace was restored to the best verified candidate so far "
+                            f"(score {restored.score:.3f}); a later attempt that scored lower "
+                            "was discarded. Continue from here.\n" + runtime.tools.feedback
+                        )
                 objective = coding_objective(config, contract)
                 review_tools = None
                 before = None
