@@ -22,7 +22,12 @@ from loopforge.adapters.research_store import ResearchStore
 from loopforge.adapters.working_evidence import working_evidence
 from loopforge.domain.goal_review import ClarificationRequest
 from loopforge.domain.goals import GoalAction, GoalState, SupervisorDecision, goal_allowed_actions
-from loopforge.domain.investigation import InspectionRequest, RecoveryIntent, TaskAssignment
+from loopforge.domain.investigation import (
+    FailureKind,
+    InspectionRequest,
+    RecoveryIntent,
+    TaskAssignment,
+)
 from loopforge.ports.supervisor import (
     SupervisorFailure,
     SupervisorRequest,
@@ -90,6 +95,16 @@ class AssignmentWireSchema(BaseModel):
     evidence_ids: list[str] = Field(min_length=1, max_length=12)
 
 
+class RecoveryWireSchema(BaseModel):
+    """The limits RecoveryIntent enforces, stated in the response schema Gemini receives."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    changed_hypothesis: str = Field(min_length=20, max_length=1000)
+    evidence_ids: list[str] = Field(min_length=1, max_length=12)
+    # Inline enum: a nested $ref would not resolve inside the embedded schema.
+    failure: str = Field(json_schema_extra={"enum": [kind.value for kind in FailureKind]})
+
+
 class DecisionPayload(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     action: Literal[
@@ -115,7 +130,9 @@ class DecisionPayload(BaseModel):
         Annotated[TaskAssignment, WithJsonSchema(AssignmentWireSchema.model_json_schema())] | None
     ) = None
     question: ClarificationRequest | None = None
-    recovery: RecoveryIntent | None = None
+    recovery: (
+        Annotated[RecoveryIntent, WithJsonSchema(RecoveryWireSchema.model_json_schema())] | None
+    ) = None
     evidence_id: str | None = Field(default=None, min_length=1, max_length=100)
 
 
@@ -237,7 +254,9 @@ class GeminiSupervisor:
                 "required": policy.require_recovery_evidence,
                 "instruction": (
                     "For retry, supply recovery with measured failure, observed evidence_ids, "
-                    "and a concrete changed_hypothesis. Unchanged retries are denied; "
+                    "and a concrete changed_hypothesis (20-1000 characters). retry carries "
+                    "only recovery; to change the worker's instructions, delegate a revised "
+                    "assignment instead. Unchanged retries are denied; "
                     "no hypothesis resets hard limits."
                 ),
             },
@@ -532,14 +551,19 @@ class GeminiSupervisor:
             ]
             message = "Gemini returned an invalid decision envelope: " + "; ".join(locations)
             raise SupervisorFailure(message, charge) from None
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError) as exc:
             message = "Gemini returned an invalid decision envelope"
+            reason = str(exc)
+            # Only our own fixed domain messages are echoed, never provider values.
+            if isinstance(exc, ValueError) and reason.startswith(_CODE_OWNED_REASONS):
+                message += ": " + reason
             raise SupervisorFailure(message, charge) from None
 
 
 _CODE_OWNED_REASONS = (
     "Assignment invalid: ",
     "Recovery needs a concrete changed hypothesis and observed evidence",
+    "Supervisor action arguments do not match its capability",
 )
 
 

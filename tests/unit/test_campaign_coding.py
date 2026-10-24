@@ -2215,3 +2215,59 @@ def test_legacy_profiles_keep_single_file_reads(tmp_path: Path) -> None:
     wide = {s.name: s for s in coding.coding_tool_specs(adder_repair_task(), read_page_chars=12000)}
     assert "paths" in cast("dict[str, object]", wide["read_file"].parameters["properties"])
     assert "up to 12000 chars" in wide["read_file"].description
+
+
+class _AcceptanceFailing:
+    """Probes fail at a constant score until the app is finished, as from scratch."""
+
+    def __init__(self, *, passed: bool = False) -> None:
+        self.passed = passed
+
+    def verify(self, state: RunState) -> VerificationResult:
+        del state
+        return VerificationResult(passed=self.passed, score=1 if self.passed else 0.4, summary="x")
+
+
+def _building(tmp_path: Path, *, credit: bool) -> tuple[coding.CodingVerifier, GitWorkspace]:
+    ws = workspace(tmp_path)
+    task = contract().model_copy(update={"required_changed_paths": [], "max_changed_files": 3})
+    verifier = coding.CodingVerifier(_AcceptanceFailing(), task, ws, construction_credit=credit)
+    return verifier, ws
+
+
+def test_building_out_more_files_counts_as_progress_on_a_failing_candidate(
+    tmp_path: Path,
+) -> None:
+    verifier, ws = _building(tmp_path, credit=True)
+    state = RunState(run_id=RunId("build"))
+    (ws.root / "src/add.py").write_text("def add(a,b): return a+b\n")
+    one = verifier.verify(state).score
+    (ws.root / "docs/api.md").write_text("Addition returns the sum.\n")
+    two = verifier.verify(state).score
+    assert abs(cast("float", one) - 0.42) < 1e-9
+    assert abs(cast("float", two) - 0.44) < 1e-9
+
+
+def test_re_editing_the_same_files_earns_no_credit_and_the_limit_bounds_it(
+    tmp_path: Path,
+) -> None:
+    verifier, ws = _building(tmp_path, credit=True)
+    state = RunState(run_id=RunId("loop"))
+    (ws.root / "src/add.py").write_text("def add(a,b): return a+b\n")
+    first = verifier.verify(state).score
+    (ws.root / "src/add.py").write_text("def add(a,b): return b+a\n")
+    assert verifier.verify(state).score == first
+    for name in ("x.py", "y.py", "z.py", "w.py"):
+        (ws.root / "src" / name).write_text("x = 1\n")
+    capped = verifier.verify(state).score
+    assert abs(cast("float", capped) - (0.4 + 3 * 0.02)) < 1e-9  # bounded by max_changed_files
+
+
+def test_no_credit_for_legacy_profiles_or_passing_candidates(tmp_path: Path) -> None:
+    verifier, ws = _building(tmp_path / "legacy", credit=False)
+    (ws.root / "src/add.py").write_text("def add(a,b): return a+b\n")
+    assert verifier.verify(RunState(run_id=RunId("legacy"))).score == 0.4
+    passing, ws2 = _building(tmp_path / "pass", credit=True)
+    passing.verifier = _AcceptanceFailing(passed=True)
+    (ws2.root / "src/add.py").write_text("def add(a,b): return a+b\n")
+    assert passing.verify(RunState(run_id=RunId("pass"))).score == 1

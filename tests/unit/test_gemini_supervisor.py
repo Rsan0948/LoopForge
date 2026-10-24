@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -495,3 +496,62 @@ def test_response_containing_the_credential_is_never_recorded(tmp_path: Path) ->
         with pytest.raises(SupervisorFailure):
             adapter.decide(adapter.prepare(state()))
     assert not (tmp_path / "diag").exists()
+
+
+def _decide(decision: Mapping[str, object]) -> object:
+    payload = response()
+    candidate = payload["candidates"][0]  # type: ignore[index]
+    candidate["content"]["parts"][0]["text"] = json.dumps(decision)  # type: ignore[index]
+    with httpx.Client(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=payload))
+    ) as client:
+        adapter = GeminiSupervisor(KEY, client=client)
+        return adapter.decide(adapter.prepare(state()))
+
+
+RECOVERY = {
+    "changed_hypothesis": "Restart must reset food to (10,10); keep #start-btn enabled.",
+    "evidence_ids": ["e_worker"],
+    "failure": "no_progress",
+}
+
+
+def test_retry_with_a_new_assignment_is_refused_with_the_accepted_fields_named() -> None:
+    decision = {
+        "action": "retry",
+        "rationale": "Measured acceptance failures",
+        "plan": "Retry with a fix",
+        "recovery": RECOVERY,
+        "assignment": {
+            "objective": "Fix the measured acceptance failures in app/",
+            "files": ["app/game.js"],
+            "evidence_ids": ["e_worker"],
+        },
+    }
+    with pytest.raises(SupervisorFailure) as failure:
+        _decide(decision)
+    assert str(failure.value) == (
+        "Gemini returned an invalid decision envelope: Supervisor action arguments do not "
+        "match its capability: retry accepts recovery"
+    )
+    assert "food" not in str(failure.value)  # Provider text is never echoed.
+    retry = {k: v for k, v in decision.items() if k != "assignment"}
+    result = _decide(retry)
+    assert result.decision.action == GoalAction.RETRY  # type: ignore[attr-defined]
+
+
+def test_recovery_schema_states_the_domain_limits() -> None:
+    schema = DecisionPayload.model_json_schema()["properties"]["recovery"]["anyOf"][0]
+    hypothesis = schema["properties"]["changed_hypothesis"]
+    assert (hypothesis["minLength"], hypothesis["maxLength"]) == (20, 1000)
+    assert "no_progress" in schema["properties"]["failure"]["enum"]
+    assert "$ref" not in json.dumps(schema)
+    with pytest.raises(SupervisorFailure, match="Recovery needs a concrete"):
+        _decide(
+            {
+                "action": "retry",
+                "rationale": "r",
+                "plan": "p",
+                "recovery": {**RECOVERY, "changed_hypothesis": "x" * 1001},
+            }
+        )

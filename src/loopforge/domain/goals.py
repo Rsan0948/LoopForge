@@ -207,7 +207,11 @@ class SupervisorDecision:
             or (self.environment is not None and not self.environment.strip())
             or (self.evidence_id is not None and not self.evidence_id.strip())
         ):
-            msg = "Supervisor action arguments do not match its capability"
+            accepted = ", ".join(sorted(expected)) or "no arguments"
+            msg = (
+                "Supervisor action arguments do not match its capability: "
+                f"{self.action.value} accepts {accepted}"
+            )
             raise ValueError(msg)
 
 
