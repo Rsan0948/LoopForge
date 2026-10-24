@@ -239,3 +239,18 @@ however, collapsed with depth: 31.6 tok/s at 10.8K tokens, 17.7 at 20.9K, 11.7 a
 10.2 at 39.4K. The user's directive was to fix everything identified before benchmarking. The
 diagnosis is in `context-management-research-2026-10-23.md` §2 and §7, and the plan in
 `roadmap-2026-10-23.md`.
+
+## Smoke after the performance roadmap, 2026-10-23 21:19 local (`engine-smoke-20261023-2119`)
+
+Profile `coding-native-a3b-v3`: delimited observations, failure fingerprints, 12K reads,
+edit echo, 16K output cap, 32,768-token checkpoint usage budget. Ollama now runs with an f16 KV
+cache. One cold trial per engine on the frozen full-a3b task; no supervisor or paid calls.
+
+| trial | result | wall | model calls | max prompt | compactions | decode |
+|---|---|---|---|---|---|---|
+| rep1-ollama-cold | **verified success** | 910 s | 36 | 28,197 | 3 checkpoint (29.9K→16.1K, 28.5K→15.3K, 30.1K→15.8K) | min 34.7, median 44.2 tok/s; 36/36 calls ≥ 20 |
+| rep1-mlx-cold | **verified success** | 744 s | 39 | 32,427 | 1 checkpoint (28.6K→16.1K), 1 budget overrun (34.8K→15.9K) | wall-based lower bound: median 41.0; the only two calls < 20 are the two full re-prefills after compaction |
+
+Before the roadmap, the tuned matrix's Ollama cold trial timed out at 2,401 s, and the stopped
+final-matrix trial was at 11.7 tok/s by call 21 at 34K tokens. Each re-prefill after a compaction
+costs about 20–22 s on both engines (about 16K tokens at about 750 tok/s).
