@@ -182,6 +182,20 @@ Live 15-call probes (`run_engine_comparison.py --probe ENGINE warm 15`):
   ~2–3 s past 20K tokens. One full miss followed a rejected multi-tool-call response
   (protocol correction as a user message); fixed by the system-role correction.
 
+### F4 — Admission over-counted and compacted one turn per request (fixed `223a624`)
+
+The ratio bound (bytes/2) overstates real tokens ~1.7x (real ≈ 3.4 bytes/token), so with
+the 32K output reserve compaction began at ~53K real tokens of a ~97K budget, and it
+removed one turn per request. Each compaction rewrites the prompt prefix, so every later
+turn re-prefilled everything: Ollama calls 47–53 took ~150 s of prefill each at ~53K
+tokens and the trial hit the 2,400 s deadline. It affects whichever engine's conversation
+grows longest, so it biases a comparison.
+
+Fix: the bound is the provider's reported prompt tokens for the previous request plus the
+byte delta at 2 bytes/token (both engines report full prompt counts, cached or not); a
+count above the bound still fails closed to the strict byte bound; a compacted request
+uses the full ratio until re-calibrated; compaction frees headroom to 75% of the budget.
+
 ## Tuning (before measuring)
 
 | Engine | Setting | Evidence | Chosen |
