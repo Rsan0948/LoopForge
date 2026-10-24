@@ -19,7 +19,9 @@ both engines, and each engine tuned to its best configuration before measuring.
       think-flag cache invalidation below. Not a valid result set.
 - [x] Fix think-flag / history-replay cache invalidation for both engines (`919c9df`).
 - [x] Initial tuning completed; selected measured settings recorded below.
-- [ ] Re-run the cold/warm matrix; launched the tuned matrix below, results pending.
+- [x] Re-run the cold/warm matrix: superseded. The final matrix (`engine-comparison-final-20261023-2011`)
+      was stopped by the operator during trial 1; see "Final matrix (stopped)" and
+      `roadmap-2026-10-23.md`, which now governs the remaining work.
 
 ## Key artifacts
 
@@ -227,3 +229,13 @@ Quantization differs (Ollama GGUF Q4_K_M vs MLX affine 4-bit): this compares dep
 
 The harness pins source hashes and stops before the next trial if anything changes; do not
 edit `src/` or `scripts/` while a matrix runs. It takes the machine-wide `ModelLease`.
+
+## Final matrix (stopped), 2026-10-23 20:11 local
+
+Pinned at `00e262d`. Trial 1 `rep1-ollama-cold` ran 24 calls, then the operator stopped the
+matrix (`operator-stop.json`). 0 of 8 trials completed, so there is no result set. The prefix
+cache worked on every call: only the 650–1,150 new tokens were prefilled each time. Decode,
+however, collapsed with depth: 31.6 tok/s at 10.8K tokens, 17.7 at 20.9K, 11.7 at 34K and
+10.2 at 39.4K. The user's directive was to fix everything identified before benchmarking. The
+diagnosis is in `context-management-research-2026-10-23.md` §2 and §7, and the plan in
+`roadmap-2026-10-23.md`.
