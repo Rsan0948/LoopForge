@@ -1,7 +1,7 @@
 """Code-owned, versioned local inference profiles; no runtime authority."""
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Final, Literal
 
 
 @dataclass(frozen=True)
@@ -36,6 +36,13 @@ class OllamaProfile:
             "num_ctx": self.context_tokens,
             "num_predict": self.output_tokens,
         }
+
+
+# Usage budget when the coding worker runs on MLX (CampaignConfig.engine). Measured decode
+# with a 256-token output: 41.3 / 43.8 / 37.4 tok/s at 40.1K / 48.6K / 57.2K prompt
+# tokens (Ollama f16: 34.1 / 37.4 / 29.8). A 48K budget keeps MLX above 40 tok/s and
+# halves compaction frequency against 32K. Run: .loopforge/mlx-lab/runs/depth-deep-0811.
+MLX_WORKING_BUDGET_TOKENS: Final = 49152
 
 
 def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inference profiles

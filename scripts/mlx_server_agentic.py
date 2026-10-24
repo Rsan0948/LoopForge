@@ -12,20 +12,83 @@ the last user-final checkpoint.
 This wrapper applies upstream's own tail split to tool-final chat requests too. Prompt
 tokens, sampling, parsing and weights are unchanged; only where the checkpoint is
 stored differs. Run with the lab interpreter and the same arguments as mlx_lm.server.
+
+Reasoning cap (``--thinking-budget N``, default 10240, 0 disables): a thinking request
+whose reasoning reaches N generated tokens without closing is steered to close it: the
+next tokens are forced to Qwen's documented early-exit phrase and ``</think>``, and the
+model then writes its answer and tool call within the request's output allowance. Lab
+data: p99 reasoning output was 9.3K tokens; one matrix call ran 16,384 tokens without a
+tool call (about 5.5 minutes lost). Ollama has no equivalent control.
 """
 
+import json
 import sys
+from pathlib import Path
 
+import mlx.core as mx
 from mlx_lm import server
 
 _upstream_tokenize = server.ResponseGenerator._tokenize
 _TAIL_WINDOW = 11  # upstream's thinking-tail search window
 
 
+_EXIT_PHRASE = (
+    "\n\nConsidering the limited time, I have to give the solution based on the "
+    "thinking directly now.\n</think>\n\n"
+)
+
+
+class _Cap:
+    budget = 10240
+    exit_ids: tuple[int, ...] = ()
+    end_id = -1
+    # Set by _tokenize for the request whose logits processors are built next; the
+    # server runs one prompt and one decode at a time (--prompt/--decode-concurrency 1).
+    thinking = False
+
+
+def _reasoning_cap():
+    thinking = _Cap.thinking
+    generated = 0
+    forced: list[int] = []
+    closed = False
+
+    def cap(tokens, logits):
+        nonlocal generated, closed
+        if closed or not thinking:
+            return logits
+        if not forced and generated and tokens.size and int(tokens[-1]) == _Cap.end_id:
+            closed = True
+            return logits
+        generated += 1
+        if generated > _Cap.budget and not forced:
+            forced.extend(_Cap.exit_ids)
+        if not forced:
+            return logits
+        token = forced.pop(0)
+        closed = not forced
+        # Same shape as the input logits: the batched generator concatenates rows.
+        hit = mx.broadcast_to(mx.arange(logits.shape[-1]) == token, logits.shape)
+        return mx.where(hit, mx.zeros_like(logits), mx.full(logits.shape, -mx.inf, logits.dtype))
+
+    return cap
+
+
+_upstream_processors = server._make_logits_processors
+
+
+def _make_logits_processors(args):
+    processors = _upstream_processors(args)
+    if _Cap.budget > 0 and _Cap.exit_ids:
+        processors = [*processors, _reasoning_cap()]
+    return processors
+
+
 def _tokenize(self, tokenizer, request, args):
     prompt, segments, segment_types, initial_state, vision = _upstream_tokenize(
         self, tokenizer, request, args
     )
+    _Cap.thinking = initial_state == "reasoning"
     messages = getattr(request, "messages", None) or []
     if (
         request.request_type == "chat"
@@ -48,7 +111,33 @@ def _tokenize(self, tokenizer, request, args):
 
 
 server.ResponseGenerator._tokenize = _tokenize
+server._make_logits_processors = _make_logits_processors
+
+
+def _configure_cap(argv: list[str]) -> list[str]:
+    """Consume --thinking-budget and load the exit-phrase token ids from the model."""
+    if "--thinking-budget" in argv:
+        index = argv.index("--thinking-budget")
+        _Cap.budget = int(argv[index + 1])
+        argv = argv[:index] + argv[index + 2 :]
+    from tokenizers import Tokenizer  # noqa: PLC0415 - lab interpreter only
+
+    model = Path(argv[argv.index("--model") + 1])
+    tokenizer = Tokenizer.from_file(str(model / "tokenizer.json"))
+    _Cap.exit_ids = tuple(tokenizer.encode(_EXIT_PHRASE, add_special_tokens=False).ids)
+    end = tokenizer.token_to_id("</think>")
+    if end is None or end not in _Cap.exit_ids:
+        msg = "model tokenizer has no </think> token"
+        raise SystemExit(msg)
+    _Cap.end_id = end
+    print(
+        json.dumps({"thinking_budget": _Cap.budget, "exit_tokens": len(_Cap.exit_ids)}),
+        flush=True,
+    )
+    return argv
+
 
 if __name__ == "__main__":
+    sys.argv = _configure_cap(sys.argv)
     sys.argv[0] = "mlx_lm.server"
     server.main()

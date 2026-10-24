@@ -7,7 +7,7 @@ import subprocess
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Final, cast
 
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError
 
@@ -21,7 +21,7 @@ from loopforge.adapters.git_workspace import GitWorkspace, GitWorkspaceManager
 from loopforge.adapters.local_sandbox import SandboxLimits
 from loopforge.adapters.mlx_transport import lab_transport
 from loopforge.adapters.ollama_model import OllamaModel
-from loopforge.adapters.ollama_profiles import profile_for
+from loopforge.adapters.ollama_profiles import MLX_WORKING_BUDGET_TOKENS, profile_for
 from loopforge.adapters.python_formatter import FormattingError, PinnedImportFormatter
 from loopforge.adapters.repair_journal import RepairJournal
 from loopforge.adapters.sandbox_tools import SandboxCommandTools
@@ -294,6 +294,12 @@ def current_failure_text(last: str | None, inherited: str | None, *, compact: bo
     return "No check failure recorded in this attempt yet"
 
 
+# A read wider than the legacy 3000-character page marks the v3 read protocol.
+_SINGLE_PAGE_CHARS: Final = 3000
+MULTI_READ_FILES: Final = 4
+MULTI_READ_CHARS: Final = 24_000
+
+
 class ConfinedCodingTools:
     def __init__(
         self, tools: CompositeToolExecutor, task: CodingTaskConfig, workspace: GitWorkspace
@@ -307,6 +313,9 @@ class ConfinedCodingTools:
         self.read_page_chars = 3000
         # Code-owned: echo the edited region after edit_file instead of forcing a reread.
         self.edit_echo = False
+        # Code-owned: read_file may take several known paths in one call (one action,
+        # a bounded total), instead of a model turn per file.
+        self.multi_read = False
 
     def metadata_for(self, tool_name: str) -> ToolMetadata:
         if tool_name in {"apply_edits", "format_python_imports"}:
@@ -685,9 +694,13 @@ class ConfinedCodingTools:
             "refine query when results are truncated. Read exact source before editing.",
         )
 
-    def read_excerpt(self, request: ToolExecutionRequest) -> ToolResult:
+    def read_excerpt(
+        self, request: ToolExecutionRequest, page_chars: int | None = None
+    ) -> ToolResult:
         """Keep source responses bounded while retaining the sandbox's path checks."""
         args = request.proposal.arguments
+        if self.multi_read and "paths" in args:
+            return self.read_several(request)
         if not source_allowed(args.get("path", "")):
             return ToolResult(
                 ok=False,
@@ -716,7 +729,9 @@ class ConfinedCodingTools:
         if not result.ok:
             return result
         try:
-            page = source_page(result.observation, start, column, page_chars=self.read_page_chars)
+            page = source_page(
+                result.observation, start, column, page_chars=page_chars or self.read_page_chars
+            )
         except ValueError as exc:
             return ToolResult(
                 ok=False,
@@ -736,6 +751,47 @@ class ConfinedCodingTools:
             f"sha256={hashlib.sha256(result.observation.encode()).hexdigest()}; "
             f"empty={page.empty}. {note}\n{page.text}",
         )
+
+    def read_several(self, request: ToolExecutionRequest) -> ToolResult:
+        """Several known files in one action, each read whole from line 1, bounded in total."""
+        args = request.proposal.arguments
+        try:
+            decoded: object = json.loads(args["paths"])
+        except json.JSONDecodeError:
+            decoded = None
+        items = cast("list[object]", decoded) if isinstance(decoded, list) else []
+        paths = [item for item in items if isinstance(item, str) and item]
+        if (
+            set(args) != {"paths"}
+            or not 1 <= len(items) <= MULTI_READ_FILES
+            or len(paths) != len(items)
+            or len(set(paths)) != len(paths)
+        ):
+            return ToolResult(
+                ok=False,
+                observation=f"paths must be a JSON list of 1-{MULTI_READ_FILES} distinct file "
+                "paths, without path/start_line/start_column; read a file's continuation "
+                "with path and start_line",
+                error_code="CODING_READ_ARGUMENTS",
+                failure_class=ToolFailureClass.PERMANENT,
+            )
+        parts: list[str] = []
+        remaining = MULTI_READ_CHARS
+        for index, path in enumerate(paths):
+            if remaining < _SINGLE_PAGE_CHARS:
+                parts.append(
+                    "Not read (combined read limit reached): "
+                    + ", ".join(repr(p) for p in paths[index:])
+                    + ". Request them in another call."
+                )
+                break
+            single = replace(request, proposal=replace(request.proposal, arguments={"path": path}))
+            result = self.read_excerpt(single, min(self.read_page_chars, remaining))
+            if not result.ok:
+                return replace(result, observation=f"{path!r}: {result.observation}")
+            parts.append(result.observation)
+            remaining -= len(result.observation)
+        return ToolResult(ok=True, observation="\n\n".join(parts))
 
 
 class CodingVerifier:
@@ -1264,7 +1320,9 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
                             "runtime compaction notice says they were omitted; act on them "
                             "instead of rereading. Reason about the current failure and the "
                             "exact source, then make one coherent edit and run the failing check. "
-                            "A failing test may itself be wrong; the contract decides."
+                            "A failing test may itself be wrong; the contract decides. "
+                            "When you know several files you need, read them in one "
+                            "read_file call with paths."
                             if native
                             else ""
                         )
@@ -1303,7 +1361,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
                     if config.repair_decisions
                     else ()
                 ),
-                *coding_tool_specs(repair),
+                *coding_tool_specs(repair, read_page_chars=profile.read_page_chars),
                 *(
                     (
                         ModelToolSpec(
@@ -1384,7 +1442,11 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             thinking_policy=profile.thinking_policy,
             history_replay=profile.history_replay,
             observation_format=profile.observation_format,
-            working_budget_tokens=profile.working_budget_tokens,
+            working_budget_tokens=(
+                MLX_WORKING_BUDGET_TOKENS
+                if config.engine == "mlx" and profile.working_budget_tokens
+                else profile.working_budget_tokens
+            ),
             # The engine switch is a transport; Ollama keeps OllamaModel's own client.
             transport=lab_transport() if config.engine == "mlx" else None,
         )
@@ -1432,6 +1494,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
     context_port: ContextBuilderPort = context_builder
     tools.read_page_chars = profile.read_page_chars
     tools.edit_echo = profile.observation_format == "delimited"
+    tools.multi_read = profile.read_page_chars > _SINGLE_PAGE_CHARS
     if profile.conversation_mode == "state" or native:
         tools.import_formatter = PinnedImportFormatter(workspace.root, task.image).format_file
     if profile.conversation_mode == "state":
@@ -1517,7 +1580,9 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
     return runtime, live
 
 
-def coding_tool_specs(task: RepairTask) -> tuple[ModelToolSpec, ...]:
+def coding_tool_specs(
+    task: RepairTask, *, read_page_chars: int = 3000
+) -> tuple[ModelToolSpec, ...]:
     edit = ModelToolSpec(
         name="apply_edits",
         description=(
@@ -1532,8 +1597,33 @@ def coding_tool_specs(task: RepairTask) -> tuple[ModelToolSpec, ...]:
             "additionalProperties": False,
         },
     )
+    multi = read_page_chars > _SINGLE_PAGE_CHARS
+    read = (
+        ModelToolSpec(
+            name="read_file",
+            description=f"Read source: path for one file (up to {read_page_chars} chars from "
+            "start_line, default 1; start_column defaults to 0), or paths, a JSON list of up "
+            f"to {MULTI_READ_FILES} known files read whole in ONE call ({MULTI_READ_CHARS} "
+            "chars in total). Use paths when you already know several files you need. "
+            "Use continuation values; never infer absence from a partial read.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "paths": {"type": "string"},
+                    "start_line": {"type": "string"},
+                    "start_column": {"type": "string"},
+                },
+                "additionalProperties": False,
+            },
+        )
+        if multi
+        else None
+    )
     return (*navigation_specs(), edit) + tuple(  # noqa: RUF005 - preserve readable generator
-        replace(
+        read
+        if spec.name == "read_file" and read is not None
+        else replace(
             spec,
             description="Read a bounded source excerpt (up to 200 lines/3000 chars); "
             "start_line defaults to 1, start_column to 0. Use both continuation values; "

@@ -190,6 +190,8 @@ def task_inputs():
 def child(directory: Path, engine: str, probe_calls: int | None = None) -> None:
     directory.mkdir(parents=True, exist_ok=False)
     config, campaign = task_inputs()
+    # Each engine runs its production configuration (the MLX usage budget included).
+    campaign = campaign.model_copy(update={"engine": engine})
     task = config.task
     (directory / "task.json").write_text(task.model_dump_json(indent=2))
     workspace = coding.prepare_checkout(

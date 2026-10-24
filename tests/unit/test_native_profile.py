@@ -184,3 +184,26 @@ def test_a3b_settings_reach_the_provider_request(
     assert isinstance(sampling, dict)
     assert sampling["presence_penalty"] == 1.5
     assert "16384-token" in str(captured["template"])
+
+
+@pytest.mark.parametrize(("engine", "budget"), [("ollama", 32768), ("mlx", 49152)])
+def test_engine_selects_its_transport_and_usage_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, engine: str, budget: int
+) -> None:
+    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
+    lab = object()
+    monkeypatch.setattr(coding, "lab_transport", lambda: lab)
+    captured: dict[str, object] = {}
+
+    def factory(**kwargs: object) -> ollama_model.OllamaModel:
+        captured.update(kwargs)
+        return ollama_model.OllamaModel(**{**kwargs, "transport": None})  # type: ignore[arg-type]
+
+    monkeypatch.setattr(coding, "OllamaModel", factory)
+    repo = workspace(tmp_path)
+    config = campaign_config(repo).model_copy(
+        update={"inference_profile": "qwen-native-v1", "model": "qwen3.6:35b-a3b", "engine": engine}
+    )
+    coding.build_coding(config, contract(), repo, store=InMemoryEventStore())
+    assert captured["working_budget_tokens"] == budget
+    assert captured["transport"] is (lab if engine == "mlx" else None)

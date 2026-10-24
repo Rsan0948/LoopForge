@@ -48,6 +48,7 @@ from loopforge.ports.paid_budget import PaidBudgetPort
 from loopforge.ports.sandbox import SandboxCommandResult, SandboxError
 from loopforge.ports.tools import ToolExecutionRequest
 from loopforge.ports.verifier import VerificationResult
+from loopforge.workloads.fixtures import adder_repair_task
 
 
 def contract() -> CodingTaskConfig:
@@ -2117,3 +2118,86 @@ def test_edit_echo_is_off_by_default_and_never_hides_a_failed_edit(tmp_path: Pat
     )
     failing.edit_echo = True
     assert _edit(failing, "missing", "x") == "old text not found"
+
+
+def _read(tools: coding.ConfinedCodingTools, **arguments: str) -> coding.ToolResult:
+    request = ToolExecutionRequest(ActionProposal(ActionId("read"), "read_file", arguments), 1, 5)
+    return tools.execute(request)
+
+
+def _multi_reader(repo: GitWorkspace, sizes: dict[str, int]) -> coding.ConfinedCodingTools:
+    for name, lines in sizes.items():
+        (repo.root / "src" / name).write_text(
+            "".join(f"{name} {i}".ljust(39) + "\n" for i in range(lines))
+        )
+    tools = coding.ConfinedCodingTools(
+        cast("coding.CompositeToolExecutor", _EditExecutor(repo.root)), contract(), repo
+    )
+    tools.read_page_chars = 12000
+    tools.multi_read = True
+    return tools
+
+
+def test_one_call_reads_several_known_files_whole(tmp_path: Path) -> None:
+    tools = _multi_reader(workspace(tmp_path), {"a.py": 5, "b.py": 7})
+    result = _read(tools, paths='["src/a.py", "src/b.py"]')
+    assert result.ok
+    first, second = result.observation.split("\n\n")
+    for part, name, lines in ((first, "a.py", 5), (second, "b.py", 7)):
+        content = (tools.workspace.root / "src" / name).read_text()
+        assert part.startswith(f"Source 'src/{name}', starting line 1")
+        assert hashlib.sha256(content.encode()).hexdigest() in part  # edits need the hash
+        assert f"{name} {lines - 1}" in part
+        assert "End of file." in part
+
+
+def test_multi_read_stays_within_its_combined_limit(tmp_path: Path) -> None:
+    # Three 11.6K-character files: the third no longer fits the 24K combined limit.
+    tools = _multi_reader(workspace(tmp_path), {"a.py": 290, "b.py": 290, "c.py": 290})
+    result = _read(tools, paths='["src/a.py", "src/b.py", "src/c.py"]')
+    assert result.ok
+    assert len(result.observation) <= coding.MULTI_READ_CHARS + 2000  # headers only
+    assert "Not read (combined read limit reached): 'src/c.py'" in result.observation
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        {"paths": "src/a.py"},
+        {"paths": "[]"},
+        {"paths": '["src/a.py", "src/a.py"]'},
+        {"paths": json.dumps([f"src/{i}.py" for i in range(5)])},
+        {"paths": '["src/a.py"]', "start_line": "3"},
+        {"paths": '["src/a.py", 7]'},
+    ],
+    ids=["not-json", "empty", "duplicate", "too-many", "with-selector", "non-string"],
+)
+def test_malformed_multi_reads_are_refused_before_reading(
+    tmp_path: Path, arguments: dict[str, str]
+) -> None:
+    tools = _multi_reader(workspace(tmp_path), {"a.py": 3})
+    result = _read(tools, **arguments)
+    assert not result.ok
+    assert result.error_code == "CODING_READ_ARGUMENTS"
+
+
+def test_multi_read_keeps_each_path_check(tmp_path: Path) -> None:
+    tools = _multi_reader(workspace(tmp_path), {"a.py": 3})
+    result = _read(tools, paths='["src/a.py", ".git/config"]')
+    assert not result.ok
+    assert result.error_code == "CODING_SOURCE_DENIED"
+    assert result.observation.startswith("'.git/config': ")
+
+
+def test_legacy_profiles_keep_single_file_reads(tmp_path: Path) -> None:
+    repo = workspace(tmp_path)
+    (repo.root / "src/a.py").write_text("x = 1\n")
+    tools = coding.ConfinedCodingTools(
+        cast("coding.CompositeToolExecutor", _EditExecutor(repo.root)), contract(), repo
+    )
+    assert not _read(tools, paths='["src/a.py"]').ok
+    specs = {s.name: s for s in coding.coding_tool_specs(adder_repair_task())}
+    assert "paths" not in cast("dict[str, object]", specs["read_file"].parameters["properties"])
+    wide = {s.name: s for s in coding.coding_tool_specs(adder_repair_task(), read_page_chars=12000)}
+    assert "paths" in cast("dict[str, object]", wide["read_file"].parameters["properties"])
+    assert "up to 12000 chars" in wide["read_file"].description

@@ -283,6 +283,7 @@ def main() -> None:
             "report",
             "accept",
             "discard",
+            "launch",
         ),
     )
     parser.add_argument("--directory", type=Path, default=Path(".loopforge/repository-supervisor"))
@@ -299,6 +300,11 @@ def main() -> None:
                 review_command(args.directory, args.command, args.topic, args.answer), indent=2
             )
         )
+        return
+    if args.command == "launch":
+        from loopforge.entrypoints.goal_launch import launch  # noqa: PLC0415
+
+        print(json.dumps(launch(args.directory, args.config), indent=2))
         return
     if args.command == "status":
         print(

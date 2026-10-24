@@ -268,6 +268,7 @@ def test_mlx_goal_checks_the_mlx_server_not_ollama(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _intake(tmp_path, "mlx")
+
     def no_preflight(_task: object) -> None:
         return None
 
