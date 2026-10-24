@@ -1,7 +1,11 @@
-"""Paired Gemini-compaction trials using the unchanged engine comparison runtime."""
+# ruff: noqa: EM101, TRY003, PLR0912, PLR0915 - operator experiment script
+"""Tier-2 (Gemini handoff) checkpoint-compaction trials on the engine comparison runtime.
+
+Tier 1 (masking) is part of the profile and runs in every comparison trial. These trials
+add the optional paid tier-2 summarizer under a separate frozen ledger.
+"""
 
 import argparse
-import hashlib
 import json
 import os
 import signal
@@ -14,12 +18,10 @@ from loopforge.adapters.model_lease import ModelLease
 from loopforge.adapters.paid_budget import SQLitePaidBudget
 from scripts import run_engine_comparison as cmp
 from scripts.compaction_lab import (
-    COOLDOWN_CALLS,
     MODEL,
     PRICE_VALID_UNTIL,
-    TRIGGER_TOKENS,
-    CompactingModel,
     GeminiCompactor,
+    checkpoint_summarizer,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,22 +32,22 @@ SCHEDULE = [(1, "ollama", "cold"), (1, "mlx", "cold"), (2, "mlx", "warm"), (2, "
 def child(directory, engine, budget_path):
     ledger = SQLitePaidBudget(budget_path, BUDGET)
     compactor = GeminiCompactor(ledger, directory / "compactor")
+    hook = checkpoint_summarizer(compactor, directory.name)
     original = cmp.OllamaModel
-    cmp.OllamaModel = lambda **kw: CompactingModel(
-        compactor=compactor, trial_directory=directory, **kw
-    )
+    cmp.OllamaModel = lambda **kw: original(**kw, checkpoint_summarizer=hook)
     try:
         cmp.child(directory, engine)
     finally:
         cmp.OllamaModel = original
     path = directory / "result.json"
     result = json.loads(path.read_text())
-    compactions = [json.loads(p.read_text()) for p in sorted(directory.glob("compaction-*.json"))]
-    result["compaction"] = {
-        "attempts": len(compactions),
-        "applied": sum(c["applied"] for c in compactions),
-        "wall_seconds": sum(c["wall_seconds"] for c in compactions),
-        "events": compactions,
+    paid = [
+        json.loads(p.read_text()) for p in sorted((directory / "compactor").glob("*.response.json"))
+    ]
+    result["tier2"] = {
+        "calls": len(paid),
+        "valid": sum(bool(r.get("valid")) for r in paid),
+        "charged_microusd": sum(r["charged_microusd"] for r in paid),
     }
     path.write_text(json.dumps(result, indent=2))
 
@@ -69,7 +71,7 @@ def run(output, baseline):
         "kind": "compaction-experiment",
         "max_additional_microusd": BUDGET,
         "authorization": "User authorized $2 for compaction throughput/time experiments",
-        "baseline": str(baseline.resolve()),
+        "baseline": str(baseline.resolve()) if baseline else None,
         "schedule": SCHEDULE,
         "pinned_hashes": hashes,
         "compactor_model": MODEL,
@@ -77,31 +79,31 @@ def run(output, baseline):
         "input_microusd_per_token": 0.3,
         "output_microusd_per_token": 2.5,
         "price_valid_until": PRICE_VALID_UNTIL.isoformat(),
-        "trigger_tokens": TRIGGER_TOKENS,
-        "minimum_calls_between_attempts": COOLDOWN_CALLS,
+        "compaction": "checkpoint tier 1 + tier 2 summarizer (ollama_model._checkpoint_compact)",
         "maximum_trial_seconds": cmp.SECONDS,
         "profile": cmp.native_options(),
         "mlx_presence_context_size": cmp.MLX_PRESENCE_CONTEXT,
         "scope": "local coding completion with independent checks; no frontier review",
     }
     (output / "plan.json").write_text(json.dumps(plan, indent=2))
-    print(json.dumps({"status": "waiting_for_baseline", "directory": str(output)}), flush=True)
-    # Never compete for the GPU or change an in-flight baseline's inputs.
-    baseline_plan = json.loads((baseline / "plan.json").read_text())
-    while True:
-        if any(cmp.sha(ROOT / name) != digest for name, digest in hashes.items()):
-            raise RuntimeError("Frozen experiment inputs changed before launch")
-        try:
-            done = json.loads((baseline / "results.json").read_text())
-        except (FileNotFoundError, json.JSONDecodeError):
-            done = []
-        if len(done) == len(baseline_plan["schedule"]):
-            break
-        if (baseline / "monitor-stop.json").exists():
-            raise RuntimeError(
-                "Baseline stopped for harness/configuration fault; review before compaction trials"
-            )
-        time.sleep(10)
+    if baseline is not None:
+        # Never compete for the GPU or change an in-flight baseline's inputs.
+        print(json.dumps({"status": "waiting_for_baseline", "directory": str(output)}), flush=True)
+        baseline_plan = json.loads((baseline / "plan.json").read_text())
+        while True:
+            if any(cmp.sha(ROOT / name) != digest for name, digest in hashes.items()):
+                raise RuntimeError("Frozen experiment inputs changed before launch")
+            try:
+                done = json.loads((baseline / "results.json").read_text())
+            except (FileNotFoundError, json.JSONDecodeError):
+                done = []
+            if len(done) == len(baseline_plan["schedule"]):
+                break
+            if any(
+                (baseline / name).exists() for name in ("monitor-stop.json", "operator-stop.json")
+            ):
+                raise RuntimeError("Baseline was stopped; review it before compaction trials")
+            time.sleep(10)
     lease = ModelLease()
     lease.acquire("compaction-comparison")
     results = []
@@ -198,10 +200,10 @@ def main():
     signal.signal(signal.SIGTERM, lambda *_: (_ for _ in ()).throw(KeyboardInterrupt()))
     if args.child:
         child(Path(args.child[0]), args.child[1], Path(args.child[2]))
-    elif args.output and args.baseline:
+    elif args.output:
         run(args.output, args.baseline)
     else:
-        parser.error("Provide --output and --baseline")
+        parser.error("Provide --output (and optionally --baseline to wait for)")
 
 
 if __name__ == "__main__":

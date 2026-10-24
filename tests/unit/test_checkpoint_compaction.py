@@ -176,16 +176,17 @@ def test_tier_two_handoff_is_model_inference_inside_a_tool_result_never_a_user_t
     assert not any("Checkpoint handoff" in u for u in users)
 
 
-def test_tier_two_failure_keeps_the_tier_one_result() -> None:
+@pytest.mark.parametrize("error", [ValueError, httpx.ConnectError, RuntimeError])
+def test_tier_two_failure_keeps_the_tier_one_result(error: type[Exception]) -> None:
     def failing(middle: Messages, previous: str | None) -> str:
-        msg = "handoff cites unknown evidence"
-        raise ValueError(msg)
+        msg = f"handoff unavailable after {len(middle)} messages ({previous})"
+        raise error(msg)
 
     model, requests = _model(budget=8192, checkpoint_summarizer=failing)
     _grow(model, 3)
     _turn(model, 7, verified=True, size=9000)
     assert model.compaction_log[-1]["tier"] == 1
-    assert model.compaction_log[-1]["tier2_error"] == "ValueError"
+    assert model.compaction_log[-1]["tier2_error"] == error.__name__
     assert not any(
         "Checkpoint handoff" in str(m.get("content", "")) for m in _messages(requests[-1])
     )

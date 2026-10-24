@@ -1,8 +1,9 @@
 # ruff: noqa: EM101, PLR0915, PT018, TRY003, TRY301 - operator experiment script
 """Ollama vs MLX on the real coding task: same runtime, same prompt bytes, cold and warm.
 
-Each trial runs the frozen qwen-native-v1 / qwen3.6:35b-a3b worker unchanged (32768
-output, 131072 context, vendor sampling, evidence-driven thinking) on the frozen
+Each trial runs the qwen-native-v1 / qwen3.6:35b-a3b worker with its current code-owned
+profile (see ollama_profiles.py: output cap, 131072 allocation, checkpoint usage budget,
+sampling, constant thinking) on the frozen
 full-a3b reconciliation task, inside the normal container sandbox and fixed checks.
 No supervisor, review or paid calls.
 
@@ -280,6 +281,7 @@ def child(directory: Path, engine: str, probe_calls: int | None = None) -> None:
                 if isinstance(e, ActionProposed)
             ],
             "stop": [e.summary for e in events if isinstance(e, RunStopped)],
+            "compactions": list(getattr(live, "compaction_log", [])),
         }
         (directory / "candidate.patch").write_text(workspace.diff())
     except BaseException as exc:
