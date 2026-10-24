@@ -85,22 +85,15 @@ def test_a_small_feature_completes(
 
 
 def test_steady_progress_through_one_probe_completes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(
-        request,
-        profile,
-        "F2: a probe failing at a later line scores the same, so steady progress "
-        "through ten assertions stalls after eight verifications",
-    )
     outcome = run(tmp_path, monkeypatch, profile, feature_by_feature())
     assert outcome.state.status is RunStatus.SUCCEEDED, outcome.stop_summary
 
 
 def test_whole_file_rewrites_that_add_features_complete(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(request, profile, "F2: whole-file rewrites that add features look flat")
     turns: list[Turn] = []
     for count in range(1, len(FEATURES) + 1):
         content = "// Snake\n" + "".join(marker(name) for name, _ in FEATURES[:count])
@@ -136,14 +129,8 @@ def test_bad_read_arguments_do_not_end_a_run_that_recovers(
 
 
 def test_a_long_run_is_charged_for_new_work_not_the_repeated_prompt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(
-        request,
-        profile,
-        "F3: every turn charges the whole prompt again, so a 1.5M budget ends a "
-        "20K-prompt run near turn 48",
-    )
     turns: list[Turn] = [call("read_file", path=GAME)]
     for name, _ in FEATURES:
         turns += [

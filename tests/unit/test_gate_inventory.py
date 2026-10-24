@@ -16,7 +16,8 @@ SOURCE = Path(loopforge.__file__).parent
 CONTROL_STOPS = {
     "STOP_SUCCESS_VERIFIED": "verified success",
     "STOP_BUDGET_EXHAUSTED": "hard budget: cost",
-    "STOP_TOKEN_BUDGET_EXHAUSTED": "hard budget: tokens (F3: charges the repeated prompt)",
+    "STOP_TOKEN_BUDGET_EXHAUSTED": "hard budget: work tokens (input not served from the "
+    "provider's prompt cache, plus output)",
     "STOP_TIME_BUDGET_EXHAUSTED": "hard budget: wall clock",
     "STOP_STALLED_NO_PROGRESS": "N verifications without a better score (F2)",
     "STOP_MAX_ITERATIONS": "hard budget: iterations",

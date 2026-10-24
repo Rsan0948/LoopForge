@@ -335,7 +335,7 @@ class CodingCoordinator:
                 ]
                 previous_ids = [rid for rid, _ in linked]
                 used = sum(
-                    replay(RunId(rid), events.events_for(RunId(rid))).total_tokens
+                    replay(RunId(rid), events.events_for(RunId(rid))).work_tokens
                     for rid in previous_ids
                 )
                 elapsed = sum(

@@ -115,6 +115,17 @@ class RunState:
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
 
+    @property
+    def work_tokens(self) -> int:
+        """Tokens a provider had to process: input not served from its prompt cache,
+        plus output. Hard token budgets count these, so an append-only conversation is
+        not charged again for the prefix it re-sends every turn."""
+        return (
+            self.input_tokens
+            - min(self.cached_input_tokens, self.input_tokens)
+            + (self.output_tokens)
+        )
+
     def failure_streak_for(self, tool_name: str) -> int:
         for item in self.tool_failure_streaks:
             if item.tool_name == tool_name:

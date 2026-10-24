@@ -99,6 +99,8 @@ class ChatResponse(BaseModel):
     done: bool
     prompt_eval_count: int = Field(ge=0)
     eval_count: int = Field(ge=0)
+    # Prompt tokens served from the server's prefix cache, when the server reports it.
+    prompt_eval_cached_count: int = Field(default=0, ge=0)
 
 
 class _ProviderError(BaseModel):
@@ -315,6 +317,9 @@ class OllamaModel:
         self._seen_items: dict[RunId, set[tuple[str, str]]] = {}
         self._pending_calls: dict[RunId, str] = {}
         self._thinking_exhausted: set[RunId] = set()
+        # The previous request's messages (serialized) and prompt size, per run: a
+        # request that extends them exactly re-sends a prefix the server already holds.
+        self._previous_prompt: dict[RunId, tuple[list[str], int]] = {}
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         self._client = httpx.Client(
             base_url=base_url,
@@ -333,6 +338,7 @@ class OllamaModel:
         self._seen_items.clear()
         self._pending_calls.clear()
         self._thinking_exhausted.clear()
+        self._previous_prompt.clear()
         self._client.close()
 
     def _selected_tools(self, context: ModelContext) -> tuple[ModelToolSpec, ...]:
@@ -444,6 +450,7 @@ class OllamaModel:
             cost_usd=self._cost(response),
             input_tokens=response.prompt_eval_count,
             output_tokens=response.eval_count,
+            cached_input_tokens=self._cached_prompt_tokens(context.run_id, payload, response),
         )
         self._record_measurement(context, admission, response.prompt_eval_count)
         try:
@@ -536,6 +543,30 @@ class OllamaModel:
                     context_admission=admission,
                 )
             payload["messages"] = list(messages)
+
+    def _cached_prompt_tokens(
+        self, run_id: RunId, payload: dict[str, object], response: ChatResponse
+    ) -> int:
+        """Prompt tokens this request re-sent unchanged, which the server did not recompute.
+
+        The server's own cached count when it reports one; otherwise the previous
+        request's prompt size when this request extends its messages exactly (an
+        append-only conversation the server's prefix cache serves). A compaction or
+        trim breaks the prefix and counts in full.
+        """
+        sent = [
+            json.dumps(message, sort_keys=True, ensure_ascii=False)
+            for message in cast("list[object]", payload["messages"])
+        ]
+        previous = self._previous_prompt.get(run_id)
+        self._previous_prompt[run_id] = (sent, response.prompt_eval_count)
+        if response.prompt_eval_cached_count:
+            cached = response.prompt_eval_cached_count
+        elif previous is not None and sent[: len(previous[0])] == previous[0]:
+            cached = previous[1]
+        else:
+            cached = 0
+        return min(cached, response.prompt_eval_count)
 
     def _record_measurement(
         self, context: ModelContext, admission: ContextAdmission | None, prompt_tokens: int
@@ -736,6 +767,7 @@ class OllamaModel:
         self._conversations.pop(run_id, None)
         self._seen_items.pop(run_id, None)
         self._pending_calls.pop(run_id, None)
+        self._previous_prompt.pop(run_id, None)
         self._history_compactions.pop(run_id, None)
         self._ratio_bound_violated.discard(run_id)
         self._calibration.pop(run_id, None)

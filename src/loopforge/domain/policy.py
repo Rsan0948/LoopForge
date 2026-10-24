@@ -50,7 +50,7 @@ class ControlPolicy:
             )
         if (
             self.budget.max_total_tokens is not None
-            and state.total_tokens >= self.budget.max_total_tokens
+            and state.work_tokens >= self.budget.max_total_tokens
         ):
             return ControlDecision(
                 ControlDecisionKind.STOP_BUDGET,
