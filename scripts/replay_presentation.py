@@ -41,7 +41,11 @@ def replay(trial: Path, *, current: bool) -> list[tuple[int, int]]:
     contexts = [e for e in events if isinstance(e, ContextAssembled)]
     template = default_controller_template()
     tools = tuple(
-        ModelToolSpec(name=t["function"]["name"], description=t["function"]["description"], parameters=t["function"]["parameters"])
+        ModelToolSpec(
+            name=t["function"]["name"],
+            description=t["function"]["description"],
+            parameters=t["function"]["parameters"],
+        )
         for t in exchanges[0]["native_request"]["tools"]
     )
     sizes: list[tuple[int, int]] = []
