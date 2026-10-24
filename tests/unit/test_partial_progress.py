@@ -88,3 +88,61 @@ def test_unchanged_or_worse_partial_credit_still_counts_as_no_progress() -> None
     for n, score in enumerate((0.7, 0.6, 0.5), start=2):
         state = _failed(replace(state, status=RunStatus.VERIFYING), score, n)
     assert state.consecutive_no_progress == 3
+
+
+def _repeat(state: RunState, score: float, n: int) -> RunState:
+    return reduce_event(
+        replace(state, status=RunStatus.VERIFYING),
+        VerificationFailed(
+            event_id=EventId(f"evt_{n}"),
+            run_id=state.run_id,
+            occurred_at=NOW,
+            sequence=n,
+            summary=f"check failed {n}",
+            score=score,
+            repeat=True,
+        ),
+    )
+
+
+def test_re_reported_verdicts_for_an_unchanged_candidate_count_no_attempt() -> None:
+    state = _failed(_reflecting(), 0.5, 1)
+    state = _failed(replace(state, status=RunStatus.VERIFYING), 0.5, 2)
+    assert state.consecutive_no_progress == 1
+    for n in range(3, 13):  # Ten checks of the same candidate: observations, not attempts.
+        state = _repeat(state, 0.5, n)
+    assert state.consecutive_no_progress == 1
+    assert state.best_verification_score == 0.5
+
+
+def test_a_repeat_never_resets_a_real_stall() -> None:
+    state = _failed(_reflecting(), 0.7, 1)
+    for n in range(2, 5):
+        state = _failed(replace(state, status=RunStatus.VERIFYING), 0.6, n)
+    state = _repeat(state, 0.9, 5)  # A repeat cannot claim progress either.
+    assert state.consecutive_no_progress == 3
+    assert state.best_verification_score == 0.7
+
+
+def test_repeat_flag_round_trips_and_old_events_default_to_attempts() -> None:
+    import json  # noqa: PLC0415
+
+    from loopforge.adapters.json_events import JsonEventCodec  # noqa: PLC0415
+
+    codec = JsonEventCodec()
+    event = VerificationFailed(
+        event_id=EventId("evt_r"),
+        run_id=RunId("run_r"),
+        occurred_at=NOW,
+        sequence=1,
+        summary="s",
+        score=0.5,
+        repeat=True,
+    )
+    encoded = codec.encode(event)
+    assert codec.decode(encoded) == event
+    legacy = json.loads(encoded)
+    del legacy["event"]["repeat"]
+    decoded = codec.decode(json.dumps(legacy))
+    assert isinstance(decoded, VerificationFailed)
+    assert decoded.repeat is False

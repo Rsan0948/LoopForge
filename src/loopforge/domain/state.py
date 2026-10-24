@@ -430,8 +430,12 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 consecutive_no_progress=0 if task_complete else no_progress,
                 status=RunStatus.VERIFYING if task_complete else RunStatus.REFLECTING,
             )
-        case VerificationFailed(summary=summary, score=score):
-            best_score, no_progress = _verification_progress(base, summary=summary, score=score)
+        case VerificationFailed(summary=summary, score=score, repeat=repeat):
+            best_score, no_progress = (
+                (base.best_verification_score, base.consecutive_no_progress)
+                if repeat
+                else _verification_progress(base, summary=summary, score=score)
+            )
             return replace(
                 base,
                 last_verification=summary,

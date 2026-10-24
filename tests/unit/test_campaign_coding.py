@@ -2271,3 +2271,16 @@ def test_no_credit_for_legacy_profiles_or_passing_candidates(tmp_path: Path) -> 
     passing.verifier = _AcceptanceFailing(passed=True)
     (ws2.root / "src/add.py").write_text("def add(a,b): return a+b\n")
     assert passing.verify(RunState(run_id=RunId("pass"))).score == 1
+
+
+def test_checking_an_unchanged_candidate_is_reported_as_a_repeat(tmp_path: Path) -> None:
+    verifier, ws = _building(tmp_path, credit=True)
+    state = RunState(run_id=RunId("repeat"))
+    (ws.root / "src/add.py").write_text("def add(a,b): return a+b\n")
+    first = verifier.verify(state)
+    again = verifier.verify(state)
+    assert not first.repeat
+    assert again.repeat
+    assert again.score == first.score
+    (ws.root / "src/add.py").write_text("def add(a,b): return b+a\n")
+    assert not verifier.verify(state).repeat  # A changed candidate is a new attempt.

@@ -324,11 +324,16 @@ def _construct_verification_failed(base: dict[str, Any], data: dict[str, Any]) -
     if not isinstance(inconclusive, bool):
         msg = "inconclusive must be a bool"
         raise TypeError(msg)
+    repeat = data.get("repeat", False)
+    if not isinstance(repeat, bool):
+        msg = "repeat must be a bool"
+        raise TypeError(msg)
     return VerificationFailed(
         **base,
         summary=_required_str(data, "summary"),
         score=float(score) if score is not None else None,
         inconclusive=inconclusive,
+        repeat=repeat,
     )
 
 

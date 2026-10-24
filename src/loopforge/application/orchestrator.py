@@ -393,6 +393,7 @@ class Orchestrator:
                     summary=verification.summary,
                     score=verification.score,
                     inconclusive=verification.inconclusive,
+                    repeat=verification.repeat,
                 ),
             )
         return verification

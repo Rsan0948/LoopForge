@@ -21,6 +21,10 @@ class VerificationResult:
     """True when at least one check never executed (infra error, not a code
     verdict). Fail-closed: inconclusive results are never ``passed``."""
 
+    repeat: bool = False
+    """True when the verdict is re-reported for an unchanged, already verified
+    candidate; the run records it without counting a new attempt."""
+
     task_complete: bool = True
     """Code-owned verdict that all workload obligations are satisfied.
 

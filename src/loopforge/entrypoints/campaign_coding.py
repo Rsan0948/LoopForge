@@ -908,6 +908,7 @@ class CodingVerifier:
                 self.checked[1],
                 summary=self.checked[1].summary
                 + "\nCandidate unchanged since this verification; edit to re-verify.",
+                repeat=True,
             )
         candidate = candidate_revision(self.workspace)
         result = self.verifier.verify(state)

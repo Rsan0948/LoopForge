@@ -109,7 +109,8 @@ class TaskAssignment:
     def __post_init__(self) -> None:
         # Each rule has its own fixed message so a model can correct the exact field.
         rules = (
-            (10 <= len(self.objective.strip()) <= 1500, "objective must be 10-1500 characters"),
+            # 4000: Gemini repeatedly wrote 1.5-2K-character fix lists (live, 2026-10-24).
+            (10 <= len(self.objective.strip()) <= 4000, "objective must be 10-4000 characters"),
             (1 <= len(self.files) <= 30, "files must list 1-30 paths"),
             (len(set(self.files)) == len(self.files), "files must not repeat a path"),
             (

@@ -90,7 +90,7 @@ class InspectionWireSchema(BaseModel):
 
 class AssignmentWireSchema(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
-    objective: str = Field(min_length=10, max_length=1500)
+    objective: str = Field(min_length=10, max_length=4000)
     files: list[str] = Field(min_length=1, max_length=30)
     evidence_ids: list[str] = Field(min_length=1, max_length=12)
 

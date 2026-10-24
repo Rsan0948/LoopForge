@@ -183,6 +183,10 @@ class VerificationFailed(DomainEvent):
     """True when the verdict reflects checks that never executed (infra
     error) rather than measured workspace state. Defaults False so replays
     of pre-existing streams keep their meaning."""
+    repeat: bool = False
+    """True when this re-reports the verdict of an unchanged, already verified
+    candidate (an observation, not a new attempt): it neither advances nor resets
+    the no-progress counter. Defaults False so existing streams keep their meaning."""
 
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
