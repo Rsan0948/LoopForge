@@ -1514,3 +1514,83 @@ def test_protocol_correction_does_not_become_a_user_query_in_exact_mode(
     correction = cast("list[dict[str, object]]", requests[1]["messages"])[-1]
     assert correction["role"] == role
     assert "Protocol correction" in str(correction["content"])
+
+
+def _calibrated_model(replies: list[int]) -> tuple[OllamaModel, list[dict[str, object]]]:
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=_chat_payload(prompt_tokens=replies[len(requests) - 1]))
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        transport=httpx.MockTransport(respond),
+        context_window_tokens=8192,
+        max_output_tokens=1024,
+        byte_ratio_admission=True,
+    )
+    return model, requests
+
+
+def _growing(size: int) -> ModelContext:
+    return _context_with(
+        _item("objective", "Repair the adder regression.", TrustClass.AUTHORIZED_HUMAN),
+        _item(f"obs{size}", "x" * size, TrustClass.UNTRUSTED_CONTENT),
+    )
+
+
+def test_provider_count_calibrates_the_next_bound_instead_of_compacting() -> None:
+    model, _ = _calibrated_model([1900, 2900])
+    first = model.propose_action(_growing(8000))
+    assert first.context_admission is not None
+    assert (
+        first.context_admission.measurement_basis
+        is InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
+    )
+    second = model.propose_action(_growing(3500))
+    admission = second.context_admission
+    assert admission is not None
+    assert admission.measurement_basis is InputMeasurementBasis.PROVIDER_COUNT_PLUS_DELTA
+    strict_ratio = -(-admission.serialized_request_bytes // 2)
+    assert strict_ratio + 1024 + 1024 > 8192  # the old ratio bound would have compacted
+    assert admission.input_token_bound < strict_ratio
+    assert admission.compacted_turns == 0
+
+
+def test_provider_count_above_the_bound_fails_closed_to_the_strict_bound() -> None:
+    model, _ = _calibrated_model([9000, 100])
+    model.propose_action(_growing(2000))
+    second = model.propose_action(_growing(100))
+    assert second.context_admission is not None
+    assert second.context_admission.measurement_basis is InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND
+
+
+def test_compaction_frees_headroom_instead_of_trimming_one_turn_per_request() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        # Realistic provider count: ~3.4 bytes per token of the actual request.
+        tokens = int(len(request.content) / 3.4)
+        return httpx.Response(200, json=_chat_payload(prompt_tokens=tokens))
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        transport=httpx.MockTransport(respond),
+        context_window_tokens=8192,
+        max_output_tokens=1024,
+        byte_ratio_admission=True,
+    )
+    turns = [model.propose_action(_growing(2800 + i)) for i in range(10)]
+    compacted = [t for t in turns if t.context_admission and t.context_admission.compacted_turns]
+    assert compacted, "test must exercise compaction"
+    budget = 8192 - 1024 - 1024
+    first = compacted[0].context_admission
+    assert first is not None
+    assert first.input_token_bound <= budget * 3 // 4
+    # Headroom means the next turns grow without another compaction right away.
+    index = turns.index(compacted[0])
+    following = [t.context_admission for t in turns[index + 1 : index + 3]]
+    assert all(a is not None and a.compacted_turns == first.compacted_turns for a in following)

@@ -10,6 +10,10 @@ class InputMeasurementBasis(StrEnum):
     # Conservative ratio bound: serialized UTF-8 bytes / 2. Measured local Qwen
     # requests average ~3.4 bytes per token, so this keeps large headroom.
     UTF8_BYTES_PER_TOKEN_FLOOR_2 = "utf8_bytes_per_token_floor_2"
+    # The provider's measured token count for the previous request of this run plus
+    # the UTF-8 byte delta since then at 2 bytes/token. Accurate at long context
+    # (the full-ratio bound overstates ~1.7x), conservative for the new part only.
+    PROVIDER_COUNT_PLUS_DELTA = "provider_count_plus_utf8_delta_floor_2"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

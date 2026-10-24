@@ -245,6 +245,8 @@ class OllamaModel:
             raise ValueError(msg)
         self._history_replay = history_replay
         self._ratio_bound_violated: set[RunId] = set()
+        # Per run: (serialized bytes, provider-reported prompt tokens) of the last request.
+        self._calibration: dict[RunId, tuple[int, int]] = {}
         self._history_compactions: dict[RunId, int] = {}
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
@@ -396,14 +398,7 @@ class OllamaModel:
             input_tokens=response.prompt_eval_count,
             output_tokens=response.eval_count,
         )
-        if (
-            admission is not None
-            and admission.measurement_basis is InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
-            and response.prompt_eval_count > admission.input_token_bound
-        ):
-            # The ratio assumption failed for this run: fail closed to the strict bound.
-            self._ratio_bound_violated.add(context.run_id)
-            self.request_tracker.note("byte_ratio_bound_exceeded_strict_bound_restored")
+        self._record_measurement(context, admission, response.prompt_eval_count)
         try:
             action = self._parse_action(context, response)
         except ModelTurnError as error:
@@ -445,31 +440,22 @@ class OllamaModel:
         if self._context_window_tokens is None:
             return None
         output_reserve = self._max_output_tokens or 2048
+        input_budget = self._context_window_tokens - output_reserve - 1024
+        compacting = False
         while True:
             serialized_bytes = len(
                 json.dumps(
                     payload, ensure_ascii=False, separators=(",", ":"), allow_nan=False
                 ).encode()
             )
-            count = (
-                self._request_token_counter(payload)
-                if self._request_token_counter is not None
-                else -(-serialized_bytes // 2)
-                if self._byte_ratio_admission and context.run_id not in self._ratio_bound_violated
-                else serialized_bytes
+            count, basis = self._measure(
+                payload, serialized_bytes, context, calibrated=not compacting
             )
             if type(count) is not int or count < 0:
                 msg = "request token counter returned invalid occupancy"
                 raise ValueError(msg)
             admission = ContextAdmission(
-                measurement_basis=(
-                    InputMeasurementBasis.TOKEN_COUNTER
-                    if self._request_token_counter is not None
-                    else InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
-                    if self._byte_ratio_admission
-                    and context.run_id not in self._ratio_bound_violated
-                    else InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND
-                ),
+                measurement_basis=basis,
                 input_token_bound=count,
                 serialized_request_bytes=serialized_bytes,
                 context_window_tokens=self._context_window_tokens,
@@ -477,9 +463,19 @@ class OllamaModel:
                 framing_reserve_tokens=1024,
                 compacted_turns=self._history_compactions.get(context.run_id, 0),
             )
-            if admission.admitted:
+            # Each compaction rewrites the prompt prefix (a full re-prefill), so once
+            # it is needed it frees headroom to 75% of the input budget at once.
+            if admission.admitted and (not compacting or count <= input_budget * 3 // 4):
                 self.request_tracker.record_admission(admission)
                 return admission
+            if admission.admitted:
+                # Short of the headroom target: drop another turn, or accept if none remain.
+                if not self._compact_history(messages, context):
+                    self.request_tracker.record_admission(admission)
+                    return admission
+                payload["messages"] = list(messages)
+                continue
+            compacting = True
             if (
                 self._conversation_mode == "state"
                 or self._history_overflow == "fail"
@@ -493,6 +489,45 @@ class OllamaModel:
                     context_admission=admission,
                 )
             payload["messages"] = list(messages)
+
+    def _record_measurement(
+        self, context: ModelContext, admission: ContextAdmission | None, prompt_tokens: int
+    ) -> None:
+        """Calibrate the next bound from the provider's count, or fail closed if exceeded."""
+        if admission is None or admission.measurement_basis not in {
+            InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2,
+            InputMeasurementBasis.PROVIDER_COUNT_PLUS_DELTA,
+        }:
+            return
+        if prompt_tokens > admission.input_token_bound:
+            # The ratio assumption failed for this run: fail closed to the strict bound.
+            self._ratio_bound_violated.add(context.run_id)
+            self._calibration.pop(context.run_id, None)
+            self.request_tracker.note("byte_ratio_bound_exceeded_strict_bound_restored")
+            return
+        self._calibration[context.run_id] = (admission.serialized_request_bytes, prompt_tokens)
+
+    def _measure(
+        self,
+        payload: dict[str, object],
+        serialized_bytes: int,
+        context: ModelContext,
+        *,
+        calibrated: bool = True,
+    ) -> tuple[int, InputMeasurementBasis]:
+        if self._request_token_counter is not None:
+            return self._request_token_counter(payload), InputMeasurementBasis.TOKEN_COUNTER
+        if not self._byte_ratio_admission or context.run_id in self._ratio_bound_violated:
+            return serialized_bytes, InputMeasurementBasis.UTF8_BYTE_UPPER_BOUND
+        # The delta assumes "previous request plus appended turns"; a compacted request
+        # removed turns and inserted a notice, so it uses the full ratio until the next
+        # provider count re-calibrates.
+        calibration = self._calibration.get(context.run_id) if calibrated else None
+        if calibration is not None and serialized_bytes >= calibration[0]:
+            delta = -(-(serialized_bytes - calibration[0]) // 2)
+            return calibration[1] + delta, InputMeasurementBasis.PROVIDER_COUNT_PLUS_DELTA
+        # First request, or the history shrank (compaction): full conservative ratio.
+        return -(-serialized_bytes // 2), InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
 
     def _compact_history(self, history: list[dict[str, object]], context: ModelContext) -> bool:
         """Drop complete older turns, preserving authority and current blockers.
@@ -549,6 +584,7 @@ class OllamaModel:
         self._pending_calls.pop(run_id, None)
         self._history_compactions.pop(run_id, None)
         self._ratio_bound_violated.discard(run_id)
+        self._calibration.pop(run_id, None)
 
     def _conversation(
         self, context: ModelContext, rendered: RenderedPrompt
