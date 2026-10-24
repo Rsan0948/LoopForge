@@ -304,6 +304,8 @@ class ConfinedCodingTools:
         self.import_formatter: Callable[[str, str], str] | None = None
         # Code-owned read window; whole small files avoid continuation calls.
         self.read_page_chars = 3000
+        # Code-owned: echo the edited region after edit_file instead of forcing a reread.
+        self.edit_echo = False
 
     def metadata_for(self, tool_name: str) -> ToolMetadata:
         if tool_name in {"apply_edits", "format_python_imports"}:
@@ -478,7 +480,43 @@ class ConfinedCodingTools:
                     error_code="CODING_PATH_DENIED",
                     failure_class=ToolFailureClass.PERMANENT,
                 )
+            if request.proposal.tool_name == "edit_file" and self.edit_echo:
+                return self.echo_edit(request, self.tools.execute(request))
         return self.tools.execute(request)
+
+    def echo_edit(self, request: ToolExecutionRequest, result: ToolResult) -> ToolResult:
+        """Return the edited region and new hash, so checking an edit needs no reread."""
+        if not result.ok:
+            return result
+        args = request.proposal.arguments
+        read = self.tools.execute(
+            replace(
+                request,
+                proposal=replace(
+                    request.proposal, tool_name="read_file", arguments={"path": args["path"]}
+                ),
+            )
+        )
+        if not read.ok:
+            return result
+        content = read.observation
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        new = args.get("new", "")
+        at = content.find(new) if new else -1
+        if at < 0:
+            return replace(result, observation=f"{result.observation}; sha256 now {digest}")
+        lines = content.splitlines()
+        first = content.count("\n", 0, at)
+        last = first + max(new.count("\n"), 0)
+        start, stop = max(0, first - 6), min(len(lines), last + 7)
+        region = "\n".join(lines[start:stop])
+        if len(region) > 4000:
+            region = region[:4000] + "\n[edited region clipped; read_file for the rest]"
+        return replace(
+            result,
+            observation=f"{result.observation}; sha256 now {digest}. "
+            f"Edited region, lines {start + 1}-{stop}:\n{region}",
+        )
 
     def format_imports(self, request: ToolExecutionRequest) -> ToolResult:
         """Compute in /tmp, then apply one fingerprint-guarded atomic replacement."""
@@ -1345,6 +1383,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             thinking_policy=profile.thinking_policy,
             history_replay=profile.history_replay,
             observation_format=profile.observation_format,
+            working_budget_tokens=profile.working_budget_tokens,
         )
     )
     selected = model if model is not None else live
@@ -1389,6 +1428,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
     )
     context_port: ContextBuilderPort = context_builder
     tools.read_page_chars = profile.read_page_chars
+    tools.edit_echo = profile.observation_format == "delimited"
     if profile.conversation_mode == "state" or native:
         tools.import_formatter = PinnedImportFormatter(workspace.root, task.image).format_file
     if profile.conversation_mode == "state":

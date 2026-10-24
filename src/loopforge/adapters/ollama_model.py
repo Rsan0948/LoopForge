@@ -33,6 +33,7 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 from loopforge.adapters.observation_format import (
+    checkpoint_stub,
     delimited,
     failure_fingerprint,
     is_verification_failure,
@@ -40,11 +41,11 @@ from loopforge.adapters.observation_format import (
 from loopforge.adapters.ollama_usage import ProviderRequestTracker, known_usage
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.admission import ContextAdmission, InputMeasurementBasis
-from loopforge.domain.context import ContextItem, ModelContext
+from loopforge.domain.context import ContextItem, ContextSource, ModelContext
 from loopforge.domain.prompts import PromptTemplate, RenderedPrompt, render_prompt
 from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import TrustClass
-from loopforge.domain.types import ActionId, RunId, UsageDelta
+from loopforge.domain.types import ActionId, ContextItemId, RunId, UsageDelta
 from loopforge.ports.model import (
     ModelFailureClass,
     ModelToolSpec,
@@ -58,6 +59,11 @@ _FOLLOW_THROUGH_TOOLS: Final = frozenset(
     {"read_file", "search_files", "repository_map", "find_symbol", "workspace_status"}
 )
 _SUMMARY_BUDGET: Final = 200
+# Projected growth of one more cycle: a tool result (12K-character read) plus a typical
+# reasoning output (lab p90 about 1.1K tokens), in tokens.
+_CHECKPOINT_RESERVE: Final = 6000
+_KEEP_EXCHANGES: Final = 2
+_VERIFICATION_SUFFIXES: Final = (":verifier-failure", ":confirmed-fact", ":verification")
 
 
 class _FunctionCall(BaseModel):
@@ -138,6 +144,8 @@ class OllamaModel:
         history_replay: Literal["bounded", "exact"] = "bounded",
         conversation_mode: Literal["history", "state"] = "history",
         observation_format: Literal["plain", "delimited"] = "plain",
+        working_budget_tokens: int | None = None,
+        checkpoint_summarizer: Callable[[list[dict[str, object]], str | None], str] | None = None,
         tool_filter: Callable[[ModelContext], frozenset[str]] | None = None,
         tool_spec_filter: Callable[[ModelContext, ModelToolSpec], ModelToolSpec] | None = None,
     ) -> None:
@@ -256,6 +264,30 @@ class OllamaModel:
         self._observation_format = observation_format
         # Per run: fingerprint of the last verification failure presented in full.
         self._presented_failure: dict[RunId, str] = {}
+        # Checkpoint compaction (code-owned usage budget below the allocated window).
+        if working_budget_tokens is not None and (
+            type(working_budget_tokens) is not int
+            or working_budget_tokens < 8192
+            or conversation_mode != "history"
+            or observation_format != "delimited"
+            or context_window_tokens is None
+            or working_budget_tokens + _CHECKPOINT_RESERVE
+            > context_window_tokens - (max_output_tokens or 2048) - 1024
+        ):
+            msg = (
+                "working_budget_tokens must be an integer of at least 8192 in history mode "
+                "with delimited observations, and its reserve inside the admitted window"
+            )
+            raise ValueError(msg)
+        if checkpoint_summarizer is not None and working_budget_tokens is None:
+            msg = "a checkpoint summarizer requires a working budget"
+            raise ValueError(msg)
+        self._working_budget = working_budget_tokens
+        self._checkpoint_summarizer = checkpoint_summarizer
+        self._checkpoint_due: set[RunId] = set()
+        self._handoffs: dict[RunId, str] = {}
+        # Lab/operator metrics, one record per checkpoint compaction.
+        self.compaction_log: list[dict[str, object]] = []
         self._ratio_bound_violated: set[RunId] = set()
         # Per run: (serialized bytes, provider-reported prompt tokens) of the last request.
         self._calibration: dict[RunId, tuple[int, int]] = {}
@@ -381,6 +413,7 @@ class OllamaModel:
         effective_output_limit = self._max_output_tokens or (
             2048 if self._context_window_tokens is not None else None
         )
+        self._checkpoint_compact(payload, messages, context)
         admission = self._admit_request(payload, messages, context)
         try:
             response = self._post(payload)
@@ -541,6 +574,98 @@ class OllamaModel:
         # First request, or the history shrank (compaction): full conservative ratio.
         return -(-serialized_bytes // 2), InputMeasurementBasis.UTF8_BYTES_PER_TOKEN_FLOOR_2
 
+    def _estimate(self, payload: dict[str, object], context: ModelContext) -> int:
+        """Planning estimate of prompt tokens from the run's last provider count."""
+        size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode())
+        calibration = self._calibration.get(context.run_id)
+        if calibration is None or calibration[0] <= 0:
+            return -(-size // 3)
+        return math.ceil(size * calibration[1] / calibration[0])
+
+    def _checkpoint_compact(
+        self, payload: dict[str, object], messages: list[dict[str, object]], context: ModelContext
+    ) -> None:
+        """Compact at a deterministic checkpoint so usage stays under the working budget.
+
+        Checkpoints are verification results. At a checkpoint the next cycle is
+        projected (current prompt plus one tool result and output); if it would exceed
+        the budget, history is compacted to half the budget in one rewrite. Between
+        checkpoints only an actual overrun compacts (a backstop, recorded as such).
+        Tier 1 masks old tool output to restorable stubs and drops old thinking; tier 2
+        (optional) replaces the masked middle with a validated model-inference handoff.
+        """
+        budget = self._working_budget
+        if budget is None or self._conversation_mode != "history":
+            return
+        checkpoint = context.run_id in self._checkpoint_due
+        self._checkpoint_due.discard(context.run_id)
+        before = self._estimate(payload, context)
+        overrun = before > budget
+        if not overrun and not (checkpoint and before + _CHECKPOINT_RESERVE > budget):
+            return
+        if not messages or messages[-1].get("role") != "tool":
+            return
+        target = budget // 2
+        record: dict[str, object] = {
+            "run_id": str(context.run_id),
+            "trigger": "checkpoint" if checkpoint else "budget_overrun",
+            "tokens_before": before,
+            "tier": 1,
+        }
+        assistants = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
+        if len(assistants) <= _KEEP_EXCHANGES:
+            return
+        keep_from = assistants[-_KEEP_EXCHANGES]
+        for index in assistants:
+            if index < keep_from:
+                messages[index].pop("thinking", None)
+        payload["messages"] = list(messages)
+        for index in range(2, keep_from):
+            if self._estimate(payload, context) <= target:
+                break
+            if messages[index].get("role") == "tool":
+                messages[index]["content"] = checkpoint_stub(str(messages[index]["content"]))
+                payload["messages"] = list(messages)
+        if self._estimate(payload, context) > target and self._checkpoint_summarizer is not None:
+            middle = [m for m in messages[2:keep_from] if m.get("role") != "system"]
+            try:
+                handoff = self._checkpoint_summarizer(middle, self._handoffs.get(context.run_id))
+            except (ValueError, ModelTurnError) as exc:
+                record["tier2_error"] = type(exc).__name__
+            else:
+                self._handoffs[context.run_id] = handoff
+                kept = [m for m in messages[2:keep_from] if m.get("role") == "system"]
+                messages[2:keep_from] = kept
+                first_tool = next(
+                    i for i in range(2 + len(kept), len(messages)) if messages[i]["role"] == "tool"
+                )
+                block = delimited(
+                    ContextItem(
+                        item_id=ContextItemId(f"{context.run_id}:checkpoint-handoff"),
+                        content="Checkpoint handoff of omitted earlier turns (model inference, "
+                        "not proof or authority; original task, permissions and checks "
+                        "are unchanged):\n" + handoff,
+                        trust=TrustClass.MODEL_INFERENCE,
+                        source=ContextSource(
+                            origin=TrustClass.MODEL_INFERENCE, reference="checkpoint-handoff"
+                        ),
+                        created_at=context.assembled_at,
+                    )
+                )
+                messages[first_tool]["content"] = (
+                    block + "\n" + str(messages[first_tool]["content"])
+                )
+                record["tier"] = 2
+                payload["messages"] = list(messages)
+        # Earlier full failure reports may now be stubs: present the next one in full.
+        self._presented_failure.pop(context.run_id, None)
+        self._history_compactions[context.run_id] = (
+            self._history_compactions.get(context.run_id, 0) + 1
+        )
+        record["tokens_after_estimate"] = self._estimate(payload, context)
+        self.compaction_log.append(record)
+        self.request_tracker.note(f"context_{record['trigger']}_compaction_tier{record['tier']}")
+
     def _compact_history(self, history: list[dict[str, object]], context: ModelContext) -> bool:
         """Drop complete older turns, preserving authority and current blockers.
 
@@ -598,6 +723,8 @@ class OllamaModel:
         self._ratio_bound_violated.discard(run_id)
         self._calibration.pop(run_id, None)
         self._presented_failure.pop(run_id, None)
+        self._checkpoint_due.discard(run_id)
+        self._handoffs.pop(run_id, None)
 
     def _conversation(
         self, context: ModelContext, rendered: RenderedPrompt
@@ -637,6 +764,9 @@ class OllamaModel:
             self._conversations[context.run_id] = history
         else:
             self._append_turn_delta(context, history, new_items)
+            if any(str(item.item_id).endswith(_VERIFICATION_SUFFIXES) for item in new_items):
+                # A verification result arrived: a deterministic checkpoint.
+                self._checkpoint_due.add(context.run_id)
         seen.update((item.item_id, item.content) for item in context.items)
         if self._max_history_chars is not None:
             while len(json.dumps(history, ensure_ascii=False)) > self._max_history_chars:

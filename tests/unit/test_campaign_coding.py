@@ -2055,3 +2055,65 @@ def test_checks_unavailable_still_block_immediately(
     result = runtime.run("Fix addition")
     assert result.status is not RunStatus.SUCCEEDED
     assert any("CODING_AUTOMATIC_CHECK_BLOCKED" in str(e) for e in store.events_for(result.run_id))
+
+
+class _EditExecutor:
+    """Minimal file executor: read_file returns content, edit_file applies one replacement."""
+
+    def __init__(self, root: Path, *, fail_edit: bool = False) -> None:
+        self.root, self.fail_edit = root, fail_edit
+
+    def execute(self, request: ToolExecutionRequest) -> coding.ToolResult:
+        args = request.proposal.arguments
+        path = self.root / args["path"]
+        if request.proposal.tool_name == "read_file":
+            return coding.ToolResult(ok=True, observation=path.read_text())
+        if self.fail_edit:
+            return coding.ToolResult(
+                ok=False,
+                observation="old text not found",
+                failure_class=coding.ToolFailureClass.PERMANENT,
+            )
+        path.write_text(path.read_text().replace(args["old"], args["new"], 1))
+        return coding.ToolResult(ok=True, observation=f"edited {args['path']} (1 replacement)")
+
+
+def _edit(tools: coding.ConfinedCodingTools, old: str, new: str) -> str:
+    request = ToolExecutionRequest(
+        ActionProposal(
+            ActionId("edit"), "edit_file", {"path": "src/add.py", "old": old, "new": new}
+        ),
+        1,
+        5,
+    )
+    return tools.execute(request).observation
+
+
+def test_edit_echo_returns_the_edited_region_and_new_hash(tmp_path: Path) -> None:
+    repo = workspace(tmp_path)
+    (repo.root / "src/add.py").write_text("".join(f"line{i}\n" for i in range(40)))
+    tools = coding.ConfinedCodingTools(
+        cast("coding.CompositeToolExecutor", _EditExecutor(repo.root)), contract(), repo
+    )
+    tools.edit_echo = True
+    observation = _edit(tools, "line20\n", "fixed20\n")
+    content = (repo.root / "src/add.py").read_text()
+    assert hashlib.sha256(content.encode()).hexdigest() in observation
+    assert "Edited region, lines 15-28:" in observation
+    assert "fixed20" in observation
+    assert "line0\n" not in observation
+
+
+def test_edit_echo_is_off_by_default_and_never_hides_a_failed_edit(tmp_path: Path) -> None:
+    repo = workspace(tmp_path)
+    plain = coding.ConfinedCodingTools(
+        cast("coding.CompositeToolExecutor", _EditExecutor(repo.root)), contract(), repo
+    )
+    assert _edit(plain, "return 0", "return a+b") == "edited src/add.py (1 replacement)"
+    failing = coding.ConfinedCodingTools(
+        cast("coding.CompositeToolExecutor", _EditExecutor(repo.root, fail_edit=True)),
+        contract(),
+        repo,
+    )
+    failing.edit_echo = True
+    assert _edit(failing, "missing", "x") == "old text not found"

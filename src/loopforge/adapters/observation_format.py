@@ -77,3 +77,38 @@ def failure_fingerprint(content: str) -> str:
 
 def is_verification_failure(item: ContextItem) -> bool:
     return str(item.item_id).endswith(":verifier-failure")
+
+
+_OMITTED = "[omitted at a context checkpoint: {size} characters; re-run the tool to view]"
+_BLOCK_OPEN = re.compile(r"^- \((\w+)\) <<<(\w+) ([0-9a-f]{12})$")
+
+
+def checkpoint_stub(content: str) -> str:
+    """Restorable stub of a tool result: item labels and first lines stay, bodies go.
+
+    Single-line items are kept (clipped). A delimited block keeps its tags, its first
+    body line (for read_file: the path and sha256, so the source can be re-read) and an
+    omission note, all still enclosed, so no body line ever escapes its block.
+    """
+    if "omitted at a context checkpoint" in content:
+        return content
+    lines = content.split("\n")
+    kept: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        opened = _BLOCK_OPEN.match(line)
+        if opened:
+            close = f"{opened.group(2)} {opened.group(3)}>>>"
+            end = next((j for j in range(index + 1, len(lines)) if lines[j] == close), None)
+            if end is None:
+                break
+            body = lines[index + 1 : end]
+            size = sum(len(b) + 1 for b in body)
+            kept += [line, body[0][:300] if body else "", _OMITTED.format(size=size), close]
+            index = end + 1
+            continue
+        if line.startswith(("- (", "Runtime update:")):
+            kept.append(line[:300])
+        index += 1
+    return "\n".join(kept)

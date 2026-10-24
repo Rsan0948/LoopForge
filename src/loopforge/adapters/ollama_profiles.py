@@ -22,6 +22,8 @@ class OllamaProfile:
     observation_format: Literal["plain", "delimited"] = "plain"
     # Code-owned read_file window in characters; 3000 keeps legacy paging.
     read_page_chars: int = 3000
+    # Prompt-token usage budget kept by checkpoint compaction; None disables it.
+    working_budget_tokens: int | None = None
 
     def options(self) -> dict[str, float | int]:
         return {
@@ -81,6 +83,9 @@ def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inferenc
                 history_replay="exact",
                 observation_format="delimited",
                 read_page_chars=12000,
+                # Usage budget (user target: stay under 32K). Measured decode with an f16
+                # KV cache stays at or above 36 tok/s through 30K on Ollama and about 48 on MLX.
+                working_budget_tokens=32768,
             )
         return OllamaProfile(
             "coding-native-v1",
