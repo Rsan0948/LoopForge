@@ -319,6 +319,8 @@ class ConfinedCodingTools:
         # Code-owned: read_file may take several known paths in one call (one action,
         # a bounded total), instead of a model turn per file.
         self.multi_read = False
+        # Code-owned: a registered check that executed and failed is a measured result.
+        self.measured_checks = False
 
     def metadata_for(self, tool_name: str) -> ToolMetadata:
         if tool_name in {"apply_edits", "format_python_imports"}:
@@ -495,7 +497,27 @@ class ConfinedCodingTools:
                 )
             if request.proposal.tool_name == "edit_file" and self.edit_echo:
                 return self.echo_edit(request, self.tools.execute(request))
-        return self.tools.execute(request)
+        return self.measured(request, self.tools.execute(request))
+
+    def measured(self, request: ToolExecutionRequest, result: ToolResult) -> ToolResult:
+        """A registered check that ran and failed is a measured result, not a broken tool.
+
+        It must not count toward the tool circuit, which ended three live snake attempts
+        while the worker was fixing its failing checks. Sandbox errors, timeouts and policy
+        denials stay tool failures. The verifier still records the authoritative verdict.
+        """
+        if (
+            not self.measured_checks
+            or result.ok
+            or not (result.error_code or "").startswith("SANDBOX_EXIT_")
+            or request.proposal.tool_name not in {c.name for c in self.task.execution_checks}
+        ):
+            return result
+        return ToolResult(
+            ok=True,
+            observation=f"{request.proposal.tool_name} ran and FAILED ({result.error_code}); "
+            "the verifier records this verdict.\n" + result.observation,
+        )
 
     def echo_edit(self, request: ToolExecutionRequest, result: ToolResult) -> ToolResult:
         """Return the edited region and new hash, so checking an edit needs no reread."""
@@ -1543,6 +1565,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
     tools.read_page_chars = profile.read_page_chars
     tools.edit_echo = profile.observation_format == "delimited"
     tools.multi_read = profile.read_page_chars > _SINGLE_PAGE_CHARS
+    tools.measured_checks = native
     if profile.conversation_mode == "state" or native:
         tools.import_formatter = PinnedImportFormatter(workspace.root, task.image).format_file
     if profile.conversation_mode == "state":

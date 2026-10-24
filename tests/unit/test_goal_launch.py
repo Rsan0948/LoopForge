@@ -82,3 +82,39 @@ def test_launch_reports_a_runner_failure_instead_of_waiting_forever(
     _runner_without_dependencies(monkeypatch, drive)
     result = goal_launch.launch(tmp_path / "goals/mine", _config(tmp_path), poll_seconds=0.05)
     assert result == {"stopped": "offline", "error": "Runner failed: AssertionError"}
+
+
+def test_the_recorded_drive_gives_gemini_the_evidence_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from loopforge.adapters.research_store import ResearchStore  # noqa: PLC0415
+
+    directory = tmp_path / "goals/mine"
+    service = RepositoryGoalService(directory)
+    service.create(RepositoryGoalConfig.model_validate_json(_config(tmp_path).read_text()))
+    service.close()
+    providers: list[object] = []
+
+    class Provider:
+        evidence_store: object = None
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            providers.append(self)
+
+        def close(self) -> None:
+            return None
+
+    def stop_before_any_decision(self: RepositoryGoalService, supervisor: object) -> object:
+        del self, supervisor
+        msg = "stop"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(goal_launch, "GeminiSupervisor", Provider)
+    def key(_path: Path) -> str:
+        return "k"
+
+    monkeypatch.setattr(goal_launch, "load_gemini_key", key)
+    monkeypatch.setattr(RepositoryGoalService, "coordinator", stop_before_any_decision)
+    with pytest.raises(RuntimeError, match="stop"):
+        goal_launch.recorded_drive(directory.resolve(), threading.Event())
+    assert isinstance(cast("Provider", providers[0]).evidence_store, ResearchStore)

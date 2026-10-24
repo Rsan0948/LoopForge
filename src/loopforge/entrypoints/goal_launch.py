@@ -17,6 +17,7 @@ from types import FrameType
 
 from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
+from loopforge.adapters.research_store import ResearchStore
 from loopforge.domain.goals import GoalState
 from loopforge.entrypoints.autonomy_qualification import RecordedSupervisor
 from loopforge.entrypoints.goal_review import morning_report
@@ -47,6 +48,9 @@ def recorded_drive(directory: Path, stop: threading.Event) -> str | None:
             count_tokens=True,
             diagnostics=directory / "supervisor-diagnostics",
         )
+        # The coordinator attaches the store only to a bare GeminiSupervisor, not to the
+        # recording wrapper; without it Gemini saw 2,000-byte excerpts and paged source.
+        provider.evidence_store = ResearchStore(service.journal)
         coordinator = service.coordinator(
             RecordedSupervisor(provider, directory / "supervisor-prompts")
         )

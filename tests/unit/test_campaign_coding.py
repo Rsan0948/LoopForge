@@ -2284,3 +2284,82 @@ def test_checking_an_unchanged_candidate_is_reported_as_a_repeat(tmp_path: Path)
     assert again.score == first.score
     (ws.root / "src/add.py").write_text("def add(a,b): return b+a\n")
     assert not verifier.verify(state).repeat  # A changed candidate is a new attempt.
+
+
+class _CheckExecutor:
+    def __init__(self, result: coding.ToolResult) -> None:
+        self.result = result
+
+    def execute(self, request: ToolExecutionRequest) -> coding.ToolResult:
+        del request
+        return self.result
+
+
+def _check(tools: coding.ConfinedCodingTools, name: str) -> coding.ToolResult:
+    return tools.execute(ToolExecutionRequest(ActionProposal(ActionId("c"), name, {}), 1, 5))
+
+
+def _checker(tmp_path: Path, result: coding.ToolResult, *, measured: bool = True) -> object:
+    tools = coding.ConfinedCodingTools(
+        cast("coding.CompositeToolExecutor", _CheckExecutor(result)),
+        contract(),
+        workspace(tmp_path),
+    )
+    tools.measured_checks = measured
+    return tools
+
+
+FAILED_RUN = coding.ToolResult(
+    ok=False,
+    observation="exit_code=1\nstdout:\nE  assert 0 == 1",
+    error_code="SANDBOX_EXIT_1",
+    failure_class=coding.ToolFailureClass.PERMANENT,
+)
+
+
+def test_a_check_that_ran_and_failed_is_a_measured_result(tmp_path: Path) -> None:
+    tools = cast("coding.ConfinedCodingTools", _checker(tmp_path, FAILED_RUN))
+    result = _check(tools, "check_regression")
+    assert result.ok
+    assert result.observation.startswith("check_regression ran and FAILED (SANDBOX_EXIT_1)")
+    assert "assert 0 == 1" in result.observation
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        coding.ToolResult(
+            ok=False,
+            observation="t",
+            error_code="SANDBOX_TIMEOUT",
+            failure_class=coding.ToolFailureClass.TRANSIENT,
+        ),
+        coding.ToolResult(
+            ok=False,
+            observation="e",
+            error_code="SANDBOX_EXECUTION",
+            failure_class=coding.ToolFailureClass.PERMANENT,
+        ),
+        coding.ToolResult(
+            ok=False,
+            observation="p",
+            error_code="SANDBOX_POLICY",
+            failure_class=coding.ToolFailureClass.PERMANENT,
+        ),
+    ],
+    ids=["timeout", "sandbox-error", "policy"],
+)
+def test_broken_checks_still_count_as_tool_failures(
+    tmp_path: Path, result: coding.ToolResult
+) -> None:
+    tools = cast("coding.ConfinedCodingTools", _checker(tmp_path, result))
+    assert _check(tools, "check_regression") == result
+
+
+def test_only_registered_checks_and_the_native_profile_are_affected(tmp_path: Path) -> None:
+    tools = cast("coding.ConfinedCodingTools", _checker(tmp_path / "a", FAILED_RUN))
+    assert _check(tools, "unregistered_command") == FAILED_RUN
+    legacy = cast(
+        "coding.ConfinedCodingTools", _checker(tmp_path / "b", FAILED_RUN, measured=False)
+    )
+    assert _check(legacy, "check_regression") == FAILED_RUN
