@@ -81,8 +81,14 @@ class GoalExecutionService:
         *,
         check: Callable[[Path], None] = dependencies,
         drive: Callable[[Path, threading.Event], str | None] | None = None,
+        only: Path | None = None,
     ) -> None:
         self.root, self.check, self.drive = root.resolve(), check, drive or self._drive
+        # A dedicated runner drives one goal; other armed goals under the root are not its work.
+        self.only = only.resolve() if only is not None else None
+        if self.only is not None and self.only.parent != self.root:
+            msg = "A dedicated runner's goal must be under its root"
+            raise ValueError(msg)
         self.stop = threading.Event()
         self.thread: threading.Thread | None = None
 
@@ -100,6 +106,9 @@ class GoalExecutionService:
         if directory.parent != self.root or not (directory / "goals.sqlite").is_file():
             msg = "Runner requires an existing server-owned goal"
             raise ValueError(msg)
+        if self.only is not None and directory != self.only:
+            msg = "A dedicated runner arms only its own goal"
+            raise ValueError(msg)
         if SQLiteGoalJournal(directory / "goals.sqlite").load(GOAL).terminal:
             msg = "Terminal goals cannot start a runner"
             raise ValueError(msg)
@@ -112,7 +121,7 @@ class GoalExecutionService:
         if self.thread:
             self.thread.join(timeout=2)
 
-    def _loop(self) -> None:
+    def _loop(self) -> None:  # noqa: PLR0912 - one durable queue pass with explicit outcomes
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / ".execution-service.lock").open("a+b") as lease:
             while not self.stop.is_set():
@@ -126,6 +135,8 @@ class GoalExecutionService:
             while not self.stop.is_set():
                 for directory in sorted(self.root.iterdir()):
                     if directory.is_symlink() or not directory.is_dir():
+                        continue
+                    if self.only is not None and directory != self.only:
                         continue
                     record = runner_record(directory)
                     if not record["armed"] or record["status"] == "stopped":
@@ -164,6 +175,8 @@ class GoalExecutionService:
                             "Runner unavailable; inspect dependencies "
                             "or competing service ownership"
                         )
+                    except Exception as exc:  # A defect must surface, not hang the runner.
+                        error = f"Runner failed: {type(exc).__name__}"
                     finally:
                         heartbeat_stop.set()
                         if pulse.is_alive():

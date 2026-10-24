@@ -50,6 +50,7 @@ from loopforge.entrypoints.campaign_models import CodingTaskConfig
 from loopforge.entrypoints.goal_checkpoint import snapshot_checkpoint
 from loopforge.entrypoints.goal_investigation import RepositoryInvestigation
 from loopforge.entrypoints.goal_review import morning_report
+from loopforge.entrypoints.goal_runner import record_runner, runner_record
 from loopforge.entrypoints.goal_successor import prepare_successor
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
 from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
@@ -367,8 +368,10 @@ def test_conflicting_answer_successor_preserves_candidate_answers_and_repeat_ide
     child = None
     try:
         state = parent.create(config)
+        record_runner(parent.directory, armed=True, status="waiting")
         with pytest.raises(ValueError, match="conflicting answer"):
             prepare_successor(parent.directory)
+        assert runner_record(parent.directory)["armed"]  # A refused handoff keeps the runner.
         with parent.harness.store.connect() as db:
             campaign = db.execute("SELECT id FROM campaigns").fetchone()["id"]
         source = (
@@ -405,6 +408,13 @@ def test_conflicting_answer_successor_preserves_candidate_answers_and_repeat_ide
         second = prepare_successor(parent.directory)
         assert first == second
         assert first["started"] is False
+        # The successor carries the work; the predecessor is no longer driven.
+        assert runner_record(parent.directory) | {"heartbeat_epoch": 0} == {
+            "armed": False,
+            "status": "stopped",
+            "heartbeat_epoch": 0,
+            "error": "",
+        }
         assert first["parent_candidate_sha256"] == candidate
         child = RepositoryGoalService(Path(str(first["directory"])))
         child_state = child.journal.load(GOAL)

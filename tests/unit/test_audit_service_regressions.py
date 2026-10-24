@@ -522,3 +522,66 @@ def test_inflight_heartbeat_cannot_overwrite_final_waiting_status(
         assert goal_runner.runner_record(directory)["status"] == "waiting"
     finally:
         service.close()
+
+
+def test_unexpected_drive_defect_is_recorded_and_the_queue_continues(tmp_path: Path) -> None:
+    broken, ready = tmp_path / "a-broken", tmp_path / "b-ready"
+    for directory in (broken, ready):
+        directory.mkdir()
+        goal_runner.record_runner(directory, armed=True, status="queued")
+    executed = threading.Event()
+
+    def drive(directory: Path, _stop: threading.Event) -> None:
+        if directory == broken:
+            msg = "defect"
+            raise AssertionError(msg)
+        executed.set()
+
+    service = goal_runner.GoalExecutionService(tmp_path, check=lambda _: None, drive=drive)
+    try:
+        service.start()
+        assert executed.wait(1)
+        assert service.thread is not None
+        assert service.thread.is_alive()
+    finally:
+        service.close()
+    record = goal_runner.runner_record(broken)
+    assert record["status"] == "offline"
+    assert record["error"] == "Runner failed: AssertionError"
+    assert goal_runner.runner_record(ready)["status"] == "stopped"
+
+
+def test_dedicated_runner_drives_only_its_own_goal(tmp_path: Path) -> None:
+    other, mine = tmp_path / "a-other", tmp_path / "b-mine"
+    for directory in (other, mine):
+        directory.mkdir()
+        goal_runner.record_runner(directory, armed=True, status="queued")
+    calls: list[Path] = []
+    done = threading.Event()
+
+    def drive(directory: Path, _stop: threading.Event) -> None:
+        calls.append(directory)
+        done.set()
+
+    service = goal_runner.GoalExecutionService(
+        tmp_path, check=lambda _: None, drive=drive, only=mine
+    )
+    try:
+        service.start()
+        assert done.wait(1)
+    finally:
+        service.close()
+    assert calls == [mine.resolve()]
+    assert goal_runner.runner_record(other)["status"] == "queued"
+
+
+def test_dedicated_runner_refuses_other_goals(tmp_path: Path) -> None:
+    mine, other = tmp_path / "mine", tmp_path / "other"
+    other.mkdir()
+    (other / "goals.sqlite").touch()
+    service = goal_runner.GoalExecutionService(tmp_path, check=lambda _: None, only=mine)
+    with pytest.raises(ValueError, match="only its own goal"):
+        service.arm(other)
+    assert goal_runner.runner_record(other) == {"status": "offline", "armed": False}
+    with pytest.raises(ValueError, match="under its root"):
+        goal_runner.GoalExecutionService(tmp_path / "x", check=lambda _: None, only=mine)

@@ -13,6 +13,7 @@ from loopforge.domain.goal_review import QuestionAnswered, QuestionOpened
 from loopforge.entrypoints.campaign_coding import CodingWorkspace, patch_identity, prepare_checkout
 from loopforge.entrypoints.goal_budget import paid_root
 from loopforge.entrypoints.goal_checkpoint import capture, snapshot_checkpoint
+from loopforge.entrypoints.goal_runner import record_runner, runner_record
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
 from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
 from loopforge.entrypoints.supervisor import GOAL, PreparedGoalService
@@ -115,6 +116,9 @@ def prepare_successor(directory: Path) -> dict[str, object]:  # noqa: PLR0912, P
             result = service.journal.append(
                 GOAL, result.sequence, QuestionAnswered(q.topic, q.answer, q.answered_epoch)
             )
+        # The successor carries the work; a still-armed predecessor would be driven again.
+        if runner_record(directory)["armed"]:
+            record_runner(directory, armed=False, status="stopped")
         return {
             "id": child.name,
             "directory": str(child),
