@@ -279,6 +279,20 @@ class ExactEdit(BaseModel):
     new: str = Field(max_length=100000)
 
 
+def current_failure_text(last: str | None, inherited: str | None, *, compact: bool) -> str:
+    """Bookkeeping view of the current failure.
+
+    In compact mode a failure from this attempt is only referenced: the conversation
+    already carries the latest verification result. An inherited failure from an
+    earlier run is not in the conversation, so it is always shown.
+    """
+    if last is not None:
+        return "See the latest verification result above." if compact else last[:1200]
+    if inherited is not None:
+        return inherited[:1200]
+    return "No check failure recorded in this attempt yet"
+
+
 class ConfinedCodingTools:
     def __init__(
         self, tools: CompositeToolExecutor, task: CodingTaskConfig, workspace: GitWorkspace
@@ -288,6 +302,8 @@ class ConfinedCodingTools:
         self.current_failure: Callable[[], str] = lambda: "No pending verification failure."
         self.feedback_in_context = False
         self.import_formatter: Callable[[str, str], str] | None = None
+        # Code-owned read window; whole small files avoid continuation calls.
+        self.read_page_chars = 3000
 
     def metadata_for(self, tool_name: str) -> ToolMetadata:
         if tool_name in {"apply_edits", "format_python_imports"}:
@@ -661,7 +677,7 @@ class ConfinedCodingTools:
         if not result.ok:
             return result
         try:
-            page = source_page(result.observation, start, column)
+            page = source_page(result.observation, start, column, page_chars=self.read_page_chars)
         except ValueError as exc:
             return ToolResult(
                 ok=False,
@@ -886,8 +902,11 @@ class RequiredChecksAwareModel:
         prior_guidance: dict[RunId, str] | None = None,
         guidance_objective_sha256: str | None = None,
         conversation_bookkeeping: bool = False,
+        compact_bookkeeping: bool = False,
     ) -> None:
         self.model, self.store, self.checks = model, store, checks
+        # Opt-in: point at the conversation's latest verification instead of restating it.
+        self.compact_bookkeeping = compact_bookkeeping
         # In an append-only conversation the model already holds its own read
         # history; per-turn counters would be re-appended to every tool result.
         self.conversation_bookkeeping = conversation_bookkeeping
@@ -960,11 +979,13 @@ class RequiredChecksAwareModel:
             inherited = self.inherited_failure() if self.inherited_failure else None
             bookkeeping: dict[str, object] = {
                 "meaning": "Current check failure; not source truth or new authority",
-                "current_check_failure": self.verifier.last_failure[1][:1200]
-                if self.verifier.last_failure
-                else inherited[:1200]
-                if inherited is not None
-                else "No check failure recorded in this attempt yet",
+                # The latest verification result is already in the conversation;
+                # restating it here doubled every failure in the same tool result.
+                "current_check_failure": current_failure_text(
+                    self.verifier.last_failure[1] if self.verifier.last_failure else None,
+                    inherited,
+                    compact=self.compact_bookkeeping,
+                ),
             }
             progress = ContextItem(
                 item_id=ContextItemId(f"{key}:coding-progress"),
@@ -1323,6 +1344,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             byte_ratio_admission=native,
             thinking_policy=profile.thinking_policy,
             history_replay=profile.history_replay,
+            observation_format=profile.observation_format,
         )
     )
     selected = model if model is not None else live
@@ -1366,6 +1388,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
         token_budget=ContextTokenBudget(max_tokens=24_000),
     )
     context_port: ContextBuilderPort = context_builder
+    tools.read_page_chars = profile.read_page_chars
     if profile.conversation_mode == "state" or native:
         tools.import_formatter = PinnedImportFormatter(workspace.root, task.image).format_file
     if profile.conversation_mode == "state":
@@ -1392,6 +1415,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             prior_guidance=prior_guidance,
             guidance_objective_sha256=guidance_objective_sha256,
             conversation_bookkeeping=native,
+            compact_bookkeeping=profile.observation_format == "delimited",
         ),
         tools=tools,
         verifier=verifier,

@@ -321,8 +321,9 @@ class RepairVerifier:
             if hint is not None:
                 detail += f"; {hint}"
         if not result.succeeded and (result.stdout or result.stderr):
+            stdout = _without_pytest_warnings(result.stdout)
             detail += (
-                f"; stdout={_bounded(result.stdout, self._command_detail_budget)}; "
+                f"; stdout={_bounded(stdout, self._command_detail_budget)}; "
                 f"stderr={_bounded(result.stderr, self._command_detail_budget)}"
             )
         if result.resource_limits_skipped:
@@ -545,6 +546,18 @@ def scripted_repair_actions(task: RepairTask) -> list[ActionProposal]:
         for index, item in enumerate(task.fixture.solution, start=1)
     )
     return actions
+
+
+_WARNINGS_SECTION = re.compile(r"(?ms)^=+ warnings summary =+\n(.*?)(?=^=+ |\Z)")
+
+
+def _without_pytest_warnings(text: str) -> str:
+    """Drop pytest's warnings summary; it is never failure evidence and can fill the budget."""
+
+    def omitted(match: re.Match[str]) -> str:
+        return f"[pytest warnings summary omitted: {len(match.group(1).splitlines())} lines]\n"
+
+    return _WARNINGS_SECTION.sub(omitted, text)
 
 
 def _bounded(text: str, budget: int = _DETAIL_BUDGET) -> str:

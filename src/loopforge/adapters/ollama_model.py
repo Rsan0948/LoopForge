@@ -32,6 +32,11 @@ from typing import Final, Literal, cast
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
+from loopforge.adapters.observation_format import (
+    delimited,
+    failure_fingerprint,
+    is_verification_failure,
+)
 from loopforge.adapters.ollama_usage import ProviderRequestTracker, known_usage
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.admission import ContextAdmission, InputMeasurementBasis
@@ -132,6 +137,7 @@ class OllamaModel:
         thinking_policy: Literal["always", "on_evidence"] = "always",
         history_replay: Literal["bounded", "exact"] = "bounded",
         conversation_mode: Literal["history", "state"] = "history",
+        observation_format: Literal["plain", "delimited"] = "plain",
         tool_filter: Callable[[ModelContext], frozenset[str]] | None = None,
         tool_spec_filter: Callable[[ModelContext, ModelToolSpec], ModelToolSpec] | None = None,
     ) -> None:
@@ -244,6 +250,12 @@ class OllamaModel:
             msg = "exact history replay requires an append-only conversation preserving thinking"
             raise ValueError(msg)
         self._history_replay = history_replay
+        if observation_format not in {"plain", "delimited"}:
+            msg = "observation_format must be plain or delimited"
+            raise ValueError(msg)
+        self._observation_format = observation_format
+        # Per run: fingerprint of the last verification failure presented in full.
+        self._presented_failure: dict[RunId, str] = {}
         self._ratio_bound_violated: set[RunId] = set()
         # Per run: (serialized bytes, provider-reported prompt tokens) of the last request.
         self._calibration: dict[RunId, tuple[int, int]] = {}
@@ -585,6 +597,7 @@ class OllamaModel:
         self._history_compactions.pop(run_id, None)
         self._ratio_bound_violated.discard(run_id)
         self._calibration.pop(run_id, None)
+        self._presented_failure.pop(run_id, None)
 
     def _conversation(
         self, context: ModelContext, rendered: RenderedPrompt
@@ -663,7 +676,7 @@ class OllamaModel:
             # distinguish runtime-owned observations from untrusted repository
             # output at the exact point tool results re-enter the conversation.
             result = (
-                "\n".join(f"- ({item.trust.value}) {item.content}" for item in observations)
+                "\n".join(self._present(context.run_id, item) for item in observations)
                 if observations
                 else "No new observation was recorded for the proposed action."
             )
@@ -673,13 +686,27 @@ class OllamaModel:
                 # and re-render every earlier assistant turn; keep runtime updates
                 # inside the tool response, with their trust labels.
                 result += "\nRuntime update:\n" + "\n".join(
-                    f"- ({item.trust.value}) {item.content}" for item in new_items
+                    self._present(context.run_id, item) for item in new_items
                 )
                 new_items = []
             history.append({"role": "tool", "tool_name": pending, "content": result})
         if new_items:
-            lines = "\n".join(f"- ({item.trust.value}) {item.content}" for item in new_items)
+            lines = "\n".join(self._present(context.run_id, item) for item in new_items)
             history.append({"role": "user", "content": f"Runtime update:\n{lines}"})
+
+    def _present(self, run_id: RunId, item: ContextItem) -> str:
+        """Code-owned item presentation inside the conversation (see observation_format)."""
+        if self._observation_format == "plain":
+            return f"- ({item.trust.value}) {item.content}"
+        if is_verification_failure(item):
+            fingerprint = failure_fingerprint(item.content)
+            if fingerprint and self._presented_failure.get(run_id) == fingerprint:
+                return (
+                    f"- ({item.trust.value}) verification failed again with the same checks, "
+                    f"failing tests and assertions as the last full report above: {fingerprint}"
+                )
+            self._presented_failure[run_id] = fingerprint
+        return delimited(item)
 
     def _correction_role(self) -> str:
         """Runtime-owned corrections; in exact replay a mid-conversation system message.

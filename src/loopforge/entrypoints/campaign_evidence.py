@@ -215,8 +215,16 @@ class SourcePage:
     empty: bool = False
 
 
-def source_page(content: str, start: int = 1, column: int = 0) -> SourcePage:
-    """Exact bounded source; a column cursor makes every long-line character reachable."""
+def source_page(
+    content: str, start: int = 1, column: int = 0, *, page_chars: int = 3000
+) -> SourcePage:
+    """Exact bounded source; a column cursor makes every long-line character reachable.
+
+    ``page_chars`` is code-owned: review read accounting relies on the 3,000 default.
+    """
+    if not 3000 <= page_chars <= 16000:
+        msg = "page_chars must be between 3000 and 16000"
+        raise ValueError(msg)
     lines = content.splitlines()
     if not lines and start == 1 and column == 0:
         return SourcePage("", 1, 0, 0, None, 0, True)
@@ -224,8 +232,8 @@ def source_page(content: str, start: int = 1, column: int = 0) -> SourcePage:
         msg = "Source selector outside file; use returned line/column continuation"
         raise ValueError(msg)
     line = lines[start - 1]
-    if column or len(line) > 3000:
-        stop = min(len(line), column + 3000)
+    if column or len(line) > page_chars:
+        stop = min(len(line), column + page_chars)
         more = stop < len(line)
         return SourcePage(
             line[column:stop],
@@ -237,9 +245,9 @@ def source_page(content: str, start: int = 1, column: int = 0) -> SourcePage:
         )
     selected: list[str] = []
     size = 0
-    for line in lines[start - 1 : start + 199]:
+    for line in lines[start - 1 : start + page_chars // 15 - 1]:
         added = len(line) + bool(selected)
-        if size + added > 3000:
+        if size + added > page_chars:
             break
         selected.append(line)
         size += added

@@ -143,7 +143,8 @@ def test_a3b_model_gets_vendor_sampling_and_room_for_long_reasoning() -> None:
 
     a3b = profile_for("coding", native=True, model="qwen3.6:35b-a3b")
     assert (a3b.temperature, a3b.top_p, a3b.presence_penalty) == (1.0, 0.95, 1.5)
-    assert a3b.output_tokens == 32768
+    assert a3b.output_tokens == 16384
+    assert (a3b.observation_format, a3b.read_page_chars) == ("delimited", 12000)
     assert a3b.context_tokens == 131072
     assert a3b.options()["presence_penalty"] == 1.5
     # Constant think flag and exact replay keep the hybrid model's prefix cache valid.
@@ -152,6 +153,7 @@ def test_a3b_model_gets_vendor_sampling_and_room_for_long_reasoning() -> None:
     assert a3b.history_replay == "exact"
     dense = profile_for("coding", native=True, model="qwen3.8:27b-q4_K_M")
     assert (dense.temperature, dense.presence_penalty, dense.output_tokens) == (0.6, 0.0, 8192)
+    assert (dense.observation_format, dense.read_page_chars) == ("plain", 3000)
     # The model never changes non-native profiles.
     assert profile_for("coding", session=True, model="qwen3.6:35b-a3b") == profile_for(
         "coding", session=True
@@ -175,9 +177,10 @@ def test_a3b_settings_reach_the_provider_request(
     )
     coding.build_coding(config, contract(), repo, store=InMemoryEventStore())
     assert captured["temperature"] == 1.0
-    assert captured["max_output_tokens"] == 32768
+    assert captured["max_output_tokens"] == 16384
+    assert captured["observation_format"] == "delimited"
     assert captured["context_window_tokens"] == 131072
     sampling = captured["sampling_options"]
     assert isinstance(sampling, dict)
     assert sampling["presence_penalty"] == 1.5
-    assert "32768-token" in str(captured["template"])
+    assert "16384-token" in str(captured["template"])

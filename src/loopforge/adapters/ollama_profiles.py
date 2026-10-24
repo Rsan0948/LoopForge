@@ -18,6 +18,10 @@ class OllamaProfile:
     conversation_mode: Literal["history", "state"] = "history"
     thinking_policy: Literal["always", "on_evidence"] = "always"
     history_replay: Literal["bounded", "exact"] = "bounded"
+    # Delimited multi-line observations and repeated-failure fingerprints (observation_format).
+    observation_format: Literal["plain", "delimited"] = "plain"
+    # Code-owned read_file window in characters; 3000 keeps legacy paging.
+    read_page_chars: int = 3000
 
     def options(self) -> dict[str, float | int]:
         return {
@@ -57,19 +61,26 @@ def profile_for(  # noqa: PLR0911, PLR0913 - explicit legacy and opt-in inferenc
             # recurrent cache. Ollama's qwen3.5 renderer renders every earlier
             # assistant turn by the current request's think flag, so the flag stays
             # constant, and thinking/content replay exactly as generated.
+            # v3 (2026-10-23 roadmap): delimited observations with repeated-failure
+            # fingerprints, whole-file reads up to 12K characters, and a 16K output cap
+            # (the largest single output across 328 lab calls was 15.5K tokens; p99 9.3K).
+            # The 131K allocation is kept: measured decode cost is identical at 32K and
+            # 131K allocation for the same depth, and Qwen advises >=128K for thinking.
             return OllamaProfile(
-                "coding-native-a3b-v2",
+                "coding-native-a3b-v3",
                 1.0,
                 0.95,
                 1.5,
                 True,
-                32768,
+                16384,
                 preserve_thinking=True,
                 context_tokens=131072,
                 keep_alive="30m",
                 conversation_mode="history",
                 thinking_policy="always",
                 history_replay="exact",
+                observation_format="delimited",
+                read_page_chars=12000,
             )
         return OllamaProfile(
             "coding-native-v1",
