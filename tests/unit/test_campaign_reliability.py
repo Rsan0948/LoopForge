@@ -15,25 +15,20 @@ from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.scripted import FixedClock, ScriptedModel
 from loopforge.domain.actions import ActionProposal
-from loopforge.domain.campaign import CampaignEvent
 from loopforge.domain.coding import CodingEvent, CodingState, reduce_coding
 from loopforge.domain.context import ContextItem, ContextSource, ModelContext, ModelRole
 from loopforge.domain.events import BudgetDebited
-from loopforge.domain.issues import IssueEvent, IssueState, reduce_issue
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import RunState
 from loopforge.domain.types import ActionId, ContextItemId, RunId, RunStatus, UsageDelta
 from loopforge.domain.verification import CheckOutcome
-from loopforge.entrypoints import campaign as campaign_module
 from loopforge.entrypoints import campaign_review as review_module
-from loopforge.entrypoints.campaign import CampaignHarness
 from loopforge.entrypoints.campaign_evidence import (
     candidate_snapshot,
     missing_coverage,
     required_reads,
 )
 from loopforge.entrypoints.campaign_execution import PatchReviewVerifier
-from loopforge.entrypoints.campaign_issues import IssueCommand, IssueConfig, Obligation
 from loopforge.entrypoints.campaign_models import CampaignConfig, ReviewReport
 from loopforge.entrypoints.campaign_review import (
     REVIEW_TEMPLATE,
@@ -42,9 +37,8 @@ from loopforge.entrypoints.campaign_review import (
     build_review,
     tool_specs,
 )
-from loopforge.ports.model import ModelFailureClass, ModelPort, ModelTurn, ModelTurnError
+from loopforge.ports.model import ModelFailureClass, ModelTurn, ModelTurnError
 from loopforge.ports.reporting import ReportTurn
-from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.tools import ToolExecutionRequest, ToolResult
 from loopforge.ports.verifier import VerificationResult
 
@@ -260,141 +254,9 @@ def test_inconclusive_or_unexecuted_checks_cannot_pass() -> None:
         CheckOutcome(name="fixture", passed=True, detail="never ran", executed=False)
 
 
-def test_issue_terminal_and_attempt_limits() -> None:
-    def apply(state: IssueState, event: IssueEvent) -> IssueState:
-        return reduce_issue(state, event, max_attempts=1, max_tokens=100)
-
-    state = apply(IssueState(), IssueEvent("start"))
-    state = apply(state, IssueEvent("failed", tokens=20))
-    with pytest.raises(ValueError, match="exhausted"):
-        apply(state, IssueEvent("retry"))
-    state = apply(state, IssueEvent("reject"))
-    with pytest.raises(ValueError, match="terminal"):
-        apply(state, IssueEvent("start"))
-
-
-@pytest.mark.parametrize(
-    "event", [IssueEvent("failed", tokens=100), IssueEvent("failed", seconds=30)]
-)
-def test_issue_aggregate_consumption_denies_retry(event: IssueEvent) -> None:
-    state = reduce_issue(
-        IssueState(), IssueEvent("start"), max_attempts=5, max_tokens=100, max_seconds=30
-    )
-    state = reduce_issue(state, event, max_attempts=5, max_tokens=100, max_seconds=30)
-    with pytest.raises(ValueError, match="exhausted"):
-        reduce_issue(state, IssueEvent("retry"), max_attempts=5, max_tokens=100, max_seconds=30)
-
-
 def test_required_read_plan_rejects_unreadable_line_and_counts_pages() -> None:
     assert required_reads({"a": "x\n" * 401}, {"a": [(1, 401)]}) == 3
     assert required_reads({"a": "x" * 3001}, {"a": [(1, 1)]}) == 2
-
-
-@pytest.mark.parametrize("reject", [False, True])
-@pytest.mark.parametrize("at_checkpoint", [False, True])
-def test_issue_dispatch_preserves_cursor_and_durable_results(  # noqa: PLR0915 - full durable lifecycle
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, reject: bool, at_checkpoint: bool
-) -> None:
-
-    cfg = CampaignConfig(repository="/fixture", project="brook", revision="a" * 40, scope=["."])
-
-    def pinned_fixture(_cfg: CampaignConfig) -> dict[str, str]:
-        return {"a.py": "observed()"}
-
-    monkeypatch.setattr(campaign_module, "pinned_files", pinned_fixture)
-    original_build = build_review
-
-    def fixture_build(  # noqa: PLR0913 - mirrors the composition seam
-        cfg: CampaignConfig,
-        *,
-        files: dict[str, str],
-        previous: str,
-        store: StateStorePort,
-        model: ModelPort | None = None,
-        patch_review: bool = False,
-        max_source_reads: int = 10,
-    ):
-        del model, patch_review
-        actions = [
-            ActionProposal(ActionId("read"), "read_file", {"path": "a.py"}),
-            ActionProposal(ActionId("report"), "submit_report", {"report": report()}),
-        ]
-        return original_build(
-            cfg,
-            files=files,
-            previous=previous,
-            store=store,
-            model=ScriptedModel(actions),
-            max_source_reads=max_source_reads,
-        )
-
-    monkeypatch.setattr(campaign_module, "build_review", fixture_build)
-    harness = CampaignHarness(tmp_path)
-    harness.acquire_service()
-    try:
-        campaign = harness.create(cfg)
-        cursor = cfg.rounds * len(cfg.scope) * 7 if at_checkpoint else 0
-        if at_checkpoint:
-            with harness.store.connect() as db:
-                for index in range(cursor):
-                    task = f"{campaign}:s1:{index}"
-                    harness.store.append(db, campaign, CampaignEvent("claimed", task), "{}")
-                    harness.store.append(db, campaign, CampaignEvent("finished", task), "{}")
-            assert not harness.snapshot(campaign)["runnable"]
-            assert not harness.tick(campaign)["accepted"]
-        issue = harness.enqueue_issue(
-            campaign,
-            IssueConfig(
-                objective="Verify a narrow implementation claim",
-                evidence="fixture evidence basis",
-                obligations=[Obligation(path="a.py", start_line=1, end_line=1)],
-            ),
-        )
-        assert harness.snapshot(campaign)["runnable"]
-        assert harness.tick(campaign)["accepted"]
-        assert harness.worker is not None
-        harness.worker.join(timeout=5)
-        assert not harness.worker.is_alive()
-        snapshot = harness.snapshot(campaign)
-        with harness.store.connect() as db:
-            state = harness.issues.state(db, issue)
-            assert state.status == "investigated"
-            assert harness.store.state(db, campaign).cursor == cursor
-        assert not snapshot["runnable"]
-        assert harness.tick(campaign).get("reason") == "issue_checkpoint"
-        assert snapshot["slot"] is None
-        restored = CampaignHarness(tmp_path)
-        with restored.store.connect() as db:
-            assert restored.issues.state(db, issue) == state
-        harness.issue_command(
-            campaign,
-            issue,
-            IssueCommand(
-                command="reject" if reject else "close",
-                evidence="operator examined fixture evidence",
-            ),
-        )
-        assert harness.snapshot(campaign)["runnable"] == (not at_checkpoint)
-        if at_checkpoint:
-            assert not harness.tick(campaign)["accepted"]
-            with harness.store.connect() as db:
-                assert harness.store.state(db, campaign).cursor == cursor
-                assert harness.store.state(db, campaign).status == "checkpoint"
-        else:
-            assert harness.tick(campaign)["accepted"]
-            assert harness.worker is not None
-            harness.worker.join(timeout=5)
-            assert not harness.worker.is_alive()
-            with harness.store.connect() as db:
-                assert harness.store.state(db, campaign).cursor == 1
-        with pytest.raises(ValueError, match="terminal"):
-            harness.issue_command(
-                campaign,
-                issue,
-                IssueCommand(command="retry", evidence="cannot resurrect this closed issue"),
-            )
-    finally:
-        harness.close()
 
 
 @pytest.mark.parametrize(

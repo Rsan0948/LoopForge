@@ -1,3 +1,5 @@
+> **Retired 2026-10-24** ([ADR-0021](../decisions/ADR-0021-core-and-agent-product-split.md)). The review-campaign product described here (lanes, issues, HTTP API, `loopforge-campaign`, n8n workflows) was removed. Only the serial coding dispatch used by prepared goals remains, in `entrypoints/campaign.py`, until it moves to WorkBuddy. Kept for history.
+
 # Sequential repository campaign harness
 
 LoopForge owns run state, tool authority, immutable budgets, evidence validation

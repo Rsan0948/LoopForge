@@ -211,10 +211,9 @@ and deliver an independently verified local candidate for console review. See th
 scope and remaining rollout gates.
 
 
-For sustained local repository reviews, see the experimental
-[sequential campaign harness](docs/architecture/campaign-harness.md): nested n8n
-loops, pinned source, one repository/agent at a time, and durable stage checkpoints.
-Read-only investigations and scoped coding/check/review tasks share the same serial execution slot.
+The experimental review-campaign product (review lanes, issues, n8n loops) was retired on
+2026-10-24; see [ADR-0021](docs/decisions/ADR-0021-core-and-agent-product-split.md). The
+repository-goal agent is moving to its own project, WorkBuddy, which depends on this core.
 
 - `docs/architecture/overview.md` — system overview; `docs/architecture/` also
   covers the kernel contract, durable event store, sandbox contract,

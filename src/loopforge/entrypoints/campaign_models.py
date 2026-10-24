@@ -294,9 +294,8 @@ class ShortReferencedReport(StrictRecord):
 
 
 class OperatorCommand(StrictRecord):
-    command: Literal["pause", "cancel", "resume", "advance", "complete", "model_changed", "park"]
+    command: Literal["pause", "cancel", "resume", "complete", "model_changed", "park"]
     evidence: str = Field(min_length=1, max_length=4000)
-    branch: str | None = None
     model: Literal["qwen3.8:27b-q4_K_M", "qwen3.6:35b-a3b"] | None = None
 
     @model_validator(mode="after")

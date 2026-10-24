@@ -255,7 +255,6 @@ class CodingCoordinator:
                 raise ValueError(msg)
         with self.store.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            config = self.store.config(db, campaign)
             state = self.store.state(db, campaign)
             if state.status not in {"ready", "paused", "checkpoint"}:
                 msg = "coding may be queued only at an idle campaign checkpoint"
@@ -269,22 +268,9 @@ class CodingCoordinator:
                 msg = "resolve the existing coding task before selecting the next"
                 raise ValueError(msg)
             permitted_kinds = {"bugfix", "feature", "launch"} if self._goal_features else {"bugfix"}
-            if state.stage == 1 and contract.kind not in permitted_kinds:
+            if contract.kind not in permitted_kinds:
                 msg = "stage 1 permits hardening fixes only"
                 raise ValueError(msg)
-            if state.stage == 2:
-                row = db.execute(
-                    "SELECT detail FROM campaign_events WHERE campaign=? "
-                    "AND json_extract(event,'$.kind')='advance' ORDER BY sequence DESC LIMIT 1",
-                    (campaign,),
-                ).fetchone()
-                if (
-                    config.project != "helicops-cloud"
-                    or not row
-                    or json.loads(row["detail"])["branch"] != contract.branch
-                ):
-                    msg = "launch work must use the recorded dedicated launch branch"
-                    raise ValueError(msg)
             db.execute(
                 "INSERT INTO coding_tasks VALUES(?,?,?,?,?,?)",
                 (task, campaign, state.stage, contract.model_dump_json(), str(source), revision),

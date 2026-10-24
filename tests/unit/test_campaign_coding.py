@@ -758,30 +758,6 @@ def test_patch_review_requires_actual_reads(tmp_path: Path) -> None:
     assert "CAMPAIGN_PATCH.diff" in result.summary
 
 
-def test_stage_contracts_and_launch_branch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    original = workspace(tmp_path / "original")
-    harness = CampaignHarness(tmp_path / "ledger")
-    config = campaign_config(original)
-    campaign = harness.create(config)
-    monkeypatch.setattr(execution, "preflight", lambda _task: None)  # pyright: ignore[reportUnknownLambdaType,reportUnknownArgumentType]
-    launch = contract().model_copy(update={"kind": "launch", "branch": "launch/pilot"})
-    with pytest.raises(ValueError, match="stage 1"):
-        harness.coding.enqueue(campaign, "coding_forbidden", launch)
-    with harness.store.connect() as db:
-        for index in range(7):
-            harness.store.append(db, campaign, CampaignEvent("claimed", str(index)), "{}")
-            harness.store.append(db, campaign, CampaignEvent("finished", str(index)), "{}")
-    coding.local_git(original.root, "branch", "launch/pilot")
-    harness.command(
-        campaign,
-        OperatorCommand(command="advance", branch="launch/pilot", evidence="baseline reviewed"),
-    )
-    with pytest.raises(ValueError, match="recorded dedicated launch branch"):
-        harness.coding.enqueue(campaign, "coding_wrong", contract())
-    assert harness.coding.enqueue(campaign, "coding_launch", launch) == "coding_launch"
-    assert harness.snapshot(campaign)["runnable"]
-
-
 def test_ignored_directories_cannot_hide_candidate_changes(tmp_path: Path) -> None:
     repo = workspace(tmp_path)
     (repo.root / ".gitignore").write_text("src/generated/\n")

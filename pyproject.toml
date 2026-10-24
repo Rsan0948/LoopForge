@@ -52,7 +52,6 @@ dev = [
 [project.scripts]
 loopforge = "loopforge.entrypoints.cli:main"
 loopforge-console = "loopforge.entrypoints.cli:main"
-loopforge-campaign = "loopforge.entrypoints.campaign:main"
 loopforge-supervisor = "loopforge.entrypoints.supervisor:main"
 loopforge-repository-supervisor = "loopforge.entrypoints.repository_supervisor:main"
 
