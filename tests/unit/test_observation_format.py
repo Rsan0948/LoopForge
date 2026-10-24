@@ -220,10 +220,8 @@ def test_unknown_tool_proposal_is_answered_with_an_explicit_rejection() -> None:
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
         name = "list_files" if len(requests) == 1 else "read_file"
-        return httpx.Response(
-            200,
-            json=_chat_payload(tool_calls=[{"function": {"name": name, "arguments": {}}}]),
-        )
+        call: dict[str, object] = {"function": {"name": name, "arguments": {}}}
+        return httpx.Response(200, json=_chat_payload(tool_calls=[call]))
 
     model = OllamaModel(
         model="m", tools=TOOLS, template=TEMPLATE, transport=httpx.MockTransport(respond)
