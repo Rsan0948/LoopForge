@@ -1354,8 +1354,12 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
                             "output allowance. "
                             "Keep each edit below about 6000 characters; build longer modules "
                             "incrementally using exact edits and fresh source hashes. "
-                            "Use the registered check_documents action to read PDF text. "
-                            "Run checks after coherent changes; test DB files belong in /tmp, "
+                            + (
+                                "Use the registered check_documents action to read PDF text. "
+                                if any(c.name == "check_documents" for c in commands)
+                                else ""
+                            )
+                            + "Run checks after coherent changes; test DB files belong in /tmp, "
                             "never in the read-only source tree."
                             if config.inference_profile
                             in {"qwen-app-v1", "qwen-state-v1", "qwen-session-v1", "qwen-native-v1"}
