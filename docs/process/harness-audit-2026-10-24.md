@@ -117,16 +117,69 @@ It passed 6 of 9 lab trials.
 
 ## Checklist
 
-- [ ] B1 runner catches all `drive` exceptions and records them (tests: allowed path keeps
-      queue, failure path records error and exits run scripts)
-- [ ] B2 stop/successor disarms the predecessor's runner (tests)
-- [ ] B3 + M2 engine-aware dependency check and config
-- [ ] M1 production MLX transport adapter (tests on recorded exchanges)
-- [ ] M3 MLX launchd service
-- [ ] S1 multi-file read and first-turn seeding (tests; replay measurement)
-- [ ] S2 MLX reasoning cap in the agentic server (lab measurement)
-- [ ] M4 depth benchmark to 64K, then per-engine budget
+- [x] B1 runner catches all `drive` exceptions and records them (tests: allowed path keeps
+      queue, failure path records error and exits run scripts). **Done** `4f3bd78`.
+- [x] B2 stop/successor disarms the predecessor's runner (tests). **Done** `4f3bd78`. A
+      runner can also be dedicated to one goal (`GoalExecutionService(only=...)`); `launch`
+      uses it.
+- [x] B3 + M2 engine-aware dependency check and config. **Done** `83b00b0`:
+      `CampaignConfig.engine: ollama | mlx`. It is omitted when `ollama`, so existing intake
+      hashes hold. MLX is allowed only for the native A3B profile.
+- [x] M1 production MLX transport adapter (tests on recorded exchanges). **Done** `83b00b0`:
+      `adapters/mlx_transport.py`. Its payload is byte-identical to the lab's on all 117
+      recorded matrix MLX requests. A live probe showed prefix-cache hits (2,634 of 3,235 tokens).
+- [x] M3 MLX launchd service. **Done** `2d5af50`: `scripts/mlx_service.py
+      install|uninstall|status`, label `local.loopforge.mlx`, the lab's exact invocation.
+      Comparison runs restart it for cold trials and stop it during Ollama trials, so both
+      engines see the same free memory.
+- [~] S1 multi-file read and first-turn seeding. **Multi-file read done** `784be70`:
+      `read_file` takes `paths` (up to 4 files, 24K characters) under v3, and the prompt names it.
+      **Observed:** in the first MLX smoke the model still read one file per call. In the
+      first Ollama smoke it used `paths` (2–4 files per call), but two defects voided reads:
+      one wrong path failed the whole call, and the model then JSON-quoted single paths.
+      The no-new-evidence stop fired, and the run failed in 221 s. Both were fixed in
+      `0153995`: failures are reported per file with successful reads kept, and a quoted
+      path gets a specific correction. First-turn seeding
+      was not built. `review_feedback` already supplies the failing-check output in one
+      call, and seeding traceback files would need a source-path extractor over check output
+      that the model could misdirect. Deferred.
+- [x] S2 MLX reasoning cap in the agentic server (lab measurement). **Done** `784be70`:
+      `--thinking-budget`, default 10,240. The first live test crashed the server's
+      generation thread (the forced logits were 1-D). After the fix, the live test with a
+      64-token budget forced the exit phrase, and the model then answered with a valid
+      tool call.
+- [x] M4 depth benchmark to 64K, then per-engine budget. **Done** `784be70`. Run
+      `.loopforge/mlx-lab/runs/depth-deep-0811`; decode in tok/s:
+
+      | depth | Ollama f16 | MLX |
+      |---|---|---|
+      | 40.1K | 34.1 | 41.3 |
+      | 48.6K | 37.4 | 43.8 |
+      | 57.2K | 29.8 | 37.4 |
+
+      The deepest point is 57K rather than 64K, because the synthesized request came out
+      shorter than estimated. MLX is not flat past 30K, but it stays above 40 tok/s through
+      48.6K, so the MLX budget is 49,152; Ollama stays at 32K.
 - [ ] Q1 reviewer obligation for changed status-code assertions; Q2 probe element-bounds check
-      (probe change needs a newly frozen intake)
-- [ ] M5 MLX smoke and one supervised trial (needs spend authorization)
-- [ ] One-command launch: `create`, freeze and `run` without hand-written per-trial scripts
+      (probe change needs a newly frozen intake). **Not done.** Both change frozen review
+      and acceptance contracts mid-comparison. They are deferred until after the
+      head-to-head, so the MLX and Ollama trials see identical gates.
+- [x] M5 MLX smoke and one supervised trial (user authorized $1.50 on 2026-10-24).
+      **Done.** The MLX smoke passed (451 s, 21 calls). The supervised MLX trial
+      **delivered** (9 decisions, 424 s, $0.440 of $1.50) through the new `launch` command.
+      See `engine-comparison-2026-10-24-final.md`.
+- [x] S4 (found in M5) supervisor paging. Gemini spent 3 paid decisions retrieving the
+      baseline record, because its 2,000-byte excerpt was filled by the passing
+      `check_documents` output. **Fixed** in `fa8d43b`: the excerpt lists failing checks
+      first and omits passing output; the full record is unchanged.
+- [x] One-command launch. **Done** `784be70`: `loopforge-repository-supervisor launch
+      --directory DIR --config INTAKE.json`. It creates the goal, runs a dedicated runner,
+      records requests and writes `final-report.json`. A starter-intake generator (`init`)
+      was not built; new goals copy an existing intake.
+- [x] Final Ollama smoke under the same conditions (user-requested head-to-head). **Done.**
+      The first run, on `784be70`, exposed the S1 defects. Both engines were then rerun
+      together on `0153995`: Ollama passed (506 s); MLX stalled on a model regression
+      (557 s). See `engine-comparison-2026-10-24-final.md`.
+- [x] B4 operator tooling. Watchers now poll the goal journal, the spend ledger and a
+      recorded PID. A `pgrep -f` watcher also matched its own command line and never
+      exited (seen in the MLX smoke watch).
