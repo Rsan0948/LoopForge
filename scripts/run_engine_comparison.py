@@ -206,6 +206,10 @@ class Transport(httpx.BaseTransport):
                         "output_tokens": normalized.get("eval_count"),
                         **cache_metrics(self.engine, data),
                         "tools": [c["function"]["name"] for c in calls],
+                        "messages": len(native.get("messages", [])),
+                        "tool_schema": hashlib.sha256(
+                            json.dumps(native.get("tools", []), sort_keys=True).encode()
+                        ).hexdigest()[:8],
                     }
                 ),
                 flush=True,

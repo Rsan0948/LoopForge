@@ -43,7 +43,12 @@ from loopforge.entrypoints.campaign_coding import (
 )
 from loopforge.entrypoints.campaign_coding_store import CodingStore
 from loopforge.entrypoints.campaign_evidence import missing_coverage, review_obligations
-from loopforge.entrypoints.campaign_models import CampaignConfig, CodingCommand, CodingTaskConfig
+from loopforge.entrypoints.campaign_models import (
+    CampaignConfig,
+    CodingCommand,
+    CodingTaskConfig,
+    ReviewReport,
+)
 from loopforge.entrypoints.campaign_repair_decisions import RepairDecisionTools
 from loopforge.entrypoints.campaign_repair_escalation import RepairGuidanceTools
 from loopforge.entrypoints.campaign_review import ReviewTools, build_review, tool_specs
@@ -486,6 +491,7 @@ class CodingCoordinator:
                         self.parent_budget,
                         tool_specs(),
                         self.directory / "frontier-review" / task,
+                        report_schema=ReviewReport.model_json_schema(),
                     )
                 runtime, review_tools, live = build_review(
                     config,

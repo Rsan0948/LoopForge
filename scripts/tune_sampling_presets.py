@@ -1,4 +1,3 @@
-
 """Tuning: sampling presets on captured requests (output length, looping, tool choice).
 
 Each captured request is replayed with every preset and several seeds. Reports output

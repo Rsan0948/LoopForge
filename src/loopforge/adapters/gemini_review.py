@@ -67,6 +67,7 @@ class GeminiReviewModel:
         client: httpx.Client | None = None,
         max_request_bytes: int = REVIEW_REQUEST_BYTES,
         count_tokens: bool = True,
+        report_schema: dict[str, object] | None = None,
     ) -> None:
         if (
             type(max_request_bytes) is not int
@@ -76,6 +77,9 @@ class GeminiReviewModel:
             raise ValueError(msg)
         self.max_request_bytes = max_request_bytes
         self.count_tokens = count_tokens is True
+        # Code-owned report format, shown once coverage is complete: the report is a
+        # JSON string argument, so without it the model guesses field names.
+        self.report_schema = report_schema
         self.progress: ReviewProgress | None = None
         self._history: dict[str, list[dict[str, object]]] = {}
         self._last_action: dict[str, tuple[str, dict[str, str]]] = {}
@@ -133,17 +137,23 @@ class GeminiReviewModel:
                 break
             retained.insert(0, entry)
             used += size
+        status = self.progress.review_status() if self.progress is not None else None
         # Stable-first ordering keeps a reusable request prefix across calls.
-        packet = {
+        packet: dict[str, object] = {
             "run_id": run,
             "tools": [asdict(t) for t in tools],
             "your_earlier_actions_and_results_untrusted": retained,
             "earlier_entries_omitted": len(history) - len(retained),
-            "review_status_runtime_measured": self.progress.review_status()
-            if self.progress is not None
-            else None,
+            "review_status_runtime_measured": status,
             "items": [asdict(i) for i in context.items],
         }
+        if (
+            self.report_schema is not None
+            and status is not None
+            and status.get("required_coverage") == "complete"
+            and any(t.name == "submit_report" for t in tools)
+        ):
+            packet["submit_report_json_schema"] = self.report_schema
         body = json.dumps(
             {
                 "systemInstruction": {

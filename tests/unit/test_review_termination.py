@@ -285,3 +285,42 @@ def test_gemini_reviewer_stops_before_another_paid_call_once_changes_are_request
     assert stopped.value.reason_code == "REVIEW_CHANGES_REQUESTED"
     assert calls == []
     assert budget.account().spent == 0
+
+
+@pytest.mark.parametrize("covered", [True, False])
+def test_report_schema_is_shown_only_once_coverage_is_complete(
+    covered: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(gemini_module, "PRICE_VALID_UNTIL", datetime(2100, 1, 1, tzinfo=UTC))
+    bodies: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith(":countTokens"):
+            return httpx.Response(200, json={"totalTokens": 400})
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=_reply(200))
+
+    tools = _tools(3)
+    if covered:
+        _call(tools, "read_file", path="app/a.py")
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        reviewer = GeminiReviewModel(
+            "fixture-review-key",
+            SQLitePaidBudget(tmp_path / "paid.sqlite", 1_000_000),
+            tool_specs(),
+            tmp_path / "traces",
+            client=client,
+            report_schema=ReviewReport.model_json_schema(),
+        )
+        reviewer.progress = tools
+        try:
+            reviewer.propose_action(_context(None))
+        except ModelTurnError:
+            pass
+    contents = cast("list[dict[str, list[dict[str, str]]]]", bodies[0]["contents"])
+    packet = json.loads(contents[0]["parts"][0]["text"])
+    if covered:
+        schema = packet["submit_report_json_schema"]
+        assert set(schema["required"]) >= {"summary", "findings", "unresolved"}
+    else:
+        assert "submit_report_json_schema" not in packet

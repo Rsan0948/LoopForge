@@ -630,7 +630,7 @@ class OllamaModel:
             middle = [m for m in messages[2:keep_from] if m.get("role") != "system"]
             try:
                 handoff = self._checkpoint_summarizer(middle, self._handoffs.get(context.run_id))
-            except Exception as exc:  # noqa: BLE001 - optional hook; any failure keeps tier 1
+            except Exception as exc:
                 record["tier2_error"] = type(exc).__name__
             else:
                 self._handoffs[context.run_id] = handoff
