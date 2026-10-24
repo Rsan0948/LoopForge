@@ -13,6 +13,10 @@ class ToolFailureClass(StrEnum):
     TRANSIENT = "transient"
     PERMANENT = "permanent"
     AMBIGUOUS_OUTCOME = "ambiguous_outcome"
+    # The tool refused the caller's arguments before doing anything: a missing edit
+    # target, a stale hash, a path outside the contract. The dependency is healthy, so
+    # this never counts toward its circuit and is never retried unchanged.
+    INVALID_INPUT = "invalid_input"
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +73,8 @@ class ReliabilityPolicy:
             return RetryDecision(False, "RETRY_TOOL_POLICY_NEVER")
         if failure_class is ToolFailureClass.PERMANENT:
             return RetryDecision(False, "RETRY_FAILURE_PERMANENT")
+        if failure_class is ToolFailureClass.INVALID_INPUT:
+            return RetryDecision(False, "RETRY_INVALID_INPUT")
         if failure_class is ToolFailureClass.AMBIGUOUS_OUTCOME and metadata.idempotency not in {
             IdempotencyClass.NATURAL,
             IdempotencyClass.KEYED,

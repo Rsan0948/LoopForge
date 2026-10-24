@@ -25,7 +25,6 @@ from tests.unit.worker_trajectory import (
 )
 
 PROFILES = ("qwen-native-v1", "qwen-bounded-v3")
-BOUNDED = ("qwen-bounded-v3",)
 
 # Stop codes that mean "the model is repeating itself", which is the right way for a
 # looping run to end.
@@ -77,10 +76,6 @@ def feature_by_feature(features: tuple[tuple[str, str], ...] = FEATURES) -> list
 
 SMALL = FEATURES[:3]
 
-# The model's own probe run fails while features are missing; without measured checks
-# that failure is a tool failure, and three open the required check's circuit.
-CHECK_CIRCUIT = "F1: the model's own failing probe runs open the required check circuit"
-
 
 def test_a_small_feature_completes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
@@ -118,14 +113,8 @@ def test_whole_file_rewrites_that_add_features_complete(
 
 
 def test_mistyped_edits_do_not_end_a_run_that_recovers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(
-        request,
-        profile,
-        "F1: three mistyped edits open the edit circuit; G1: each re-verifies "
-        "'deliverables missing' on the unchanged candidate and counts as a repeated failure",
-    )
     turns: list[Turn] = [call("read_file", path=GAME)]
     for _ in range(3):
         turns += [
@@ -138,9 +127,8 @@ def test_mistyped_edits_do_not_end_a_run_that_recovers(
 
 
 def test_bad_read_arguments_do_not_end_a_run_that_recovers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(request, profile, "F1: read argument mistakes open the read circuit")
     turns: list[Turn] = [call("read_file", path=GAME, start_line="999")] * 3
     turns += feature_by_feature(SMALL)
     outcome = run(tmp_path, monkeypatch, profile, turns, SMALL)
@@ -203,14 +191,8 @@ def test_a_reply_with_several_calls_does_not_end_the_run(
 
 
 def test_an_identical_failing_edit_forever_ends_as_a_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(
-        request,
-        profile,
-        "G1: the loop ends after four turns on 'same candidate repeatedly failed fixed "
-        "checks', a check verdict, instead of on loop detection",
-    )
     turns: list[Turn] = [call("read_file", path=GAME)]
     turns += [call("edit_file", path=GAME, old="text that is not there", new="x")] * 40
     outcome = run(tmp_path, monkeypatch, profile, turns)
@@ -220,9 +202,8 @@ def test_an_identical_failing_edit_forever_ends_as_a_loop(
 
 
 def test_rerunning_a_check_on_an_unchanged_candidate_ends_as_a_loop(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str, request: pytest.FixtureRequest
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, profile: str
 ) -> None:
-    known_gap(request, profile, CHECK_CIRCUIT, BOUNDED)
     turns: list[Turn] = [add_feature("start")]
     turns += [call("check_acceptance_gameplay")] * 40
     outcome = run(tmp_path, monkeypatch, profile, turns)

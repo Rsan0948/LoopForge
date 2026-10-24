@@ -49,6 +49,7 @@ def test_tool_failure_class_values_round_trip_through_strings() -> None:
     assert ToolFailureClass("transient") is ToolFailureClass.TRANSIENT
     assert ToolFailureClass("permanent") is ToolFailureClass.PERMANENT
     assert ToolFailureClass("ambiguous_outcome") is ToolFailureClass.AMBIGUOUS_OUTCOME
+    assert ToolFailureClass("invalid_input") is ToolFailureClass.INVALID_INPUT
 
 
 def test_tool_failure_class_partition_is_exact() -> None:
@@ -56,7 +57,20 @@ def test_tool_failure_class_partition_is_exact() -> None:
         ToolFailureClass.TRANSIENT,
         ToolFailureClass.PERMANENT,
         ToolFailureClass.AMBIGUOUS_OUTCOME,
+        ToolFailureClass.INVALID_INPUT,
     }
+
+
+@pytest.mark.parametrize("retry", list(RetryClass))
+def test_refused_input_is_never_retried_unchanged(retry: RetryClass) -> None:
+    decision = ReliabilityPolicy().retry_decision(
+        metadata=_metadata(retry=retry, idempotency=IdempotencyClass.KEYED),
+        failure_class=ToolFailureClass.INVALID_INPUT,
+        attempt=1,
+        action_id=ACTION,
+    )
+    assert decision.should_retry is False
+    assert decision.reason_code in {"RETRY_INVALID_INPUT", "RETRY_TOOL_POLICY_NEVER"}
 
 
 # --- RetrySettings validation -------------------------------------------------

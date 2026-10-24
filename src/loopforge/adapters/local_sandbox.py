@@ -22,6 +22,7 @@ from loopforge.domain.security import SandboxCapabilities
 from loopforge.ports.sandbox import (
     SandboxCommandResult,
     SandboxError,
+    SandboxMissingPathError,
     SandboxPathError,
     SandboxPolicyError,
     SandboxTimeoutError,
@@ -174,7 +175,7 @@ class ConstrainedLocalSandbox:
         try:
             if not path.is_file():
                 msg_8 = "read target must be a regular file"
-                raise SandboxPathError(msg_8)
+                raise SandboxMissingPathError(msg_8)
             if path.stat().st_size > self._limits.max_read_bytes:
                 msg_9 = "read exceeds sandbox byte limit"
                 raise SandboxPolicyError(msg_9)
@@ -189,7 +190,7 @@ class ConstrainedLocalSandbox:
         except FileNotFoundError as exc:
             # Vanished between path resolution and read: report, never crash.
             msg_24 = "sandbox path does not exist"
-            raise SandboxPathError(msg_24) from exc
+            raise SandboxMissingPathError(msg_24) from exc
         except PermissionError as exc:
             msg_25 = "read target is not readable"
             raise SandboxPolicyError(msg_25) from exc
@@ -314,7 +315,7 @@ class ConstrainedLocalSandbox:
             resolved = candidate.resolve(strict=not allow_missing)
         except FileNotFoundError as exc:
             msg_17 = "sandbox path does not exist"
-            raise SandboxPathError(msg_17) from exc
+            raise SandboxMissingPathError(msg_17) from exc
         if not resolved.is_relative_to(self._root):
             msg_14 = "sandbox path escapes configured root"
             raise SandboxPathError(msg_14)

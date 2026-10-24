@@ -233,8 +233,10 @@ def test_unknown_tool_proposal_is_answered_with_an_explicit_rejection() -> None:
     assert "read_file" in tool
 
 
-def test_known_tool_without_observation_keeps_the_neutral_notice() -> None:
+def test_known_tool_without_observation_says_it_was_refused_before_running() -> None:
     model, requests = _native("delimited")
     model.propose_action(_context())
     model.propose_action(_context())
-    assert _tool_message(requests) == "No new observation was recorded for the proposed action."
+    tool = _tool_message(requests)
+    assert tool.startswith("No action executed: the runtime refused this proposal")
+    assert tool.endswith("Choose a different action.")

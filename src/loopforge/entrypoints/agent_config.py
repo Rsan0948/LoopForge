@@ -76,8 +76,6 @@ class WorkerProfile:
     byte_ratio_admission: bool
     # Bookkeeping: only the current failure, not read lists, in each turn.
     conversation_bookkeeping: bool
-    # Checks: a check that ran and failed is a measured result, not a tool failure.
-    measured_checks: bool
     # Verification: each distinct changed file counts as construction progress.
     construction_credit: bool
     # Review: reporting envelope for patch review.
@@ -95,7 +93,6 @@ WORKER_PROFILES: dict[str, WorkerProfile] = {
         history_limit_chars=None,
         byte_ratio_admission=True,
         conversation_bookkeeping=True,
-        measured_checks=True,
         construction_credit=True,
         app_reporting=True,
         bounded_reporting=False,
@@ -109,7 +106,6 @@ WORKER_PROFILES: dict[str, WorkerProfile] = {
         history_limit_chars=96_000,
         byte_ratio_admission=False,
         conversation_bookkeeping=False,
-        measured_checks=False,
         construction_credit=False,
         app_reporting=False,
         bounded_reporting=True,
@@ -135,9 +131,8 @@ class GateLimits:
     no_progress_verifications: int = 8
     # Turns in a row with an unchanged patch and no new source read.
     no_new_evidence_turns: int = 8
-    # The same candidate failing fixed checks with the same summary.
-    repeated_check_failures: int = 3
-    # Failures of one tool without a success of that tool in between.
+    # Infrastructure failures of one tool without a success of that tool in between
+    # (refused model input does not count).
     tool_circuit_failures: int = 3
     # Local inference is free; the runtime still needs a finite cost ceiling.
     local_cost_usd: float = 1.0
@@ -148,7 +143,6 @@ class GateLimits:
         counts = (
             self.no_progress_verifications,
             self.no_new_evidence_turns,
-            self.repeated_check_failures,
             self.tool_circuit_failures,
             self.supervisor_evidence_bytes,
         )

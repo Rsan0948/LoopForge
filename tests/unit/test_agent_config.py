@@ -75,7 +75,6 @@ def test_composition_follows_the_profile_record(
     tools = {spec.name for spec in live._tools}  # pyright: ignore[reportPrivateUsage]
     assert ("format_python_imports" in tools) is record.import_formatter
     assert isinstance(runtime.tools, coding.ConfinedCodingTools)
-    assert runtime.tools.measured_checks is record.measured_checks
     assert isinstance(runtime.verifier, coding.CodingVerifier)
     assert runtime.verifier.construction_credit is record.construction_credit
     assert runtime.verifier.app_workload is record.app_reporting
@@ -90,7 +89,6 @@ def test_gate_limits_reach_every_rule_they_name(
     gates = GateLimits(
         no_progress_verifications=5,
         no_new_evidence_turns=6,
-        repeated_check_failures=4,
         tool_circuit_failures=7,
         local_cost_usd=2.0,
     )
@@ -100,14 +98,12 @@ def test_gate_limits_reach_every_rule_they_name(
     assert runtime.control.no_progress_limit == 5
     assert runtime.control.budget.max_cost_usd == 2.0
     assert runtime.reliability.circuit_failure_threshold == 7
-    assert isinstance(runtime.verifier, coding.CodingVerifier)
-    assert runtime.verifier.repeated_failures == 4
     assert isinstance(runtime.model, coding.RequiredChecksAwareModel)
     assert runtime.model.no_new_evidence_turns == 6
 
 
 def test_default_gate_limits_are_todays_values() -> None:
-    assert GateLimits(8, 8, 3, 3, 1.0, 24_000) == GATE_LIMITS
+    assert GateLimits(8, 8, 3, 1.0, 24_000) == GATE_LIMITS
 
 
 @pytest.mark.parametrize(

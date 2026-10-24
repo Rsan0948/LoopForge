@@ -18,6 +18,13 @@ class SandboxPathError(SandboxPolicyError):
     """Raised when a filesystem request escapes or violates workspace policy."""
 
 
+class SandboxMissingPathError(SandboxPathError):
+    """A safe path names nothing readable: it does not exist or is not a regular file.
+
+    Nothing escaped policy; the caller asked for the wrong path.
+    """
+
+
 class SandboxTimeoutError(SandboxError):
     """Raised when a command exceeds its configured wall-clock timeout."""
 

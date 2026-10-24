@@ -302,8 +302,6 @@ class ConfinedCodingTools:
         # Code-owned: read_file may take several known paths in one call (one action,
         # a bounded total), instead of a model turn per file.
         self.multi_read = False
-        # Code-owned: a registered check that executed and failed is a measured result.
-        self.measured_checks = False
 
     def metadata_for(self, tool_name: str) -> ToolMetadata:
         if tool_name in {"apply_edits", "format_python_imports"}:
@@ -429,7 +427,7 @@ class ConfinedCodingTools:
                     observation="Versioned feedback is already in the current context. "
                     "Inspect the failing source, make a real change, or run a required check.",
                     error_code="CODING_FEEDBACK_ALREADY_PRESENT",
-                    failure_class=ToolFailureClass.PERMANENT,
+                    failure_class=ToolFailureClass.INVALID_INPUT,
                 )
             return ToolResult(ok=True, observation=self.feedback_snapshot())
         if request.proposal.tool_name in {"repository_map", "find_symbol"}:
@@ -442,7 +440,7 @@ class ConfinedCodingTools:
                     ok=False,
                     observation="Expected query and optional find_symbol offset",
                     error_code="NAV_ARGUMENTS",
-                    failure_class=ToolFailureClass.PERMANENT,
+                    failure_class=ToolFailureClass.INVALID_INPUT,
                 )
             files = candidate_snapshot(self.workspace)
             try:
@@ -459,7 +457,7 @@ class ConfinedCodingTools:
                     ok=False,
                     observation=str(exc),
                     error_code="NAV_ARGUMENTS",
-                    failure_class=ToolFailureClass.PERMANENT,
+                    failure_class=ToolFailureClass.INVALID_INPUT,
                 )
         if request.proposal.tool_name == "format_python_imports":
             return self.format_imports(request)
@@ -476,7 +474,7 @@ class ConfinedCodingTools:
                     ok=False,
                     observation="path outside edit contract or protected",
                     error_code="CODING_PATH_DENIED",
-                    failure_class=ToolFailureClass.PERMANENT,
+                    failure_class=ToolFailureClass.INVALID_INPUT,
                 )
             if request.proposal.tool_name == "edit_file" and self.edit_echo:
                 return self.echo_edit(request, self.tools.execute(request))
@@ -490,8 +488,7 @@ class ConfinedCodingTools:
         denials stay tool failures. The verifier still records the authoritative verdict.
         """
         if (
-            not self.measured_checks
-            or result.ok
+            result.ok
             or not (result.error_code or "").startswith("SANDBOX_EXIT_")
             or request.proposal.tool_name not in {c.name for c in self.task.execution_checks}
         ):
@@ -574,7 +571,7 @@ class ConfinedCodingTools:
                         "Repair the remaining diagnostic instead."
                     ),
                     error_code="CODING_FORMAT_NO_CHANGE",
-                    failure_class=ToolFailureClass.PERMANENT,
+                    failure_class=ToolFailureClass.INVALID_INPUT,
                 )
             # apply_edits rechecks the source fingerprint after the subprocess returns.
             return self.apply_edits(
@@ -595,7 +592,10 @@ class ConfinedCodingTools:
                 ok=False,
                 observation=str(exc),
                 error_code="CODING_FORMAT_DENIED",
-                failure_class=ToolFailureClass.PERMANENT,
+                # A refused request is the model's to correct; an OS error is the formatter's.
+                failure_class=ToolFailureClass.INVALID_INPUT
+                if isinstance(exc, ValueError)
+                else ToolFailureClass.PERMANENT,
             )
 
     def apply_edits(self, request: ToolExecutionRequest) -> ToolResult:
@@ -637,7 +637,7 @@ class ConfinedCodingTools:
                     observation="Edit batch leaves the file unchanged; no write performed. "
                     "Make a substantive correction using the current source hash.",
                     error_code="CODING_EDITS_NO_CHANGE",
-                    failure_class=ToolFailureClass.PERMANENT,
+                    failure_class=ToolFailureClass.INVALID_INPUT,
                 )
             written = self.tools.execute(
                 replace(
@@ -664,7 +664,7 @@ class ConfinedCodingTools:
                 ok=False,
                 observation=str(exc),
                 error_code="CODING_EDITS_DENIED",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
 
     def search_excerpt(self, request: ToolExecutionRequest) -> ToolResult:
@@ -679,7 +679,7 @@ class ConfinedCodingTools:
                 ok=False,
                 observation=str(exc),
                 error_code="CODING_SEARCH_ARGUMENTS",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         result = self.tools.execute(
             replace(request, proposal=replace(request.proposal, arguments={"query": args["query"]}))
@@ -717,14 +717,14 @@ class ConfinedCodingTools:
                 observation="path is a plain string such as app/server.py, not JSON-quoted; "
                 "only paths takes a JSON list",
                 error_code="CODING_READ_ARGUMENTS",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         if not source_allowed(args.get("path", "")):
             return ToolResult(
                 ok=False,
                 observation="source excluded by campaign evidence policy",
                 error_code="CODING_SOURCE_DENIED",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         try:
             start = int(args.get("start_line", "1"))
@@ -736,7 +736,7 @@ class ConfinedCodingTools:
                 ok=False,
                 observation="read_file accepts path and a positive integer start_line only",
                 error_code="CODING_READ_ARGUMENTS",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         result = self.tools.execute(
             replace(
@@ -755,7 +755,7 @@ class ConfinedCodingTools:
                 ok=False,
                 observation=str(exc),
                 error_code="CODING_READ_ARGUMENTS",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         note = (
             f"Next start_line: {page.next_line}; start_column: {page.next_column}"
@@ -791,7 +791,7 @@ class ConfinedCodingTools:
                 "paths, without path/start_line/start_column; read a file's continuation "
                 "with path and start_line",
                 error_code="CODING_READ_ARGUMENTS",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         parts: list[str] = []
         failures: list[ToolResult] = []
@@ -831,9 +831,7 @@ class CodingVerifier:
         reporting_v3: bool = False,
         app_workload: bool = False,
         construction_credit: bool = False,
-        repeated_failures: int = GATE_LIMITS.repeated_check_failures,
     ) -> None:
-        self.repeated_failures = repeated_failures
         self.app_workload = app_workload
         self.construction_credit = construction_credit
         self.reporting_v3 = reporting_v3
@@ -843,16 +841,38 @@ class CodingVerifier:
         self.contract_sha256 = acceptance_contract_hash(task)
         self.acceptance_receipt: AcceptanceReceipt | None = None
         self.last_failure: tuple[str, str] | None = None
-        self.repetitions = 0
         self.blocked = False
         self.checked: tuple[str, VerificationResult] | None = None
         self.starting_patch = patch_identity(workspace) if require_revision else None
 
-    def verify(self, state: RunState) -> VerificationResult:  # noqa: PLR0911 - ordered gates
+    def verify(self, state: RunState) -> VerificationResult:
         self.acceptance_receipt = None
         if acceptance_contract_hash(self.task) != self.contract_sha256:
             self.blocked = True
             return VerificationResult(False, "Frozen task contract changed", inconclusive=True)
+        identity = patch_identity(self.workspace)
+        if self.checked is not None and self.checked[0] == identity:
+            # Unchanged candidate: reuse its conclusive failing verdict instead of judging
+            # it again. The runtime verifies after every failed tool call, so a refused
+            # read or edit must not count as another failure of the same candidate;
+            # a model repeating itself is bounded by loop detection instead.
+            return replace(
+                self.checked[1],
+                summary=self.checked[1].summary
+                + "\nCandidate unchanged since this verification; edit to re-verify.",
+                repeat=True,
+            )
+        result = self._judge(state, identity)
+        if result.passed:
+            self.last_failure = None
+        else:
+            self.last_failure = (identity, result.summary)
+        # Inconclusive means the checks could not run: an infrastructure stop.
+        self.blocked = result.inconclusive
+        self.checked = (identity, result) if not result.passed and not result.inconclusive else None
+        return result
+
+    def _judge(self, state: RunState, identity: str) -> VerificationResult:
         changed = set(self.workspace.status().files)
         forbidden = [path for path in changed if not writable(path, self.task, self.workspace)]
         if forbidden:
@@ -861,26 +881,21 @@ class CodingVerifier:
                 score=0,
                 summary="protected/out-of-scope patch: " + ", ".join(forbidden),
             )
-        if (
-            self.starting_patch is not None
-            and patch_identity(self.workspace) == self.starting_patch
-        ):
-            summary = (
-                "Revision required: candidate is unchanged since Return for edits. "
-                "Correct the requested issue before fixed checks can complete this coding run."
+        if self.starting_patch is not None and identity == self.starting_patch:
+            return VerificationResult(
+                passed=False,
+                score=0,
+                summary="Revision required: candidate is unchanged since Return for edits. "
+                "Correct the requested issue before fixed checks can complete this coding run.",
             )
-            self.last_failure = (self.starting_patch, summary)
-            return VerificationResult(passed=False, score=0, summary=summary)
         missing_deliverables = sorted(set(self.task.required_changed_paths) - changed)
         if missing_deliverables:
-            summary = "Required changed-file deliverables are missing: " + ", ".join(
-                missing_deliverables
+            return VerificationResult(
+                passed=False,
+                score=0,
+                summary="Required changed-file deliverables are missing: "
+                + ", ".join(missing_deliverables),
             )
-            failure = (patch_identity(self.workspace), summary)
-            self.repetitions = self.repetitions + 1 if failure == self.last_failure else 1
-            self.last_failure = failure
-            self.blocked = self.repetitions >= self.repeated_failures
-            return VerificationResult(passed=False, score=0, summary=summary)
         files = candidate_snapshot(self.workspace)
         expected = set(self.workspace.status().files) | {"CAMPAIGN_PATCH.diff"}
         if files["CAMPAIGN_PATCH.diff"]:
@@ -905,30 +920,10 @@ class CodingVerifier:
                     summary=f"Review admission blocked: {exc}; "
                     "reduce the patch or stop for decomposition",
                 )
-        identity = patch_identity(self.workspace)
-        if self.checked is not None and self.checked[0] == identity:
-            # Unchanged candidate: reuse its conclusive failing verdict instead of
-            # re-running every check and counting a strike. Runtime-triggered
-            # verifications after a failed read or an unrelated check must not end
-            # a run that is still investigating; stalls are bounded separately.
-            return replace(
-                self.checked[1],
-                summary=self.checked[1].summary
-                + "\nCandidate unchanged since this verification; edit to re-verify.",
-                repeat=True,
-            )
         candidate = candidate_revision(self.workspace)
         result = self.verifier.verify(state)
         result = self._bind_acceptance(state, candidate, result)
         result = self._with_construction_credit(result)
-        if result.passed:
-            self.last_failure, self.repetitions = None, 0
-            self.blocked = False
-        else:
-            failure = (patch_identity(self.workspace), result.summary)
-            self.repetitions = self.repetitions + 1 if failure == self.last_failure else 1
-            self.last_failure = failure
-            self.blocked = self.repetitions >= self.repeated_failures or result.inconclusive
         if self.receipts is not None:
             result = replace(
                 result,
@@ -936,7 +931,6 @@ class CodingVerifier:
                 + "\nCheck receipts: "
                 + json.dumps(self.receipts.history[-len(self.task.execution_checks) :]),
             )
-        self.checked = (identity, result) if not result.passed and not result.inconclusive else None
         return result
 
     def _with_construction_credit(self, result: VerificationResult) -> VerificationResult:
@@ -1074,7 +1068,7 @@ class RequiredChecksAwareModel:
             raise ModelTurnError(
                 ModelFailureClass.PERMANENT,
                 "CODING_AUTOMATIC_CHECK_BLOCKED",
-                "Same candidate repeatedly failed fixed checks, or checks were unavailable; "
+                "Checks could not run, or the frozen contract changed; "
                 "preserve diagnostics for operator attention",
             )
         if self.verifier is not None:
@@ -1390,7 +1384,6 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
         reporting_v3=worker.large_reporting,
         app_workload=worker.app_reporting,
         construction_credit=worker.construction_credit,
-        repeated_failures=gates.repeated_check_failures,
     )
 
     def inherited_failure() -> str | None:
@@ -1412,7 +1405,6 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
     tools.read_page_chars = profile.read_page_chars
     tools.edit_echo = profile.observation_format == "delimited"
     tools.multi_read = profile.read_page_chars > _SINGLE_PAGE_CHARS
-    tools.measured_checks = worker.measured_checks
     if worker.import_formatter:
         tools.import_formatter = PinnedImportFormatter(workspace.root, task.image).format_file
     runtime = Runtime(

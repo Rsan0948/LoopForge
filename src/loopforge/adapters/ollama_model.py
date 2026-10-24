@@ -850,7 +850,12 @@ class OllamaModel:
                 f"Rejected: {tool_name!r} is not an available tool; no action executed. "
                 f"Available tools: {', '.join(names)}."
             )
-        return "No new observation was recorded for the proposed action."
+        return (
+            "No action executed: the runtime refused this proposal before it ran, for "
+            "example because the tool is unavailable after repeated infrastructure "
+            "failures or needs a permission this run does not have. Choose a different "
+            "action."
+        )
 
     def _present(self, run_id: RunId, item: ContextItem) -> str:
         """Code-owned item presentation inside the conversation (see observation_format)."""

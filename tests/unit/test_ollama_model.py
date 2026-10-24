@@ -371,7 +371,7 @@ def test_rejected_proposal_yields_explicit_empty_tool_result() -> None:
     second = json.loads(captured[1].content)
     tool = second["messages"][3]
     assert tool["role"] == "tool"
-    assert "No new observation was recorded" in tool["content"]
+    assert tool["content"].startswith("No action executed: the runtime refused this proposal")
 
 
 def test_drop_conversation_starts_fresh() -> None:

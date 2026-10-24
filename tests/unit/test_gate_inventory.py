@@ -25,9 +25,10 @@ CONTROL_STOPS = {
 # Workload rules raised as permanent model failures from model wrappers. Each one ends
 # the run as a model failure, whatever the real cause (F11).
 WRAPPER_STOPS = {
-    "CODING_REQUIRED_CHECK_CIRCUIT_OPEN": "a required check's tool circuit opened (F1)",
-    "CODING_AUTOMATIC_CHECK_BLOCKED": "same candidate failed checks N times, or checks "
-    "were unavailable (G1)",
+    "CODING_REQUIRED_CHECK_CIRCUIT_OPEN": "a required check failed to run N times "
+    "(infrastructure; a check that ran and failed is a measured result)",
+    "CODING_AUTOMATIC_CHECK_BLOCKED": "checks could not run (inconclusive), or the frozen "
+    "contract changed",
     "CODING_NO_NEW_EVIDENCE": "N turns with an unchanged patch and no new read",
     "MODEL_DEADLINE": "run deadline reached before a model call",
     "REVIEW_NO_NEW_EVIDENCE": "reviewer repeats itself",

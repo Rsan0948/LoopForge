@@ -380,6 +380,12 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             )
         case ToolFailed(error_message=message, failure_class=failure_class, attempt=attempt):
             tool_name = base.current_tool_metadata.name if base.current_tool_metadata else "unknown"
+            # Refused input says nothing about the tool's health: leave its streak alone.
+            streaks = (
+                base.tool_failure_streaks
+                if failure_class is ToolFailureClass.INVALID_INPUT
+                else _update_streak(base.tool_failure_streaks, tool_name, success=False)
+            )
             return replace(
                 base,
                 last_observation=message,
@@ -387,9 +393,7 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 last_tool_failure_class=failure_class,
                 current_attempt=attempt,
                 execution_in_flight=False,
-                tool_failure_streaks=_update_streak(
-                    base.tool_failure_streaks, tool_name, success=False
-                ),
+                tool_failure_streaks=streaks,
                 # A grant is spent by the execution of its action, whatever the
                 # outcome. A failed-but-granted action that re-plans back to
                 # READY must not keep its grant: the next cycle would

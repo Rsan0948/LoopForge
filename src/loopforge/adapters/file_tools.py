@@ -30,6 +30,7 @@ from loopforge.domain.tooling import (
 from loopforge.domain.types import Permission, RiskLevel
 from loopforge.ports.sandbox import (
     SandboxError,
+    SandboxMissingPathError,
     SandboxPolicyError,
     SandboxPort,
     SandboxTimeoutError,
@@ -281,7 +282,7 @@ def _argument_failure(observation: str) -> ToolResult:
         ok=False,
         observation=observation,
         error_code="TOOL_ARGUMENTS",
-        failure_class=ToolFailureClass.PERMANENT,
+        failure_class=ToolFailureClass.INVALID_INPUT,
     )
 
 
@@ -292,6 +293,14 @@ def _sandbox_failure(exc: SandboxError) -> ToolResult:
             observation=str(exc),
             error_code="SANDBOX_TIMEOUT",
             failure_class=ToolFailureClass.TRANSIENT,
+        )
+    if isinstance(exc, SandboxMissingPathError):
+        # Nothing escaped policy; the caller named the wrong path.
+        return ToolResult(
+            ok=False,
+            observation=str(exc),
+            error_code="SANDBOX_PATH_MISSING",
+            failure_class=ToolFailureClass.INVALID_INPUT,
         )
     if isinstance(exc, SandboxPolicyError):
         return ToolResult(

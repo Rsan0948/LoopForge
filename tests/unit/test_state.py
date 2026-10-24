@@ -1179,6 +1179,23 @@ def test_failure_streaks_are_tracked_per_tool_and_sorted() -> None:
     assert state.failure_streak_for("beta") == 2
 
 
+def test_refused_input_leaves_the_tool_streak_alone() -> None:
+    state = _apply_outcome(RunState(run_id=RUN), "edit", success=False)
+    acting = replace(
+        RunState(run_id=RUN),
+        status=RunStatus.ACTING,
+        current_action_id="a1",
+        current_tool_metadata=_metadata("edit"),
+        tool_failure_streaks=state.tool_failure_streaks,
+    )
+    for _ in range(5):
+        refused = reduce_event(
+            acting, _tool_failed(1, failure_class=ToolFailureClass.INVALID_INPUT)
+        )
+        assert refused.failure_streak_for("edit") == 1
+        assert refused.last_tool_failure_class is ToolFailureClass.INVALID_INPUT
+
+
 def test_total_tokens_sums_input_and_output() -> None:
     state = replace(RunState(run_id=RUN), input_tokens=7, output_tokens=3)
     assert state.total_tokens == 10

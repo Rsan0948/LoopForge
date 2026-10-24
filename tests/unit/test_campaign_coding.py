@@ -20,6 +20,7 @@ from loopforge.domain.actions import ActionProposal
 from loopforge.domain.campaign import CampaignEvent, CampaignState, reduce_campaign
 from loopforge.domain.coding import CodingEvent, CodingState, CodingStatus, reduce_coding
 from loopforge.domain.context import ModelContext
+from loopforge.domain.events import VerificationFailed
 from loopforge.domain.security import TrustClass
 from loopforge.domain.state import RunState
 from loopforge.domain.types import ActionId, RunId, RunStatus
@@ -806,11 +807,22 @@ def test_parked_campaign_cannot_enqueue_coding(
     harness.close()
 
 
+class BrokenChecks(ContainerSandbox):
+    """The check infrastructure itself fails, as when the container engine is down."""
+
+    def run(
+        self, command_name: str, *, timeout_seconds: float | None = None
+    ) -> SandboxCommandResult:
+        del command_name, timeout_seconds
+        msg = "container engine unavailable"
+        raise SandboxError(msg)
+
+
 def test_coding_required_check_circuit_stops_before_more_inference(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ws = workspace(tmp_path / "coding")
-    monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
+    monkeypatch.setattr(coding, "ContainerSandbox", BrokenChecks)
     actions = [ActionProposal(ActionId(f"check-{i}"), "check_regression", {}) for i in range(3)]
     actions.append(ActionProposal(ActionId("never"), "read_file", {"path": "src/add.py"}))
     store = InMemoryEventStore()
@@ -824,7 +836,7 @@ def test_coding_required_check_circuit_stops_before_more_inference(
     assert any("CODING_REQUIRED_CHECK_CIRCUIT_OPEN" in str(e) for e in events)
 
 
-def test_automatic_checks_stop_unchanged_candidate_without_tool_failures(
+def test_rewriting_an_unchanged_candidate_ends_as_a_loop_not_a_check_verdict(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ws = workspace(tmp_path / "coding")
@@ -835,7 +847,7 @@ def test_automatic_checks_stop_unchanged_candidate_without_tool_failures(
             "write_file",
             {"path": "src/add.py", "content": "def add(a,b): return 0\n"},
         )
-        for i in range(4)
+        for i in range(12)
     ]
     store = InMemoryEventStore()
     runtime, _ = coding.build_coding(
@@ -844,8 +856,11 @@ def test_automatic_checks_stop_unchanged_candidate_without_tool_failures(
     state = runtime.run("Fix addition")
     assert state.status == RunStatus.FAILED
     events = store.events_for(state.run_id)
-    assert sum(type(e).__name__ == "ActionProposed" for e in events) == 3
-    assert any("CODING_AUTOMATIC_CHECK_BLOCKED" in str(e) for e in events)
+    assert sum(type(e).__name__ == "ActionProposed" for e in events) == 8
+    assert any("CODING_NO_NEW_EVIDENCE" in str(e) for e in events)
+    assert not any("CODING_AUTOMATIC_CHECK_BLOCKED" in str(e) for e in events)
+    failed = [e for e in events if isinstance(e, VerificationFailed)]
+    assert [e.repeat for e in failed] == [False] + [True] * (len(failed) - 1)
 
 
 def test_coding_waits_for_required_regression_file_after_first_green_edit(
@@ -1873,14 +1888,12 @@ def _check(tools: coding.ConfinedCodingTools, name: str) -> coding.ToolResult:
     return tools.execute(ToolExecutionRequest(ActionProposal(ActionId("c"), name, {}), 1, 5))
 
 
-def _checker(tmp_path: Path, result: coding.ToolResult, *, measured: bool = True) -> object:
-    tools = coding.ConfinedCodingTools(
+def _checker(tmp_path: Path, result: coding.ToolResult) -> object:
+    return coding.ConfinedCodingTools(
         cast("coding.CompositeToolExecutor", _CheckExecutor(result)),
         contract(),
         workspace(tmp_path),
     )
-    tools.measured_checks = measured
-    return tools
 
 
 FAILED_RUN = coding.ToolResult(
@@ -1930,10 +1943,6 @@ def test_broken_checks_still_count_as_tool_failures(
     assert _check(tools, "check_regression") == result
 
 
-def test_only_registered_checks_and_the_native_profile_are_affected(tmp_path: Path) -> None:
-    tools = cast("coding.ConfinedCodingTools", _checker(tmp_path / "a", FAILED_RUN))
+def test_only_registered_checks_are_measured(tmp_path: Path) -> None:
+    tools = cast("coding.ConfinedCodingTools", _checker(tmp_path, FAILED_RUN))
     assert _check(tools, "unregistered_command") == FAILED_RUN
-    legacy = cast(
-        "coding.ConfinedCodingTools", _checker(tmp_path / "b", FAILED_RUN, measured=False)
-    )
-    assert _check(legacy, "check_regression") == FAILED_RUN
