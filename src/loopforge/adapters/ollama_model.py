@@ -808,7 +808,7 @@ class OllamaModel:
             result = (
                 "\n".join(self._present(context.run_id, item) for item in observations)
                 if observations
-                else "No new observation was recorded for the proposed action."
+                else self._no_observation(pending)
             )
             new_items = [item for item in new_items if item not in observations]
             if self._history_replay == "exact" and new_items:
@@ -823,6 +823,16 @@ class OllamaModel:
         if new_items:
             lines = "\n".join(self._present(context.run_id, item) for item in new_items)
             history.append({"role": "user", "content": f"Runtime update:\n{lines}"})
+
+    def _no_observation(self, tool_name: str) -> str:
+        """Code-owned result for a proposal that produced no observation."""
+        names = [spec.name for spec in self._tools]
+        if tool_name not in names:
+            return (
+                f"Rejected: {tool_name!r} is not an available tool; no action executed. "
+                f"Available tools: {', '.join(names)}."
+            )
+        return "No new observation was recorded for the proposed action."
 
     def _present(self, run_id: RunId, item: ContextItem) -> str:
         """Code-owned item presentation inside the conversation (see observation_format)."""

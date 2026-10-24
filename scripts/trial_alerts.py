@@ -18,7 +18,7 @@ BUDGET = int(sys.argv[1]) if len(sys.argv) > 1 else 32768
 
 def main() -> None:
     schema: str | None = None
-    messages = 0
+    previous = 0
     for raw in sys.stdin:
         line = raw.strip()
         try:
@@ -31,14 +31,16 @@ def main() -> None:
             continue
         kind = event.get("event")
         if kind in {"trial_start", "trial_end"} or "verified_success" in event:
-            schema, messages = None, 0
+            schema, previous = None, 0
             print(line, flush=True)
             continue
         if kind != "model_call":
             continue
         flags = []
-        compacted = event.get("messages", 0) < messages
-        messages = event.get("messages", messages)
+        # Masking keeps the message count; a compaction shows as a smaller prompt.
+        prompt = event.get("prompt_tokens") or 0
+        compacted = 0 < prompt < previous
+        previous = prompt or previous
         decode = event.get("decode_tok_s")
         if decode is not None and decode < 20 and (event.get("output_tokens") or 0) > 32:
             flags.append(f"decode {decode} tok/s")

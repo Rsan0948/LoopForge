@@ -212,3 +212,30 @@ def test_compact_bookkeeping_still_shows_an_inherited_failure_and_the_empty_stat
     assert current_failure_text(None, None, compact=True) == (
         "No check failure recorded in this attempt yet"
     )
+
+
+def test_unknown_tool_proposal_is_answered_with_an_explicit_rejection() -> None:
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        name = "list_files" if len(requests) == 1 else "read_file"
+        return httpx.Response(
+            200,
+            json=_chat_payload(tool_calls=[{"function": {"name": name, "arguments": {}}}]),
+        )
+
+    requests: list[dict[str, object]] = []
+    model = OllamaModel(
+        model="m", tools=TOOLS, template=TEMPLATE, transport=httpx.MockTransport(respond)
+    )
+    model.propose_action(_context())
+    model.propose_action(_context())
+    tool = _tool_message(requests)
+    assert tool.startswith("Rejected: 'list_files' is not an available tool; no action executed.")
+    assert "read_file" in tool
+
+
+def test_known_tool_without_observation_keeps_the_neutral_notice() -> None:
+    model, requests = _native("delimited")
+    model.propose_action(_context())
+    model.propose_action(_context())
+    assert _tool_message(requests) == "No new observation was recorded for the proposed action."
