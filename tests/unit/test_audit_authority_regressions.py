@@ -350,7 +350,10 @@ def test_model_action_protocol_errors_are_distinct_from_provider_transport() -> 
         )
 
     assert worker_failure([failed("MODEL_INVALID_RESPONSE")]) == FailureKind.PROTOCOL
-    assert worker_failure([failed("MODEL_CONNECTION_ERROR")]) == FailureKind.PROVIDER
+    for transport in ("MODEL_UNAVAILABLE", "MODEL_TIMEOUT"):
+        assert worker_failure([failed(transport)]) == FailureKind.PROVIDER
+    # A code nobody mapped is reported as unknown, not guessed to be the provider.
+    assert worker_failure([failed("MODEL_CONNECTION_ERROR")]) == FailureKind.UNKNOWN
 
 
 @pytest.mark.parametrize("worker_started", [False, True])

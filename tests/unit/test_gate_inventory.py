@@ -9,6 +9,8 @@ import ast
 from pathlib import Path
 
 import loopforge
+from loopforge.application.failure_recovery import reason_kind
+from loopforge.domain.investigation import FailureKind
 
 SOURCE = Path(loopforge.__file__).parent
 
@@ -83,3 +85,22 @@ def test_every_permanent_wrapper_stop_is_inventoried() -> None:
             ):
                 found.add(code)
     assert found == set(WRAPPER_STOPS)
+
+
+def test_every_literal_reason_code_has_an_explicit_failure_kind() -> None:
+    codes: set[str] = set()
+    for path in SOURCE.rglob("*.py"):
+        for name in ("ModelTurnError", "RunGateStop"):
+            for call in _calls(path, name):
+                if len(call.args) < 2:
+                    continue
+                argument = call.args[1]
+                # A code chosen by a conditional, e.g. 'A' if x else 'B'.
+                options = (
+                    (argument.body, argument.orelse)
+                    if isinstance(argument, ast.IfExp)
+                    else (argument,)
+                )
+                codes.update(code for option in options if (code := _literal(option)))
+    unmapped = sorted(code for code in codes if reason_kind(code) is FailureKind.UNKNOWN)
+    assert unmapped == []
