@@ -254,3 +254,54 @@ cache. One cold trial per engine on the frozen full-a3b task; no supervisor or p
 Before the roadmap, the tuned matrix's Ollama cold trial timed out at 2,401 s, and the stopped
 final-matrix trial was at 11.7 tok/s by call 21 at 34K tokens. Each re-prefill after a compaction
 costs about 20–22 s on both engines (about 16K tokens at about 750 tok/s).
+
+## Cold/warm matrix on the final harness (`engine-matrix-v4-20261024-0106`)
+
+Commit `90ca564`, with the thrash fix (7.2) and partial-credit progress (7.1); f16 Ollama KV.
+The first attempt (`engine-matrix-v3-20261023-2147`) was stopped after 5 trials because it
+exposed the compaction thrash (its rep2-mlx-cold trial made 10 compactions and timed out). Its
+rows are kept below for reference.
+
+| trial | result | wall (s) | calls | max prompt | compactions | Ollama decode min / median (tok/s) | stop |
+|---|---|---|---|---|---|---|---|
+| rep1-ollama-cold | iteration cap | 2102 | 60 | 32,452 | 7 | 34.4 / 41.3 | STOP_MAX_ITERATIONS |
+| rep1-mlx-cold | **pass** | 247 | 20 | 25,972 | 1 | — | success |
+| rep1-mlx-warm | **pass** | 920 | 39 | 28,569 | 2 | — | success |
+| rep1-ollama-warm | **pass** | 863 | 28 | 26,150 | 3 | 32.3 / 42.2 | success |
+| rep2-mlx-cold | **pass** | 655 | 24 | 27,560 | 2 | — | success |
+| rep2-ollama-cold | **pass** | 275 | 26 | 24,486 | 1 | 37.9 / 47.7 | success |
+| rep2-ollama-warm | blocked | 759 | 32 | 30,389 | 2 | 35.8 / 44.7 | CODING_AUTOMATIC_CHECK_BLOCKED (harness defect, fixed in `70c6b64`) |
+| rep2-mlx-warm | stalled | 917 | 34 | 27,631 | 4 | — | STOP_STALLED_NO_PROGRESS (score oscillated 0.5–0.81) |
+
+v3 reference (pre-fix): rep1-ollama-cold pass 772 s; rep1-mlx-cold pass 305 s; rep1-mlx-warm
+stalled (coarse progress signal, fixed by 7.1); rep1-ollama-warm pass 343 s; rep2-mlx-cold
+cancelled at 2,421 s (compaction thrash, fixed by 7.2).
+
+**What the failures were.** None of the eight were infrastructure: no cache break, no prompt
+over the budget, no tool-schema change, and no Ollama call below 32 tok/s.
+- `rep2-ollama-warm` was a harness misclassification. A broken server made the launcher probe
+  time out, and the timeout was treated as an inconclusive infrastructure error. It is now a
+  measured failure (`70c6b64`).
+- The other two are model outcomes. `rep1-ollama-cold` used all 60 iterations with tests still
+  failing. `rep2-mlx-warm` oscillated between fixes and regressions until the no-progress limit.
+
+**Totals since the roadmap work** (smoke, v3 and v4 combined; the defect-caused failures are
+counted, not excused):
+
+| engine | runs | passed | pass wall times (s) |
+|---|---|---|---|
+| Ollama (f16) | 7 | 5 | 910, 772, 343, 863, 275 |
+| MLX | 9 | 6 | 744, 305, 247, 920, 655 |
+
+## Recommendation
+
+- **Both engines are now viable and close.** With the f16 cache, Ollama decodes at about 41–48 tok/s
+  median (always ≥ 32 tok/s); MLX decode is flat with depth (about 48–54 tok/s through 30K). Pass times
+  overlap (Ollama median about 772 s, MLX median 655 s); with n = 5–6 passes each, the difference
+  is within run-to-run variance.
+- **Keep Ollama for supervised and production runs now.** It is the production adapter path; MLX
+  runs only through the lab's agentic server wrapper and renderer oracle. Move to MLX only after a
+  production MLX adapter exists and passes the same matrix.
+- **The remaining failures are task-solving, not throughput.** The next lever is supervision:
+  Gemini guidance between attempts, which is what the full supervised trial (roadmap 6.6) tests.
+  That trial needs new spend authorization.
