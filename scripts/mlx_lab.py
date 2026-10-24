@@ -132,41 +132,11 @@ def server(
                 },
             ).raise_for_status()
     env = os.environ.copy()
-    env |= {
-        "HF_HUB_OFFLINE": "1",
-        "HF_HUB_DISABLE_TELEMETRY": "1",
-        "TOKENIZERS_PARALLELISM": "false",
-    }
+    env |= SERVER_ENV
     log = (LAB / "artifacts/server.log").open("a")
     try:
         return subprocess.Popen(
-            [
-                # agentic_cache: upstream server plus a cache checkpoint for
-                # tool-result turns (see scripts/mlx_server_agentic.py).
-                *(
-                    [str(LAB / ".venv/bin/python"), str(ROOT / "scripts/mlx_server_agentic.py")]
-                    if agentic_cache
-                    else [str(LAB / ".venv/bin/mlx_lm.server")]
-                ),
-                "--model",
-                info["local_path"],
-                *(["--chat-template", chat_template] if chat_template is not None else []),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                str(port),
-                "--max-tokens",
-                "512",
-                "--decode-concurrency",
-                "1",
-                "--prompt-concurrency",
-                "1",
-                "--prompt-cache-size",
-                "2",
-                "--prompt-cache-bytes",
-                "4294967296",
-                *extra_args,
-            ],
+            server_command(port, chat_template, agentic_cache=agentic_cache, extra_args=extra_args),
             cwd=ROOT,
             env=env,
             stdout=log,
@@ -175,6 +145,50 @@ def server(
         )
     finally:
         log.close()
+
+
+SERVER_ENV = {
+    "HF_HUB_OFFLINE": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "TOKENIZERS_PARALLELISM": "false",
+}
+
+
+def server_command(
+    port: int,
+    chat_template: str | None = None,
+    *,
+    agentic_cache: bool = False,
+    extra_args: tuple[str, ...] = (),
+) -> list[str]:
+    """The pinned server invocation, shared by lab runs and the launchd service."""
+    return [
+        # agentic_cache: upstream server plus a cache checkpoint for
+        # tool-result turns (see scripts/mlx_server_agentic.py).
+        *(
+            [str(LAB / ".venv/bin/python"), str(ROOT / "scripts/mlx_server_agentic.py")]
+            if agentic_cache
+            else [str(LAB / ".venv/bin/mlx_lm.server")]
+        ),
+        "--model",
+        model_info()["local_path"],
+        *(["--chat-template", chat_template] if chat_template is not None else []),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--max-tokens",
+        "512",
+        "--decode-concurrency",
+        "1",
+        "--prompt-concurrency",
+        "1",
+        "--prompt-cache-size",
+        "2",
+        "--prompt-cache-bytes",
+        "4294967296",
+        *extra_args,
+    ]
 
 
 def stop_server(proc: subprocess.Popen) -> None:

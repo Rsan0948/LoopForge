@@ -35,6 +35,7 @@ from pathlib import Path
 import httpx
 
 from loopforge.adapters.json_events import JsonEventCodec
+from loopforge.adapters.mlx_transport import lab_transport
 from loopforge.adapters.model_lease import ModelLease
 from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.sqlite_events import SQLiteEventStore
@@ -43,7 +44,6 @@ from loopforge.domain.types import RunStatus
 from loopforge.entrypoints import campaign_coding as coding
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
 from scripts import mlx_lab
-from scripts.run_mlx_comparison import native_response
 
 ROOT = Path(__file__).resolve().parents[1]
 TRIAL = ROOT / ".loopforge/tasks/reconciliation-forced-attempt/full-a3b-2026-10-23"
@@ -77,68 +77,6 @@ def sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def render(native: dict[str, object]) -> str:
-    out = subprocess.run(
-        [str(ORACLE)],
-        input=json.dumps(native),
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
-    return json.loads(out.stdout)["prompt"]
-
-
-def mlx_payload(native: dict[str, object], model_path: str) -> dict[str, object]:
-    """Ollama-rendered prompt plus OpenAI-shaped framing; tool results pair positionally."""
-    messages: list[dict[str, object]] = []
-    last_ids: list[str] = []
-    for i, original in enumerate(native["messages"]):  # type: ignore[arg-type]
-        message: dict[str, object] = {
-            "role": original["role"],
-            "content": original.get("content", ""),
-        }
-        if original["role"] == "assistant" and original.get("tool_calls"):
-            last_ids = []
-            calls = []
-            for j, call in enumerate(original["tool_calls"]):
-                last_ids.append(f"call_{i}_{j}")
-                calls.append(
-                    {
-                        "id": last_ids[-1],
-                        "type": "function",
-                        "function": {
-                            "name": call["function"]["name"],
-                            "arguments": json.dumps(call["function"].get("arguments", {})),
-                        },
-                    }
-                )
-            message["tool_calls"] = calls
-        if original["role"] == "tool":
-            message["name"] = original.get("tool_name", original.get("name"))
-            message["tool_call_id"] = last_ids.pop(0) if last_ids else f"orphan_{i}"
-        messages.append(message)
-    opts = native["options"]  # type: ignore[index]
-    return {
-        "model": model_path,
-        "messages": messages,
-        "tools": native.get("tools", []),
-        "stream": False,
-        "max_tokens": opts["num_predict"],
-        "temperature": opts["temperature"],
-        "top_p": opts["top_p"],
-        "top_k": opts["top_k"],
-        "min_p": opts["min_p"],
-        "presence_penalty": opts["presence_penalty"],
-        # Tuned (scripts/tune_engine_sampling.py): a 2048-token presence window gave shorter,
-        # far less variable reasoning on MLX with exact edit arguments intact. Ollama keeps
-        # its shipped window; changing repeat_last_n showed no clear effect there.
-        "presence_context_size": MLX_PRESENCE_CONTEXT,
-        "repetition_penalty": opts.get("repeat_penalty", 1.0),
-        "chat_template_kwargs": {"ollama_rendered_prompt": render(native)},
-    }
-
-
 def cache_metrics(engine: str, data: dict[str, object]) -> dict[str, object]:
     """Ollama reports prefill time; MLX reports cached prompt tokens."""
     if engine == "ollama":
@@ -148,9 +86,7 @@ def cache_metrics(engine: str, data: dict[str, object]) -> dict[str, object]:
             "prefill_s": round(prefill, 2),
             "decode_tok_s": round(data.get("eval_count", 0) / decode, 1) if decode else None,  # type: ignore[operator]
         }
-    usage = data.get("usage", {})
-    details = usage.get("prompt_tokens_details") or {}  # type: ignore[union-attr]
-    return {"cached_tokens": details.get("cached_tokens", 0)}  # type: ignore[union-attr]
+    return {"cached_tokens": data.get("prompt_eval_cached_count", 0)}
 
 
 class Transport(httpx.BaseTransport):
@@ -161,17 +97,15 @@ class Transport(httpx.BaseTransport):
         self.probe_calls = probe_calls
         self.calls = 0
         self.client = httpx.Client(trust_env=False)
-        self.model_path = mlx_lab.model_info()["local_path"] if engine == "mlx" else ""
+        # MLX runs through the production engine adapter; this wrapper only records.
+        self.mlx = lab_transport(mlx_lab.LAB) if engine == "mlx" else None
 
     def handle_request(self, request: httpx.Request) -> httpx.Response:
         if self.probe_calls is not None and self.calls >= self.probe_calls:
             raise TimeoutError("probe complete")
         self.calls += 1
         native = json.loads(request.content)
-        if self.engine == "mlx":
-            payload, url = mlx_payload(native, self.model_path), f"{MLX}/v1/chat/completions"
-        else:
-            payload, url = native, f"{OLLAMA}/api/chat"
+        url = f"{OLLAMA}/api/chat"
         record: dict[str, object] = {
             "engine": self.engine,
             "call": self.calls,
@@ -183,7 +117,13 @@ class Transport(httpx.BaseTransport):
             remaining = self.deadline - started
             if remaining <= 0:
                 raise TimeoutError("trial deadline reached")
-            response = self.client.post(url, json=payload, timeout=min(1200, remaining))
+            if self.mlx is not None:
+                timeout = min(1200, remaining)
+                request.extensions["timeout"] = httpx.Timeout(timeout).as_dict()
+                response = self.mlx.handle_request(request)
+                response.read()
+            else:
+                response = self.client.post(url, json=native, timeout=min(1200, remaining))
             record |= {
                 "http_status": response.status_code,
                 "wall_seconds": time.monotonic() - started,
@@ -193,7 +133,7 @@ class Transport(httpx.BaseTransport):
                 return httpx.Response(response.status_code, content=response.content)
             data = response.json()
             record["response"] = data
-            normalized = native_response(data) if self.engine == "mlx" else data
+            normalized = data
             calls = normalized.get("message", {}).get("tool_calls", [])
             print(
                 json.dumps(
@@ -223,6 +163,8 @@ class Transport(httpx.BaseTransport):
 
     def close(self) -> None:
         self.client.close()
+        if self.mlx is not None:
+            self.mlx.close()
 
 
 def task_inputs():
@@ -357,8 +299,49 @@ def warm_ollama() -> dict[str, object]:
     }
 
 
-def start_mlx(extra_args: tuple[str, ...] = ()) -> tuple[subprocess.Popen[bytes], float]:
+def mlx_service(action: str) -> bool:
+    """Drive the launchd MLX service (scripts/mlx_service.py) if it is installed.
+
+    A restart empties the prompt cache, so "cold" means the same thing for both engines.
+    Ollama trials run with the service stopped, so both engines see the same free memory.
+    """
+    plist = Path.home() / "Library/LaunchAgents/local.loopforge.mlx.plist"
+    if not plist.exists():
+        return False
+    target = f"gui/{os.getuid()}"
+    if action == "stop":
+        subprocess.run(["launchctl", "bootout", target, str(plist)], check=False, timeout=60)
+        return True
+    loaded = subprocess.run(
+        ["launchctl", "print", f"{target}/local.loopforge.mlx"],
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    if loaded.returncode == 0:
+        subprocess.run(
+            ["launchctl", "kickstart", "-k", f"{target}/local.loopforge.mlx"],
+            check=True,
+            timeout=60,
+        )
+    else:
+        subprocess.run(["launchctl", "bootstrap", target, str(plist)], check=True, timeout=60)
+    return True
+
+
+def start_mlx(
+    extra_args: tuple[str, ...] = (),
+) -> tuple[subprocess.Popen[bytes] | None, float]:
     started = time.monotonic()
+    if not extra_args and mlx_service("restart"):
+        while time.monotonic() < started + 300:
+            try:
+                if httpx.get(f"{MLX}/v1/models", timeout=2, trust_env=False).is_success:
+                    return None, time.monotonic() - started
+            except httpx.HTTPError:
+                pass
+            time.sleep(1)
+        raise TimeoutError("MLX service startup timeout")
     provider = mlx_lab.server(
         True,
         18181,
@@ -389,9 +372,12 @@ def warm_mlx() -> dict[str, object]:
         "think": False,
         "options": {**native_options(), "num_predict": 8},
     }
-    payload = mlx_payload(native, mlx_lab.model_info()["local_path"])
-    with httpx.Client(timeout=900, trust_env=False) as client:
-        client.post(f"{MLX}/v1/chat/completions", json=payload).raise_for_status()
+    transport = lab_transport(mlx_lab.LAB)
+    try:
+        with httpx.Client(transport=transport, timeout=900) as client:
+            client.post(f"{OLLAMA}/api/chat", json=native).raise_for_status()
+    finally:
+        transport.close()
     return {"warmup_seconds": time.monotonic() - started}
 
 
@@ -439,7 +425,7 @@ def ollama_kv_cache_type() -> str | None:
     return out.stdout.strip() or None
 
 
-def run(output: Path, only: str | None, *, smoke: bool = False) -> None:
+def run(output: Path, only: str | None, *, smoke: bool = False) -> None:  # noqa: PLR0912 - sequential trial schedule
     output = output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     pinned = [
@@ -495,6 +481,8 @@ def run(output: Path, only: str | None, *, smoke: bool = False) -> None:
             started = time.monotonic()
             try:
                 unload_ollama()
+                if engine == "ollama":
+                    mlx_service("stop")
                 if engine == "mlx":
                     provider, ready = start_mlx()
                     prep["server_ready_seconds"] = ready
@@ -569,6 +557,7 @@ def run(output: Path, only: str | None, *, smoke: bool = False) -> None:
                 flush=True,
             )
     finally:
+        mlx_service("start")  # Leave the production engine running.
         lease.release()
 
 
