@@ -15,13 +15,13 @@ from pathlib import Path
 
 import httpx
 
-from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
+from loopforge.adapters.gemini_supervisor import load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
 from loopforge.adapters.mlx_transport import lab_transport, mlx_ready
 from loopforge.entrypoints.campaign_coding import preflight
+from loopforge.entrypoints.goal_bootstrap import DEFAULT_KEY_FILE, drive_goal
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
-from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
-from loopforge.entrypoints.supervisor import GOAL, PreparedGoalConfig, PreparedGoalService
+from loopforge.entrypoints.supervisor import GOAL, PreparedGoalConfig
 
 
 def runner_record(directory: Path) -> dict[str, object]:
@@ -78,7 +78,7 @@ def dependencies(directory: Path) -> None:
                 msg = "Configured local model is unavailable"
                 raise ValueError(msg)
     if config.remote_data != "none":
-        load_gemini_key(Path(".loopforge/secrets.env"))
+        load_gemini_key(DEFAULT_KEY_FILE)
 
 
 class GoalExecutionService:
@@ -195,41 +195,7 @@ class GoalExecutionService:
                         return
                 self.stop.wait(1)
 
-    @staticmethod
-    def _drive(directory: Path, stop: threading.Event) -> str | None:
-        service = (
-            RepositoryGoalService(directory)
-            if (directory / "repository-intake.json").exists()
-            else PreparedGoalService(directory)
-        )
-        supervisor = None
-        try:
-            service.harness.nonblocking_goals = True
-            service.harness.operator_stop = stop
-            service.worker().recover_interrupted()
-            initial = service.journal.load(GOAL)
-            if initial.terminal:
-                return None
-            if initial.paused or initial.late_answer_conflict:
-                return "waiting"
-            supervisor = GeminiSupervisor(load_gemini_key(Path(".loopforge/secrets.env")))
-            coordinator = service.coordinator(supervisor)
-            while not stop.is_set():
-                before = service.journal.load(GOAL)
-                state = coordinator.step(GOAL)
-                if state.terminal:
-                    return None
-                if (
-                    state.paused
-                    or state.late_answer_conflict
-                    or (
-                        state.sequence == before.sequence
-                        and state.observation.status not in {"coding", "reviewing", "queued"}
-                    )
-                ):
-                    return "waiting"
-                stop.wait(1)
-        finally:
-            if supervisor:
-                supervisor.close()
-            service.close()
+    def _drive(self, directory: Path, stop: threading.Event) -> str | None:
+        # A shared queue yields idle goals so other armed goals are served; a
+        # dedicated runner keeps driving its one goal until it needs a person.
+        return drive_goal(directory, stop, yield_when_idle=self.only is None)

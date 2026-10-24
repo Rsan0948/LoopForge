@@ -1,10 +1,9 @@
 """One-command unattended goal: create, arm a dedicated runner, drive to a terminal state.
 
-This is the trial runners' validated composition (`.loopforge/tasks/*/run.py`) as a
-product command. A runner dedicated to this goal never drives another armed goal under
-the same root. Supervisor prompts and worker requests are recorded beside the goal for
-review. The paid ceiling is the intake's own frozen `max_cost_microusd`; this command
-cannot raise it.
+A runner dedicated to this goal never drives another armed goal under the same root.
+The supervisor, recording and evidence wiring come from goal_bootstrap, shared with the
+console's execution service. The paid ceiling is the intake's own frozen
+`max_cost_microusd`; this command cannot raise it.
 
 Usage: loopforge-repository-supervisor launch --directory DIR [--config INTAKE.json]
 """
@@ -15,72 +14,12 @@ import threading
 from pathlib import Path
 from types import FrameType
 
-from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
-from loopforge.adapters.research_store import ResearchStore
-from loopforge.domain.goals import GoalState
-from loopforge.entrypoints.autonomy_qualification import RecordedSupervisor
 from loopforge.entrypoints.goal_review import morning_report
 from loopforge.entrypoints.goal_runner import GoalExecutionService, runner_record
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
 from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
 from loopforge.entrypoints.supervisor import GOAL
-
-KEY_PATH = Path(".loopforge/secrets.env")
-
-
-def recorded_drive(directory: Path, stop: threading.Event) -> str | None:
-    """Drive one goal with request capture, as the delivered trials did."""
-    service = RepositoryGoalService(directory)
-    provider = None
-    try:
-        service.harness.nonblocking_goals = True
-        service.harness.operator_stop = stop
-        service.harness.provider_request_directory = directory / "worker-prompts"
-        service.worker().recover_interrupted()
-        state = service.journal.load(GOAL)
-        if state.terminal:
-            return None
-        if state.paused or state.late_answer_conflict:
-            return "waiting"
-        provider = GeminiSupervisor(
-            load_gemini_key(KEY_PATH),
-            count_tokens=True,
-            diagnostics=directory / "supervisor-diagnostics",
-        )
-        # The coordinator attaches the store only to a bare GeminiSupervisor, not to the
-        # recording wrapper; without it Gemini saw 2,000-byte excerpts and paged source.
-        provider.evidence_store = ResearchStore(service.journal)
-        coordinator = service.coordinator(
-            RecordedSupervisor(provider, directory / "supervisor-prompts")
-        )
-        while not stop.is_set():
-            before = service.journal.load(GOAL)
-            state = coordinator.step(GOAL)
-            if state.sequence != before.sequence:
-                print(json.dumps(progress(state)), flush=True)
-            if state.terminal:
-                return None
-            if state.paused or state.late_answer_conflict:
-                return "waiting"
-            stop.wait(1)
-    finally:
-        if provider:
-            provider.close()
-        service.close()
-    return None
-
-
-def progress(state: GoalState) -> dict[str, object]:
-    return {
-        "sequence": state.sequence,
-        "phase": state.phase,
-        "decisions": state.decisions,
-        "action": state.decision.action if state.decision else None,
-        "worker": state.observation.status,
-        "spent_microusd": state.spent_microusd,
-        "summary": state.summary,
-    }
 
 
 def launch(directory: Path, config: Path | None, *, poll_seconds: float = 2) -> dict[str, object]:
@@ -98,7 +37,7 @@ def launch(directory: Path, config: Path | None, *, poll_seconds: float = 2) -> 
         msg = "The goal already exists; its frozen intake cannot be replaced"
         raise ValueError(msg)
     stop = threading.Event()
-    runner = GoalExecutionService(directory.parent, drive=recorded_drive, only=directory)
+    runner = GoalExecutionService(directory.parent, only=directory)
 
     def interrupt(_signum: int, _frame: FrameType | None) -> None:
         stop.set()

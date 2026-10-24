@@ -15,7 +15,6 @@ from typing import Literal, cast
 from pydantic import Field, model_validator
 
 from loopforge.adapters.acceptance_receipts import decode_acceptance
-from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.research_store import ResearchStore
@@ -33,11 +32,11 @@ from loopforge.domain.investigation import FailureKind
 from loopforge.domain.types import ActionId
 from loopforge.entrypoints.campaign_coding import local_git_bytes
 from loopforge.entrypoints.campaign_models import StrictRecord
+from loopforge.entrypoints.goal_bootstrap import GoalWiring, wire
 from loopforge.entrypoints.goal_review import morning_report
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
 from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
 from loopforge.entrypoints.supervisor import GOAL
-from loopforge.ports.supervisor import SupervisorRequest, SupervisorResponse
 
 
 class QualificationCase(StrictRecord):
@@ -234,24 +233,6 @@ def qualification_passed(plan: QualificationPlan, results: list[dict[str, object
     )
 
 
-class RecordedSupervisor:
-    def __init__(self, delegate: GeminiSupervisor, directory: Path) -> None:
-        self.delegate, self.directory = delegate, directory
-        directory.mkdir(parents=True, exist_ok=True)
-
-    def prepare(self, state: GoalState) -> SupervisorRequest:
-        request = self.delegate.prepare(state)
-        path = self.directory / f"{state.sequence}.json"
-        if path.exists() and path.read_text() != request.body:
-            msg = "Recorded prompt changed"
-            raise ValueError(msg)
-        path.write_text(request.body)
-        return request
-
-    def decide(self, request: SupervisorRequest) -> SupervisorResponse:
-        return self.delegate.decide(request)
-
-
 def qualify(plan: QualificationPlan, directory: Path, key_file: Path) -> dict[str, object]:
     if directory.exists():
         msg = "Live qualification requires a fresh artifact directory"
@@ -265,18 +246,13 @@ def qualify(plan: QualificationPlan, directory: Path, key_file: Path) -> dict[st
         for repeat in range(plan.repetitions):
             root = directory / f"{case.name}-{repeat + 1}"
             service = RepositoryGoalService(root)
-            provider = None
+            stack = None
             started = time.monotonic()
             try:
                 state = service.create(case.intake)
-                service.harness.nonblocking_goals = True
-                service.harness.provider_request_directory = root / "worker-prompts"
                 timed_out = False
-                provider = GeminiSupervisor(load_gemini_key(key_file))
-                provider.evidence_store = ResearchStore(service.journal)
-                coordinator = service.coordinator(
-                    RecordedSupervisor(provider, root / "supervisor-prompts")
-                )
+                stack = wire(service, GoalWiring(key_file=key_file))
+                coordinator = stack.coordinator
                 while not state.terminal:
                     if time.monotonic() - started > case.intake.max_goal_seconds:
                         timed_out = True
@@ -307,8 +283,8 @@ def qualify(plan: QualificationPlan, directory: Path, key_file: Path) -> dict[st
                     }
                 )
             finally:
-                if provider:
-                    provider.close()
+                if stack is not None:
+                    stack.close()
                 service.close()
             (directory / "results.json").write_text(json.dumps(results, indent=2))
     passed = qualification_passed(plan, results)

@@ -19,7 +19,8 @@ from loopforge.entrypoints.campaign_models import (
     CodingCheck,
     CodingTaskConfig,
 )
-from loopforge.entrypoints.supervisor import GOAL, PreparedGoalConfig, PreparedGoalService, main
+from loopforge.entrypoints.goal_commands import prepared_main as main
+from loopforge.entrypoints.supervisor import GOAL, PreparedGoalConfig, PreparedGoalService
 
 
 @pytest.fixture

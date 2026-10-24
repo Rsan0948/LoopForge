@@ -18,7 +18,6 @@ import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, WithJsonSchema
 from pydantic_core import ErrorDetails
 
-from loopforge.adapters.research_store import ResearchStore
 from loopforge.adapters.working_evidence import working_evidence
 from loopforge.domain.goal_review import ClarificationRequest
 from loopforge.domain.goals import GoalAction, GoalState, SupervisorDecision, goal_allowed_actions
@@ -29,6 +28,7 @@ from loopforge.domain.investigation import (
     TaskAssignment,
 )
 from loopforge.ports.supervisor import (
+    EvidenceStorePort,
     SupervisorFailure,
     SupervisorRequest,
     SupervisorResponse,
@@ -213,7 +213,7 @@ class GeminiSupervisor:
         self._working_evidence_bytes = working_evidence_bytes
         self._count_tokens = count_tokens is True
         self.diagnostics = diagnostics
-        self.evidence_store: ResearchStore | None = None
+        self.evidence_store: EvidenceStorePort | None = None
         self._api_key = api_key
         self.client = client or httpx.Client(timeout=httpx.Timeout(120), trust_env=False)
         self._owns_client = client is None
@@ -221,6 +221,9 @@ class GeminiSupervisor:
     def close(self) -> None:
         if self._owns_client:
             self.client.close()
+
+    def attach_evidence(self, store: EvidenceStorePort) -> None:
+        self.evidence_store = store
 
     def prepare(self, state: GoalState) -> SupervisorRequest:  # noqa: PLR0912, PLR0915 - bounded request assembly
         policy = state.policy

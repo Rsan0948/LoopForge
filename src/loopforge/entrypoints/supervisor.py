@@ -1,18 +1,13 @@
 """Prepared durable goal CLI: intake, unattended run, status and cancellation."""
 
-import argparse
 import hashlib
-import json
 import os
-import time
-from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal, cast
 
 from pydantic import Field, SerializerFunctionWrapHandler, model_serializer, model_validator
 
-from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
 from loopforge.adapters.paid_budget import SQLitePaidBudget
 from loopforge.adapters.research_store import ResearchStore
@@ -26,7 +21,11 @@ from loopforge.entrypoints.goal_budget import paid_root
 from loopforge.entrypoints.goal_guidance import worker_guidance
 from loopforge.entrypoints.goal_worker import CampaignGoalWorker
 from loopforge.ports.clock import ClockPort
-from loopforge.ports.supervisor import ManagedGoalWorkerPort, SupervisorPort
+from loopforge.ports.supervisor import (
+    EvidenceAwareSupervisorPort,
+    ManagedGoalWorkerPort,
+    SupervisorPort,
+)
 
 GOAL = "prepared-goal"
 
@@ -99,6 +98,9 @@ class BaseGoalService:
         self.harness.close()
 
     def worker(self) -> ManagedGoalWorkerPort:
+        raise NotImplementedError
+
+    def coordinator(self, supervisor: SupervisorPort) -> GoalCoordinator:
         raise NotImplementedError
 
     def cancel(self) -> GoalState:
@@ -217,8 +219,8 @@ class PreparedGoalService(BaseGoalService):
         return worker
 
     def coordinator(self, supervisor: SupervisorPort) -> GoalCoordinator:
-        if isinstance(supervisor, GeminiSupervisor):
-            supervisor.evidence_store = ResearchStore(self.journal)
+        if isinstance(supervisor, EvidenceAwareSupervisorPort):
+            supervisor.attach_evidence(ResearchStore(self.journal))
         return GoalCoordinator(
             self.journal,
             BudgetedSupervisor(supervisor, self.paid_budget()),
@@ -227,69 +229,8 @@ class PreparedGoalService(BaseGoalService):
         )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "command",
-        choices=(
-            "create",
-            "run",
-            "status",
-            "cancel",
-            "pause",
-            "resume",
-            "report",
-            "accept",
-            "discard",
-        ),
-    )
-    parser.add_argument("--directory", type=Path, default=Path(".loopforge/supervisor"))
-    parser.add_argument("--config", type=Path)
-    parser.add_argument("--key-file", type=Path)
-    args = parser.parse_args()
-    if args.command in {"pause", "resume", "report", "accept", "discard"}:
-        from loopforge.entrypoints.goal_review import review_command  # noqa: PLC0415
-
-        print(json.dumps(review_command(args.directory, args.command), indent=2))
-        return
-    if args.command == "status":
-        state = SQLiteGoalJournal(args.directory / "goals.sqlite").load(GOAL)
-        print(json.dumps(asdict(state), indent=2))
-        return
-    service = PreparedGoalService(args.directory)
-    supervisor = None
-    try:
-        if args.command == "create":
-            if args.config is None:
-                parser.error("create requires --config with an operator-prepared contract")
-            state = service.create(PreparedGoalConfig.model_validate_json(args.config.read_text()))
-        elif args.command == "cancel":
-            state = service.cancel()
-        else:
-            supervisor = GeminiSupervisor(load_gemini_key(args.key_file))
-            coordinator = service.coordinator(supervisor)
-            state = service.journal.load(GOAL)
-            while not state.terminal:
-                state = coordinator.step(GOAL)
-                print(
-                    json.dumps(
-                        {
-                            "phase": state.phase,
-                            "spent_microusd": state.spent_microusd,
-                            "reserved_microusd": state.reserved_microusd,
-                            "summary": state.summary,
-                        }
-                    ),
-                    flush=True,
-                )
-                if not state.terminal:
-                    time.sleep(1)
-        print(json.dumps(asdict(state), indent=2))
-    finally:
-        if supervisor is not None:
-            supervisor.close()
-        service.close()
-
-
 if __name__ == "__main__":
-    main()
+    # The command line itself lives in goal_commands.
+    from loopforge.entrypoints.goal_commands import prepared_main
+
+    prepared_main()

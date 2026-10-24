@@ -25,7 +25,7 @@ from loopforge.domain.goals import AssignmentVersion, GoalCreated, GoalEvent, Go
 from loopforge.domain.investigation import TaskAssignment
 from loopforge.domain.workspace import FixtureFile, FixtureSpec
 from loopforge.entrypoints import autonomy_qualification as qualification
-from loopforge.entrypoints import goal_review, goal_runner
+from loopforge.entrypoints import goal_bootstrap, goal_review, goal_runner
 from loopforge.entrypoints.campaign_models import (
     AcceptanceProbe,
     CampaignConfig,
@@ -40,8 +40,9 @@ def no_action(_value: object = None) -> None:
     pass
 
 
-def offline_provider(_key: str) -> SimpleNamespace:
-    return SimpleNamespace(close=no_action)
+def offline_provider(_key: str, **_wiring: object) -> SimpleNamespace:
+    # Stands in for an attached provider; the bootstrap requires the evidence store.
+    return SimpleNamespace(close=no_action, evidence_store="offline-evidence")
 
 
 def offline_key(_path: Path | None) -> str:
@@ -166,9 +167,9 @@ def test_service_yields_idle_goal_and_runs_next_armed_goal(
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(goal_runner, "PreparedGoalService", Service)
-    monkeypatch.setattr(goal_runner, "GeminiSupervisor", offline_provider)
-    monkeypatch.setattr(goal_runner, "load_gemini_key", offline_key)
+    monkeypatch.setattr(goal_bootstrap, "PreparedGoalService", Service)
+    monkeypatch.setattr(goal_bootstrap, "GeminiSupervisor", offline_provider)
+    monkeypatch.setattr(goal_bootstrap, "load_gemini_key", offline_key)
     for name in ["a-idle", "b-ready"]:
         directory = tmp_path / name
         directory.mkdir()
@@ -343,7 +344,7 @@ def test_paused_qualification_reaches_frozen_timeout_without_model_calls(
     class Service:
         def __init__(self, root: Path) -> None:
             root.mkdir()
-            self.root = root
+            self.root = self.directory = root
             self.harness = SimpleNamespace()
             self.journal = SQLiteGoalJournal(root / "goals.sqlite")
 
@@ -365,8 +366,8 @@ def test_paused_qualification_reaches_frozen_timeout_without_model_calls(
         qualification, "time", SimpleNamespace(monotonic=lambda: next(ticks), sleep=no_action)
     )
     monkeypatch.setattr(qualification, "RepositoryGoalService", Service)
-    monkeypatch.setattr(qualification, "GeminiSupervisor", offline_provider)
-    monkeypatch.setattr(qualification, "load_gemini_key", offline_key)
+    monkeypatch.setattr(goal_bootstrap, "GeminiSupervisor", offline_provider)
+    monkeypatch.setattr(goal_bootstrap, "load_gemini_key", offline_key)
 
     def fake_metrics(
         _root: Path, _state: GoalState, _case: qualification.QualificationCase

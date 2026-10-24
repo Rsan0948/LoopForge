@@ -17,9 +17,11 @@ from loopforge.domain.goal_review import ControlRequested, QuestionAnswered, Rev
 from loopforge.domain.goals import reduce_goal
 from loopforge.entrypoints.campaign_coding import patch_identity
 from loopforge.entrypoints.campaign_models import CodingCommand, StrictRecord
+from loopforge.entrypoints.goal_bootstrap import goal_service
 from loopforge.entrypoints.goal_budget import paid_root
 from loopforge.entrypoints.goal_runner import runner_record
-from loopforge.entrypoints.supervisor import GOAL, PreparedGoalConfig, PreparedGoalService
+from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
+from loopforge.entrypoints.supervisor import GOAL, PreparedGoalConfig
 
 
 class AcceptedWorkerReceipt(StrictRecord):
@@ -140,13 +142,7 @@ def review_command(
 
 
 def _dispose(directory: Path, command: str) -> dict[str, object]:
-    from loopforge.entrypoints.repository_supervisor import RepositoryGoalService  # noqa: PLC0415
-
-    service = (
-        RepositoryGoalService(directory)
-        if (directory / "repository-intake.json").is_file()
-        else PreparedGoalService(directory)
-    )
+    service = goal_service(directory)
     try:
         worker = None
         if command == "accept":

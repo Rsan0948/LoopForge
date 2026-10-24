@@ -40,6 +40,21 @@ class SupervisorPort(Protocol):
     def decide(self, request: SupervisorRequest) -> SupervisorResponse: ...
 
 
+class EvidenceStorePort(Protocol):
+    """Original evidence by identity, and worker artifacts too large to inline."""
+
+    def original(self, record_id: str) -> str: ...
+    def publish_worker(self, raw: str, revision: str, candidate: str) -> ResearchRecord: ...
+
+
+@runtime_checkable
+class EvidenceAwareSupervisorPort(SupervisorPort, Protocol):
+    """A supervisor that reads original evidence. Decorators must forward attachment,
+    otherwise the provider silently falls back to bounded excerpts."""
+
+    def attach_evidence(self, store: EvidenceStorePort) -> None: ...
+
+
 class GoalJournalPort(Protocol):
     def load(self, goal: str) -> GoalState: ...
     def append(self, goal: str, sequence: int, event: GoalEvent) -> GoalState: ...

@@ -1,14 +1,9 @@
 """Repository-goal composition over the durable coordinator and local worker."""
 
-import argparse
 import json
 import os
-import time
-from dataclasses import asdict
 from pathlib import Path
 
-from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
-from loopforge.adapters.goal_journal import SQLiteGoalJournal
 from loopforge.adapters.research_store import ResearchStore
 from loopforge.application.paid_supervisor import BudgetedSupervisor
 from loopforge.application.supervisor import GoalCoordinator
@@ -21,7 +16,7 @@ from loopforge.entrypoints.goal_investigation import RepositoryInvestigation
 from loopforge.entrypoints.goal_worker import CampaignGoalWorker
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig, repository_binding
 from loopforge.entrypoints.supervisor import GOAL, BaseGoalService
-from loopforge.ports.supervisor import SupervisorPort
+from loopforge.ports.supervisor import EvidenceAwareSupervisorPort, SupervisorPort
 
 
 class RepositoryGoalWorker:
@@ -257,8 +252,8 @@ class RepositoryGoalService(BaseGoalService):
 
     def coordinator(self, supervisor: SupervisorPort) -> GoalCoordinator:
         worker = self.worker()
-        if isinstance(supervisor, GeminiSupervisor):
-            supervisor.evidence_store = ResearchStore(self.journal)
+        if isinstance(supervisor, EvidenceAwareSupervisorPort):
+            supervisor.attach_evidence(ResearchStore(self.journal))
         return GoalCoordinator(
             self.journal,
             BudgetedSupervisor(supervisor, self.paid_budget()),
@@ -268,89 +263,8 @@ class RepositoryGoalService(BaseGoalService):
         )
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "command",
-        choices=(
-            "create",
-            "run",
-            "status",
-            "cancel",
-            "pause",
-            "resume",
-            "answer",
-            "report",
-            "accept",
-            "discard",
-            "launch",
-        ),
-    )
-    parser.add_argument("--directory", type=Path, default=Path(".loopforge/repository-supervisor"))
-    parser.add_argument("--config", type=Path)
-    parser.add_argument("--key-file", type=Path)
-    parser.add_argument("--topic")
-    parser.add_argument("--answer")
-    args = parser.parse_args()
-    if args.command in {"pause", "resume", "answer", "report", "accept", "discard", "cancel"}:
-        from loopforge.entrypoints.goal_review import review_command  # noqa: PLC0415
-
-        print(
-            json.dumps(
-                review_command(args.directory, args.command, args.topic, args.answer), indent=2
-            )
-        )
-        return
-    if args.command == "launch":
-        from loopforge.entrypoints.goal_launch import launch  # noqa: PLC0415
-
-        print(json.dumps(launch(args.directory, args.config), indent=2))
-        return
-    if args.command == "status":
-        print(
-            json.dumps(
-                asdict(SQLiteGoalJournal(args.directory / "goals.sqlite").load(GOAL)), indent=2
-            )
-        )
-        return
-    service = RepositoryGoalService(args.directory)
-    supervisor = None
-    try:
-        if args.command == "create":
-            if args.config is None:
-                parser.error("create requires --config with a trusted repository policy")
-            state = service.create(
-                RepositoryGoalConfig.model_validate_json(args.config.read_text())
-            )
-        elif args.command == "cancel":
-            state = service.cancel()
-        else:
-            supervisor = GeminiSupervisor(load_gemini_key(args.key_file))
-            coordinator = service.coordinator(supervisor)
-            state = service.journal.load(GOAL)
-            while not state.terminal:
-                state = coordinator.step(GOAL)
-                print(
-                    json.dumps(
-                        {
-                            "phase": state.phase,
-                            "worker": state.observation.status,
-                            "environment": state.environment_id,
-                            "research_records": len(state.research),
-                            "spent_microusd": state.spent_microusd,
-                            "summary": state.summary,
-                        }
-                    ),
-                    flush=True,
-                )
-                if not state.terminal:
-                    time.sleep(1)
-        print(json.dumps(asdict(state), indent=2))
-    finally:
-        if supervisor:
-            supervisor.close()
-        service.close()
-
-
 if __name__ == "__main__":
-    main()
+    # Documented entry point; the command line itself lives in goal_commands.
+    from loopforge.entrypoints.goal_commands import repository_main
+
+    repository_main()
