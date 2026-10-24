@@ -750,3 +750,26 @@ def test_baseline_measurement_uses_the_frozen_coding_sandbox_limits(
         instance.close()
     assert observed
     assert set(observed) == {open_files}
+
+
+def test_baseline_excerpt_puts_failing_checks_first_and_keeps_the_full_record() -> None:
+    from loopforge.entrypoints.goal_investigation import failures_first  # noqa: PLC0415
+
+    raw = json.dumps(
+        {
+            "environment": "env",
+            "revision": "r",
+            "outcomes": [
+                {"name": "check_documents", "passed": True, "stdout": "PDF text " * 500},
+                {"name": "check_project", "passed": False, "stdout": "E  assert 422 == 409"},
+            ],
+        }
+    )
+    excerpt = failures_first(raw)
+    assert excerpt.encode()[:2000].decode().count("assert 422 == 409") == 1
+    assert "PDF text" not in excerpt
+    data = json.loads(excerpt)
+    assert [o["name"] for o in data["outcomes"]] == ["check_project", "check_documents"]
+    assert data["outcomes"][1] == {"name": "check_documents", "passed": True}
+    # Nothing is lost: the stored record is the unchanged raw output.
+    assert json.loads(raw)["outcomes"][0]["stdout"].startswith("PDF text")

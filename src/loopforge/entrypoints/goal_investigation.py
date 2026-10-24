@@ -6,6 +6,7 @@ import time
 from collections.abc import Callable
 from dataclasses import asdict
 from pathlib import Path
+from typing import cast
 
 from loopforge.adapters.container_sandbox import ContainerSandbox, ContainerSandboxConfig
 from loopforge.adapters.local_sandbox import CommandSpec
@@ -32,6 +33,28 @@ MAX_ARTIFACT_BYTES = 262_144
 
 def within(path: str, scopes: list[str]) -> bool:
     return any(path == scope or path.startswith(scope.rstrip("/") + "/") for scope in scopes)
+
+
+def failures_first(raw: str) -> str:
+    """The baseline excerpt the supervisor sees: failing checks first, passing output omitted.
+
+    The record keeps the complete output; this only orders the bounded excerpt. A passing
+    check's output (for example nine PDF text dumps) otherwise filled the excerpt, and the
+    supervisor spent paid decisions paging to reach the failing check (live, 2026-10-24).
+    """
+    data = cast("dict[str, object]", json.loads(raw))
+    outcomes = cast("list[dict[str, object]]", data["outcomes"])
+    failing = [o for o in outcomes if not o["passed"]]
+    passing = [{"name": o["name"], "passed": True} for o in outcomes if o["passed"]]
+    return json.dumps(
+        {
+            **data,
+            "excerpt_note": "Failing checks first; passing checks' output is omitted here "
+            "and kept in the full record.",
+            "outcomes": failing + passing,
+        },
+        indent=2,
+    )
 
 
 class RepositoryInvestigation:
@@ -257,7 +280,7 @@ class RepositoryInvestigation:
                 "baseline",
                 environment.environment_id,
                 raw,
-                raw[:8000],
+                failures_first(raw),
                 environment_id=environment.environment_id,
                 baseline_reproduced=behavior_failed
                 or (passed and self.config.task.kind != "bugfix"),
