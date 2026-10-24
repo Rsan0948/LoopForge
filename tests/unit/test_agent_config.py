@@ -76,7 +76,6 @@ def test_composition_follows_the_profile_record(
     assert ("format_python_imports" in tools) is record.import_formatter
     assert isinstance(runtime.tools, coding.ConfinedCodingTools)
     assert isinstance(runtime.verifier, coding.CodingVerifier)
-    assert runtime.verifier.construction_credit is record.construction_credit
     assert runtime.verifier.app_workload is record.app_reporting
     assert runtime.verifier.bounded_reporting is record.bounded_reporting
 

@@ -22,6 +22,7 @@ Everything in this module is code-owned workload authority:
 
 from __future__ import annotations
 
+import ast
 import math
 import re
 from dataclasses import dataclass, replace
@@ -340,12 +341,14 @@ class RepairVerifier:
             skipped = ", ".join(result.resource_limits_skipped)
             detail += f"; resource limits not enforced by this platform: {skipped}"
         passed = result.succeeded and completed
-        return CheckOutcome(
-            name=f"command:{name}",
-            passed=passed,
-            detail=detail,
-            partial=None if passed else pytest_partial(result.stdout),
-        )
+        partial = None
+        if not passed:
+            partial = (
+                pytest_partial(result.stdout)
+                if source is None
+                else acceptance_partial(source, result.stderr)
+            )
+        return CheckOutcome(name=f"command:{name}", passed=passed, detail=detail, partial=partial)
 
     def _patch_outcome(self) -> CheckOutcome:
         constraints = self._criteria.patch
@@ -622,6 +625,82 @@ def _path_allowed(path: str, allowed_prefixes: tuple[str, ...]) -> bool:
 
 
 _PROBE_FRAME = re.compile(r'File "<trusted-acceptance>", line (\d+)')
+# A real traceback frame line, anchored at its line start; text inside an exception
+# message on the same line as other text does not match.
+_PROBE_MODULE_FRAME = re.compile(
+    r'^  File "<trusted-acceptance>", line (\d+), in <module>$', re.MULTILINE
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceItem:
+    """One assertion of a frozen acceptance probe, scored by the harness."""
+
+    line: int
+    text: str
+    passed: bool
+
+
+def acceptance_assertions(source: str) -> tuple[tuple[int, str], ...]:
+    """The probe's own assertions, in line order: every ``assert`` in module code.
+
+    Assertions inside helper functions belong to whichever module line called the
+    helper, so they are not separate items.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+    lines = source.splitlines()
+    found: list[tuple[int, str]] = []
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+        if isinstance(node, ast.Assert):
+            message = node.msg
+            text = (
+                message.value
+                if isinstance(message, ast.Constant) and isinstance(message.value, str)
+                else lines[node.lineno - 1].strip()
+            )
+            found.append((node.lineno, text[:300]))
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+    return tuple(sorted(found))
+
+
+def acceptance_items(source: str, stderr: str, *, passed: bool) -> tuple[AcceptanceItem, ...]:
+    """Which of the probe's assertions this run got past.
+
+    A probe runs top to bottom, so failing at module line N means every assertion
+    above N held. The module frame is the first probe frame Python prints, ahead of
+    the exception message, so text the app under test puts into a message cannot
+    move it. Without a module frame (the probe was killed, or never started) no
+    assertion is credited. This is a progress signal only: passing still requires
+    the probe to exit cleanly and print its completion marker.
+    """
+    assertions = acceptance_assertions(source)
+    if passed:
+        return tuple(AcceptanceItem(line, text, passed=True) for line, text in assertions)
+    frame = _PROBE_MODULE_FRAME.search(stderr)
+    failing = int(frame.group(1)) if frame else 0
+    if not 1 <= failing <= len(source.splitlines()):
+        failing = 0
+    return tuple(AcceptanceItem(line, text, passed=line < failing) for line, text in assertions)
+
+
+def acceptance_partial(source: str, stderr: str) -> float | None:
+    """Partial credit for a failed probe: assertions passed out of assertions plus one.
+
+    The extra item is the probe completing, so a failed probe stays below one check.
+    """
+    items = acceptance_items(source, stderr, passed=False)
+    if not items:
+        return None
+    return sum(item.passed for item in items) / (len(items) + 1)
 
 
 def acceptance_failure_line(source: str, output: str) -> str | None:

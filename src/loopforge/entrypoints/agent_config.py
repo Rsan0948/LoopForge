@@ -76,8 +76,6 @@ class WorkerProfile:
     byte_ratio_admission: bool
     # Bookkeeping: only the current failure, not read lists, in each turn.
     conversation_bookkeeping: bool
-    # Verification: each distinct changed file counts as construction progress.
-    construction_credit: bool
     # Review: reporting envelope for patch review.
     app_reporting: bool
     bounded_reporting: bool
@@ -93,7 +91,6 @@ WORKER_PROFILES: dict[str, WorkerProfile] = {
         history_limit_chars=None,
         byte_ratio_admission=True,
         conversation_bookkeeping=True,
-        construction_credit=True,
         app_reporting=True,
         bounded_reporting=False,
         large_reporting=False,
@@ -106,7 +103,6 @@ WORKER_PROFILES: dict[str, WorkerProfile] = {
         history_limit_chars=96_000,
         byte_ratio_admission=False,
         conversation_bookkeeping=False,
-        construction_credit=False,
         app_reporting=False,
         bounded_reporting=True,
         large_reporting=True,

@@ -280,8 +280,6 @@ def current_failure_text(last: str | None, inherited: str | None, *, compact: bo
 # A read wider than the legacy 3000-character page marks the v3 read protocol.
 _SINGLE_PAGE_CHARS: Final = 3000
 # Per distinct changed file; at most max_changed_files (18) * 0.02 = 0.36 on a failure.
-_CONSTRUCTION_CREDIT: Final = 0.02
-_MAX_FAILED_SCORE: Final = 0.999
 MULTI_READ_FILES: Final = 4
 MULTI_READ_CHARS: Final = 24_000
 
@@ -830,10 +828,8 @@ class CodingVerifier:
         bounded_reporting: bool = False,
         reporting_v3: bool = False,
         app_workload: bool = False,
-        construction_credit: bool = False,
     ) -> None:
         self.app_workload = app_workload
-        self.construction_credit = construction_credit
         self.reporting_v3 = reporting_v3
         self.bounded_reporting = bounded_reporting
         self.receipts = receipts
@@ -923,7 +919,6 @@ class CodingVerifier:
         candidate = candidate_revision(self.workspace)
         result = self.verifier.verify(state)
         result = self._bind_acceptance(state, candidate, result)
-        result = self._with_construction_credit(result)
         if self.receipts is not None:
             result = replace(
                 result,
@@ -932,26 +927,6 @@ class CodingVerifier:
                 + json.dumps(self.receipts.history[-len(self.task.execution_checks) :]),
             )
         return result
-
-    def _with_construction_credit(self, result: VerificationResult) -> VerificationResult:
-        """Count building out more files as progress on a still-failing candidate.
-
-        Acceptance probes of a from-scratch app cannot improve until every file exists,
-        so each new file looked like no progress and stalled a run after its first check
-        (live snake trial, 2026-10-24). Each distinct changed file, measured from the
-        workspace, adds a small code-owned credit; editing the same files again adds
-        nothing, so loops still stall. Bounded by the task's changed-file limit.
-        """
-        if (
-            not self.construction_credit
-            or result.passed
-            or result.inconclusive
-            or result.score is None
-        ):
-            return result
-        changed = min(len(self.workspace.status().files), self.task.max_changed_files)
-        credit = _CONSTRUCTION_CREDIT * changed
-        return replace(result, score=min(result.score + credit, _MAX_FAILED_SCORE))
 
     def _bind_acceptance(
         self, state: RunState, candidate: CandidateRevision, result: VerificationResult
@@ -1383,7 +1358,6 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
         bounded_reporting=worker.bounded_reporting,
         reporting_v3=worker.large_reporting,
         app_workload=worker.app_reporting,
-        construction_credit=worker.construction_credit,
     )
 
     def inherited_failure() -> str | None:
