@@ -116,8 +116,9 @@ def test_checkpoint_compacts_old_output_and_thinking_and_keeps_recent_exchanges(
     assert all("thinking" not in messages[i] for i in assistants[:-2])
     assert "omitted at a context checkpoint" in str(messages[assistants[0] + 1]["content"])
     assert "Source 'src/f1.py', sha256=" in str(messages[assistants[0] + 1]["content"])
-    # The last two exchanges, the task and the newest failure stay verbatim.
-    assert all("thinking" in messages[i] for i in assistants[-2:])
+    # Only the latest reasoning stays; the task and the newest result stay verbatim.
+    assert "thinking" in messages[assistants[-1]]
+    assert "thinking" not in messages[assistants[-2]]
     assert "line 7" in str(messages[-1]["content"])
     assert "assert 7 == 3" in str(messages[-1]["content"])
     assert messages[1]["role"] == "user"
@@ -241,3 +242,26 @@ def test_long_history_compacts_to_half_the_budget_at_one_checkpoint() -> None:
     (record,) = model.compaction_log
     assert record["trigger"] == "checkpoint"
     assert cast("int", record["tokens_after_estimate"]) <= 16384 // 2
+
+
+def test_a_retained_tail_over_target_falls_back_to_the_latest_exchange_only() -> None:
+    model, requests = _model(budget=16384)
+    _grow(model, 5)
+    _turn(model, 6, size=9000)
+    _turn(model, 7, verified=True, size=9000)
+    messages = _messages(requests[-1])
+    assistants = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
+    assert "omitted at a context checkpoint" in str(messages[assistants[-2] + 1]["content"])
+    assert "line 7" in str(messages[-1]["content"])
+
+
+def test_no_repeated_rewrite_until_the_prompt_has_grown_by_one_cycle() -> None:
+    model, _ = _model(budget=8192)
+    _grow(model, 3)
+    _turn(model, 4, verified=True, size=9000)
+    first = len(model.compaction_log)
+    assert first == 1
+    # The irreducible tail keeps the prompt over budget; small growth must not rewrite again.
+    _turn(model, 5, size=200)
+    _turn(model, 6, verified=True, size=200)
+    assert len(model.compaction_log) == first

@@ -215,6 +215,8 @@ def test_compact_bookkeeping_still_shows_an_inherited_failure_and_the_empty_stat
 
 
 def test_unknown_tool_proposal_is_answered_with_an_explicit_rejection() -> None:
+    requests: list[dict[str, object]] = []
+
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
         name = "list_files" if len(requests) == 1 else "read_file"
@@ -223,7 +225,6 @@ def test_unknown_tool_proposal_is_answered_with_an_explicit_rejection() -> None:
             json=_chat_payload(tool_calls=[{"function": {"name": name, "arguments": {}}}]),
         )
 
-    requests: list[dict[str, object]] = []
     model = OllamaModel(
         model="m", tools=TOOLS, template=TEMPLATE, transport=httpx.MockTransport(respond)
     )

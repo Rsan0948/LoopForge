@@ -329,10 +329,12 @@ class RepairVerifier:
         if result.resource_limits_skipped:
             skipped = ", ".join(result.resource_limits_skipped)
             detail += f"; resource limits not enforced by this platform: {skipped}"
+        passed = result.succeeded and completed
         return CheckOutcome(
             name=f"command:{name}",
-            passed=result.succeeded and completed,
+            passed=passed,
             detail=detail,
+            partial=None if passed else pytest_partial(result.stdout),
         )
 
     def _patch_outcome(self) -> CheckOutcome:
@@ -546,6 +548,33 @@ def scripted_repair_actions(task: RepairTask) -> list[ActionProposal]:
         for index, item in enumerate(task.fixture.solution, start=1)
     )
     return actions
+
+
+_PYTEST_COUNTS = re.compile(r"(\d+) (passed|failed|errors?)\b")
+_PYTEST_DURATION = re.compile(r"\bin \d+(?:\.\d+)?s\b")
+
+
+def pytest_partial(stdout: str) -> float | None:
+    """Share of tests passing from pytest's final summary line, when one is present.
+
+    Only the last line containing a count is used, so test output cannot add counts.
+    Returns None when there is no pytest summary (for example a lint failure stopped
+    the check before tests ran) or when nothing failed.
+    """
+    lines = [
+        line
+        for line in stdout.splitlines()
+        if _PYTEST_COUNTS.search(line) and _PYTEST_DURATION.search(line)
+    ]
+    if not lines:
+        return None
+    counts = {"passed": 0, "failed": 0, "error": 0}
+    for number, kind in _PYTEST_COUNTS.findall(lines[-1]):
+        counts["error" if kind.startswith("error") else kind] += int(number)
+    total = sum(counts.values())
+    if total == 0 or counts["passed"] == total:
+        return None
+    return counts["passed"] / total
 
 
 _WARNINGS_SECTION = re.compile(r"(?ms)^=+ warnings summary =+\n(.*?)(?=^=+ |\Z)")

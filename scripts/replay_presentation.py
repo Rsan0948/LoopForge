@@ -1,4 +1,4 @@
-# ruff: noqa: E501 - operator analysis script
+
 """Offline: replay a recorded trial's contexts through the adapter, old vs new presentation.
 
 Feeds each recorded ContextAssembled snapshot to OllamaModel with the recorded model

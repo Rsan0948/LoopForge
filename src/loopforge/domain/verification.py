@@ -14,8 +14,21 @@ class CheckOutcome:
     executed: bool = True
     """False when the check never ran (sandbox/infra error, harness bug) —
     distinct from "ran and failed": the workspace was never measured."""
+    partial: float | None = None
+    """For a failed check only: the code-measured share of its sub-tests passing, in
+    [0, 1). Lets the progress signal see repair inside one check; a failed check still
+    never counts as passed."""
 
     def __post_init__(self) -> None:
+        if self.partial is not None and (
+            self.passed
+            or isinstance(self.partial, bool)
+            or not isinstance(self.partial, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not math.isfinite(self.partial)
+            or not 0.0 <= self.partial < 1.0
+        ):
+            msg = "partial credit must be a finite fraction in [0, 1) on a failed check"
+            raise ValueError(msg)
         if type(self.executed) is not bool:
             msg = "check outcome executed must be a bool"
             raise TypeError(msg)
@@ -64,8 +77,8 @@ def compose_check_outcomes(outcomes: tuple[CheckOutcome, ...]) -> CompositeVerif
 
     Composition is conjunctive: success requires every independent check to
     pass. The summary preserves the caller-supplied check order and the score
-    is the passing fraction, so identical workspace state always yields an
-    identical verdict.
+    is the passing fraction (failed checks contribute their partial credit, always
+    below one check), so identical workspace state always yields an identical verdict.
     """
     if not outcomes:
         msg = "verification requires at least one check"
@@ -77,6 +90,10 @@ def compose_check_outcomes(outcomes: tuple[CheckOutcome, ...]) -> CompositeVerif
     return CompositeVerification(
         passed=passed_count == len(outcomes),
         summary=summary,
-        score=passed_count / len(outcomes),
+        score=(
+            passed_count
+            + sum(o.partial for o in outcomes if not o.passed and o.partial is not None)
+        )
+        / len(outcomes),
         inconclusive=any(not outcome.executed for outcome in outcomes),
     )

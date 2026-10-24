@@ -286,6 +286,8 @@ class OllamaModel:
         self._checkpoint_summarizer = checkpoint_summarizer
         self._checkpoint_due: set[RunId] = set()
         self._handoffs: dict[RunId, str] = {}
+        # Per run: estimated prompt tokens right after the last checkpoint compaction.
+        self._compacted_to: dict[RunId, int] = {}
         # Lab/operator metrics, one record per checkpoint compaction.
         self.compaction_log: list[dict[str, object]] = []
         self._ratio_bound_violated: set[RunId] = set()
@@ -582,7 +584,7 @@ class OllamaModel:
             return -(-size // 3)
         return math.ceil(size * calibration[1] / calibration[0])
 
-    def _checkpoint_compact(
+    def _checkpoint_compact(  # noqa: PLR0912 - ordered checkpoint, tier-1 and tier-2 gates
         self, payload: dict[str, object], messages: list[dict[str, object]], context: ModelContext
     ) -> None:
         """Compact at a deterministic checkpoint so usage stays under the working budget.
@@ -603,6 +605,11 @@ class OllamaModel:
         overrun = before > budget
         if not overrun and not (checkpoint and before + _CHECKPOINT_RESERVE > budget):
             return
+        previous = self._compacted_to.get(context.run_id)
+        if previous is not None and before < previous + _CHECKPOINT_RESERVE:
+            # Too little growth since the last rewrite for another one to free a cycle;
+            # each rewrite is a full re-prefill, so repeating it would only thrash.
+            return
         if not messages or messages[-1].get("role") != "tool":
             return
         target = budget // 2
@@ -616,9 +623,10 @@ class OllamaModel:
         if len(assistants) <= _KEEP_EXCHANGES:
             return
         keep_from = assistants[-_KEEP_EXCHANGES]
-        for index in assistants:
-            if index < keep_from:
-                messages[index].pop("thinking", None)
+        # Only the latest turn's reasoning is still in use; earlier reasoning (including
+        # the retained previous exchange) is dropped at the boundary.
+        for index in assistants[:-1]:
+            messages[index].pop("thinking", None)
         payload["messages"] = list(messages)
         for index in range(2, keep_from):
             if self._estimate(payload, context) <= target:
@@ -626,6 +634,13 @@ class OllamaModel:
             if messages[index].get("role") == "tool":
                 messages[index]["content"] = checkpoint_stub(str(messages[index]["content"]))
                 payload["messages"] = list(messages)
+        if self._estimate(payload, context) > target:
+            # Two retained exchanges still exceed the target: keep only the latest one.
+            for index in range(keep_from, assistants[-1]):
+                if messages[index].get("role") == "tool":
+                    messages[index]["content"] = checkpoint_stub(str(messages[index]["content"]))
+            keep_from = assistants[-1]
+            payload["messages"] = list(messages)
         if self._estimate(payload, context) > target and self._checkpoint_summarizer is not None:
             middle = [m for m in messages[2:keep_from] if m.get("role") != "system"]
             try:
@@ -662,7 +677,9 @@ class OllamaModel:
         self._history_compactions[context.run_id] = (
             self._history_compactions.get(context.run_id, 0) + 1
         )
-        record["tokens_after_estimate"] = self._estimate(payload, context)
+        after = self._estimate(payload, context)
+        record["tokens_after_estimate"] = after
+        self._compacted_to[context.run_id] = after
         self.compaction_log.append(record)
         self.request_tracker.note(f"context_{record['trigger']}_compaction_tier{record['tier']}")
 
@@ -725,6 +742,7 @@ class OllamaModel:
         self._presented_failure.pop(run_id, None)
         self._checkpoint_due.discard(run_id)
         self._handoffs.pop(run_id, None)
+        self._compacted_to.pop(run_id, None)
 
     def _conversation(
         self, context: ModelContext, rendered: RenderedPrompt
