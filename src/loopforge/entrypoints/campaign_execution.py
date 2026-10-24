@@ -532,6 +532,11 @@ class CodingCoordinator:
                 "patch": workspace.diff(),
                 "provider_observations": live.request_tracker.observations() if live else [],
             }
+            if event == "start" and acceptance_verifier is not None:
+                detail["checklist"] = acceptance_verifier.checklist()
+                best = CheckpointStore(self.directory / "checkpoints" / f"{task}.json").load().best
+                if best is not None:
+                    detail["best_checkpoint_score"] = best.score
             if (
                 acceptance_verifier is not None
                 and acceptance_verifier.acceptance_receipt is not None

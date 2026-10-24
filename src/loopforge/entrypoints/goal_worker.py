@@ -14,6 +14,7 @@ from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.research_store import ResearchStore
 from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.application.failure_recovery import worker_failure
+from loopforge.domain.coding import CodingState
 from loopforge.domain.events import ActionProposed, Event
 from loopforge.domain.goals import GoalAction, WorkerObservation
 from loopforge.domain.investigation import FailureKind
@@ -31,6 +32,38 @@ from loopforge.entrypoints.campaign_coding import (
 )
 from loopforge.entrypoints.campaign_models import CodingCommand, CodingTaskConfig, OperatorCommand
 from loopforge.entrypoints.goal_checkpoint import capture
+
+# Room kept for the failing checks when worker evidence is compacted.
+_VERIFICATION_BYTES = 6000
+
+
+def attempt_digest(
+    state: CodingState,
+    contract: CodingTaskConfig,
+    detail: dict[str, object],
+    changed: list[str],
+) -> dict[str, object]:
+    """What one worker attempt did, bounded by structure rather than truncation.
+
+    Counters and the harness-scored checklist are code-owned measurements; the worker
+    model's own claims never enter it.
+    """
+    stop = str(detail.get("stop_summary") or "")
+    checklist = cast("list[dict[str, object]]", detail.get("checklist") or [])
+    return {
+        "attempts_used": state.attempts,
+        "max_attempts": contract.max_attempts,
+        "review_attempts_used": state.review_attempts,
+        "max_review_attempts": contract.max_review_attempts,
+        "stop_code": stop.split(":", 1)[0] or None,
+        "files_changed": changed[: contract.max_changed_files],
+        "checklist": checklist[:10],
+        **(
+            {"best_checkpoint_score": detail["best_checkpoint_score"]}
+            if "best_checkpoint_score" in detail
+            else {}
+        ),
+    }
 
 
 class CampaignGoalWorker:
@@ -128,8 +161,10 @@ class CampaignGoalWorker:
         # Only task evidence crosses the supervisor boundary: no environment,
         # credentials, host workspace paths or raw provider request observations.
         measured = measured_summary(detail, changed, run_events) if row else None
+        digest = attempt_digest(state, actual, detail, changed) if row else None
         evidence = json.dumps(
             {
+                **({"attempt": digest} if digest is not None else {}),
                 **({"measured_summary": measured} if measured is not None else {}),
                 **{
                     key: detail[key]
@@ -152,14 +187,21 @@ class CampaignGoalWorker:
                 evidence, actual.branch, identity
             )
             artifact_ids = (artifact.record_id,)
-        # Explicit omission is preferable to slicing a serialized evidence object.
+        # Explicit omission is preferable to slicing a serialized evidence object. The
+        # patch is what makes evidence large and it stays retrievable; why the checks
+        # failed must not be dropped with it (F4: 19 paid inspections paged the source).
         if len(evidence.encode()) > GATE_LIMITS.supervisor_evidence_bytes:
+            verification = str(detail.get("last_verification") or "")
             evidence = json.dumps(
                 {
-                    "omitted": "Retrieve the full worker artifact with retrieve and offset_bytes",
+                    "omitted": "The patch and full worker output are in the artifact; "
+                    "retrieve with retrieve and offset_bytes",
+                    **({"attempt": digest} if digest is not None else {}),
                     **({"measured_summary": measured} if measured is not None else {}),
                     "artifact_ids": artifact_ids,
                     "failure_summary": str(detail.get("stop_summary", ""))[:1000],
+                    "last_verification": verification[:_VERIFICATION_BYTES]
+                    + ("..." if len(verification) > _VERIFICATION_BYTES else ""),
                     "patch_sha256": detail.get("patch_sha256", ""),
                 }
             )

@@ -95,6 +95,7 @@ from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolError
 from loopforge.ports.verifier import VerificationResult, VerifierPort
 from loopforge.workloads.repair import (
+    AcceptanceItem,
     RepairCommand,
     RepairCommandKind,
     RepairTask,
@@ -932,6 +933,23 @@ class CodingVerifier:
                 + json.dumps(self.receipts.history[-len(self.task.execution_checks) :]),
             )
         return result
+
+    def checklist(self) -> list[dict[str, object]]:
+        """Each acceptance probe's assertions passed at the last real verification, with
+        the next ones still failing (line and assertion text; the probe source stays
+        hidden). Harness-scored, so it is safe to show a supervisor."""
+        items: dict[str, tuple[AcceptanceItem, ...]] = getattr(self.verifier, "last_acceptance", {})
+        return [
+            {
+                "probe": name,
+                "passed": sum(item.passed for item in probe),
+                "total": len(probe),
+                "next_failing": [
+                    {"line": item.line, "assertion": item.text} for item in probe if not item.passed
+                ][:3],
+            }
+            for name, probe in sorted(items.items())
+        ]
 
     def _bind_acceptance(
         self, state: RunState, candidate: CandidateRevision, result: VerificationResult

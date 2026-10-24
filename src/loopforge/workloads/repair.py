@@ -250,6 +250,8 @@ class RepairVerifier:
         self._command_detail_budget = command_detail_budget
         self._completion_markers = dict(completion_markers)
         self._probe_sources = dict(probe_sources)
+        # Per acceptance probe, which of its assertions the last verification got past.
+        self.last_acceptance: dict[str, tuple[AcceptanceItem, ...]] = {}
         if (
             len(self._completion_markers) != len(completion_markers)
             or any(not name or not marker for name, marker in completion_markers)
@@ -260,6 +262,7 @@ class RepairVerifier:
 
     def verify(self, state: RunState) -> VerificationResult:
         del state  # verification truth comes from the workspace, never model-claimed state
+        self.last_acceptance = {}
         outcomes = [self._command_outcome(name) for name in self._criteria.required_commands]
         outcomes.append(self._patch_outcome_checked())
         for index, hook in enumerate(self._hooks, start=1):
@@ -341,6 +344,8 @@ class RepairVerifier:
             skipped = ", ".join(result.resource_limits_skipped)
             detail += f"; resource limits not enforced by this platform: {skipped}"
         passed = result.succeeded and completed
+        if source is not None:
+            self.last_acceptance[name] = acceptance_items(source, result.stderr, passed=passed)
         partial = None
         if not passed:
             partial = (
