@@ -46,6 +46,39 @@ fallback paths, on Qwen-next-style hybrids ([llama.cpp #28734](https://github.co
 is on Metal, so this has to be measured here. With the current Ollama setup, 20 tok/s is crossed
 at about 15–17K tokens, not 32K.
 
+### Measured answer (roadmap Phase 1, `scripts/bench_engine_depth.py`, 2026-10-23 20:38)
+
+Setup: requests captured from the evidence trial at four depths; fixed 256-token output, seed 7,
+the profile's own sampling. Ollama ran on a private `ollama serve` with each setting; MLX ran on
+the pinned agentic server. Artifacts: `.loopforge/mlx-lab/runs/depth-tuning-2038/` (`depth.json` and logs).
+Decode is reported in tok/s, with ms/token in parentheses.
+
+| depth (tokens) | Ollama 32K, q8_0 | Ollama 131K, q8_0 | Ollama 32K, f16 | Ollama 131K, f16 | MLX 4-bit |
+|---|---|---|---|---|---|
+| 8,808  | 29.5 (33.9) | 30.0 (33.4) | 55.3 (18.1) | 53.7 (18.6) | 53.8 (18.6) |
+| 17,429 | 21.0 (47.7) | 21.5 (46.5) | 50.5 (19.8) | 50.1 (20.0) | 48.7 (20.5) |
+| 25,139 | 13.8 (72.4) | 13.2 (75.9) | 38.9 (25.7) | 36.3 (27.5) | 47.5 (21.1) |
+| 29,825 | 12.4 (80.6) | 12.6 (79.6) | 38.6 (25.9) | 35.8 (27.9) | 49.7 (20.1) |
+
+MTP acceptance at each depth was identical across settings (0.83, 0.82, 0.57, 0.56–0.61), so it
+does not explain the differences.
+
+Conclusions:
+
+1. **The q8_0 KV cache was the cause of the slowdown.** At 30K tokens it is 3.1× slower than f16. It
+   matches the quantized-KV attention slow paths reported elsewhere. The user's service now uses
+   `OLLAMA_KV_CACHE_TYPE=f16`; the original plist is backed up as
+   `~/Library/LaunchAgents/local.ollama.serve.plist.bak-q8_0-20261023`.
+2. **The allocated window has no measurable compute cost** (32K and 131K are within noise at every
+   depth). The 131K allocation is kept, per Qwen's "at least 128K for thinking" guidance. The user's
+   32K target is applied as a *usage* budget enforced by checkpoint compaction (Phase 4).
+3. **MLX decode is flat with depth** (about 48–54 tok/s through 30K). With f16, Ollama declines slowly
+   (about 54 to 36 tok/s). Both stay well above 20 tok/s within a 32K usage budget.
+4. **Prefill:** MLX cold prefill is about 1.4–1.55 ms/token (about 700 tok/s). Ollama prefill figures in
+   this run are not cold, because consecutive depths share a cached prefix, so they are not compared.
+5. **MTP on/off:** Ollama 0.32.15 exposes no setting for its draft-MTP (no environment variable or
+   option; the runner launches `--spec-type draft-mtp` itself), so it was not varied.
+
 ### Does the allocated window (`-c`) itself cost compute?
 
 This is unresolved and has to be measured. In llama.cpp, the attention pass is sized from the
