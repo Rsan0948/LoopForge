@@ -51,6 +51,7 @@ from loopforge.domain.types import (
     RunId,
     UsageDelta,
 )
+from loopforge.entrypoints.agent_config import worker_profile
 from loopforge.entrypoints.campaign_evidence import missing_coverage, required_reads, source_page
 from loopforge.entrypoints.campaign_models import (
     CampaignConfig,
@@ -1074,10 +1075,10 @@ class ReportingReviewModel:
         self, model: ModelPort, tools: ReviewTools, config: CampaignConfig, store: StateStorePort
     ) -> None:
         self.model, self.tools, self.config, self.store = model, tools, config, store
-        native = config.inference_profile == "qwen-native-v1"
-        tools.bounded_reporting = not native
-        tools.app_workload = native
-        tools.reporting_v3 = not native
+        worker = worker_profile(config)
+        tools.bounded_reporting = worker.bounded_reporting
+        tools.app_workload = worker.app_reporting
+        tools.reporting_v3 = worker.large_reporting
         self.pending: dict[str, ActionProposal] = {}
         self.feedback: dict[str, dict[str, str]] = {}
         self.progress: dict[str, tuple[int, int]] = {}
@@ -1346,8 +1347,10 @@ def build_review(  # noqa: PLR0913 - explicit trusted workload context tuning
     max_source_reads: int = 10,
 ) -> tuple[Runtime, ReviewTools, OllamaModel | None]:
     tools = ReviewTools(files, previous, max_source_reads=max_source_reads)
-    native = config.inference_profile == "qwen-native-v1"
-    profile = profile_for("review", bounded_v2=not native, app_workload=native)
+    worker = worker_profile(config)
+    profile = profile_for(
+        "review", bounded_v2=worker.bounded_reporting, app_workload=worker.app_reporting
+    )
     live = (
         None
         if model

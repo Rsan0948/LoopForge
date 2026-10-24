@@ -19,6 +19,7 @@ from loopforge.domain.goals import GoalAction, WorkerObservation
 from loopforge.domain.investigation import FailureKind
 from loopforge.domain.state import replay
 from loopforge.domain.types import RunId, RunStatus
+from loopforge.entrypoints.agent_config import GATE_LIMITS
 from loopforge.entrypoints.campaign import CampaignHarness
 from loopforge.entrypoints.campaign_coding import (
     CodingWorkspace,
@@ -152,7 +153,7 @@ class CampaignGoalWorker:
             )
             artifact_ids = (artifact.record_id,)
         # Explicit omission is preferable to slicing a serialized evidence object.
-        if len(evidence.encode()) > 24_000:
+        if len(evidence.encode()) > GATE_LIMITS.supervisor_evidence_bytes:
             evidence = json.dumps(
                 {
                     "omitted": "Retrieve the full worker artifact with retrieve and offset_bytes",

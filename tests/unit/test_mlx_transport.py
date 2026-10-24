@@ -285,6 +285,9 @@ def test_mlx_goal_checks_the_mlx_server_not_ollama(
     opened: list[bool] = []
 
     class Lab:
+        def __init__(self, lab: Path) -> None:
+            assert lab.is_absolute()
+
         def close(self) -> None:
             opened.append(True)
 

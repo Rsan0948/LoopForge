@@ -30,6 +30,7 @@ from loopforge.domain.events import (
 from loopforge.domain.goals import GoalState
 from loopforge.domain.investigation import FailureKind
 from loopforge.domain.types import ActionId
+from loopforge.entrypoints.agent_config import agent_settings
 from loopforge.entrypoints.campaign_coding import local_git_bytes
 from loopforge.entrypoints.campaign_models import StrictRecord
 from loopforge.entrypoints.goal_bootstrap import GoalWiring, wire
@@ -303,7 +304,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--directory", type=Path, required=True)
-    parser.add_argument("--key-file", type=Path, default=Path(".loopforge/secrets.env"))
+    parser.add_argument("--key-file", type=Path, default=agent_settings().key_file)
     parser.add_argument("--live", action="store_true")
     args = parser.parse_args()
     plan = QualificationPlan.model_validate_json(args.plan.read_text())

@@ -15,11 +15,11 @@ from pathlib import Path
 
 import httpx
 
-from loopforge.adapters.gemini_supervisor import load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
 from loopforge.adapters.mlx_transport import lab_transport, mlx_ready
+from loopforge.entrypoints.agent_config import agent_settings
 from loopforge.entrypoints.campaign_coding import preflight
-from loopforge.entrypoints.goal_bootstrap import DEFAULT_KEY_FILE, drive_goal
+from loopforge.entrypoints.goal_bootstrap import drive_goal
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
 from loopforge.entrypoints.supervisor import GOAL, PreparedGoalConfig
 
@@ -69,7 +69,8 @@ def dependencies(directory: Path) -> None:
         if not mlx_ready():
             msg = "The MLX server is unavailable"
             raise ValueError(msg)
-        lab_transport().close()  # Pinned model revision and renderer must be present.
+        # Pinned model revision and renderer must be present.
+        lab_transport(agent_settings().mlx_lab).close()
     else:
         with httpx.Client(timeout=5, trust_env=False) as client:
             response = client.get("http://127.0.0.1:11434/api/tags")
@@ -78,7 +79,7 @@ def dependencies(directory: Path) -> None:
                 msg = "Configured local model is unavailable"
                 raise ValueError(msg)
     if config.remote_data != "none":
-        load_gemini_key(DEFAULT_KEY_FILE)
+        agent_settings().gemini_key()
 
 
 class GoalExecutionService:

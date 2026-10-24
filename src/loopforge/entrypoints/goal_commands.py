@@ -11,6 +11,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
+from loopforge.entrypoints.agent_config import agent_settings
 from loopforge.entrypoints.goal_bootstrap import GoalWiring, drive_goal
 from loopforge.entrypoints.goal_launch import launch
 from loopforge.entrypoints.goal_review import review_command
@@ -26,7 +27,7 @@ def repository_main() -> None:
     parser.add_argument(
         "command", choices=("create", "run", "status", "cancel", *REVIEW_COMMANDS, "launch")
     )
-    parser.add_argument("--directory", type=Path, default=Path(".loopforge/repository-supervisor"))
+    parser.add_argument("--directory", type=Path, default=agent_settings().repository_goals)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--key-file", type=Path)
     parser.add_argument("--topic")
@@ -83,7 +84,7 @@ def prepared_main() -> None:
             "discard",
         ),
     )
-    parser.add_argument("--directory", type=Path, default=Path(".loopforge/supervisor"))
+    parser.add_argument("--directory", type=Path, default=agent_settings().prepared_goals)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--key-file", type=Path)
     args = parser.parse_args()

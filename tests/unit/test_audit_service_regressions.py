@@ -26,6 +26,7 @@ from loopforge.domain.investigation import TaskAssignment
 from loopforge.domain.workspace import FixtureFile, FixtureSpec
 from loopforge.entrypoints import autonomy_qualification as qualification
 from loopforge.entrypoints import goal_bootstrap, goal_review, goal_runner
+from loopforge.entrypoints.agent_config import AgentSettings
 from loopforge.entrypoints.campaign_models import (
     AcceptanceProbe,
     CampaignConfig,
@@ -46,6 +47,10 @@ def offline_provider(_key: str, **_wiring: object) -> SimpleNamespace:
 
 
 def offline_key(_path: Path | None) -> str:
+    return "unused-offline-fixture"
+
+
+def offline_settings_key(_settings: AgentSettings, _override: Path | None = None) -> str:
     return "unused-offline-fixture"
 
 
@@ -169,7 +174,7 @@ def test_service_yields_idle_goal_and_runs_next_armed_goal(
 
     monkeypatch.setattr(goal_bootstrap, "PreparedGoalService", Service)
     monkeypatch.setattr(goal_bootstrap, "GeminiSupervisor", offline_provider)
-    monkeypatch.setattr(goal_bootstrap, "load_gemini_key", offline_key)
+    monkeypatch.setattr(AgentSettings, "gemini_key", offline_settings_key)
     for name in ["a-idle", "b-ready"]:
         directory = tmp_path / name
         directory.mkdir()
@@ -367,7 +372,7 @@ def test_paused_qualification_reaches_frozen_timeout_without_model_calls(
     )
     monkeypatch.setattr(qualification, "RepositoryGoalService", Service)
     monkeypatch.setattr(goal_bootstrap, "GeminiSupervisor", offline_provider)
-    monkeypatch.setattr(goal_bootstrap, "load_gemini_key", offline_key)
+    monkeypatch.setattr(AgentSettings, "gemini_key", offline_settings_key)
 
     def fake_metrics(
         _root: Path, _state: GoalState, _case: qualification.QualificationCase

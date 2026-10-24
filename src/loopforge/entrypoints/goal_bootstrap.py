@@ -14,23 +14,21 @@ from types import TracebackType
 
 import httpx
 
-from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
+from loopforge.adapters.gemini_supervisor import GeminiSupervisor
 from loopforge.adapters.recorded_supervisor import RecordedSupervisor
 from loopforge.application.supervisor import GoalCoordinator
 from loopforge.domain.goals import GoalState
+from loopforge.entrypoints.agent_config import agent_settings
 from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
 from loopforge.entrypoints.supervisor import GOAL, BaseGoalService, PreparedGoalService
 from loopforge.ports.supervisor import EvidenceAwareSupervisorPort
 
-# Relative to the working directory until configuration gets an owner (migration step 2).
-DEFAULT_KEY_FILE = Path(".loopforge/secrets.env")
-
 
 @dataclass(frozen=True)
 class GoalWiring:
-    """Operator-owned runner options. ``key_file=None`` reads ``GEMINI_API_KEY``."""
+    """Operator-owned runner options. ``key_file=None`` uses the agent's credentials."""
 
-    key_file: Path | None = DEFAULT_KEY_FILE
+    key_file: Path | None = None
     record: bool = True
     count_tokens: bool = True
     nonblocking: bool = True
@@ -86,7 +84,7 @@ def wire(
     if wiring.record:
         service.harness.provider_request_directory = directory / "worker-prompts"
     provider = GeminiSupervisor(
-        load_gemini_key(wiring.key_file),
+        agent_settings().gemini_key(wiring.key_file),
         client=client,
         count_tokens=wiring.count_tokens,
         diagnostics=directory / "supervisor-diagnostics" if wiring.record else None,

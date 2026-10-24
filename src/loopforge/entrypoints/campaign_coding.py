@@ -62,6 +62,12 @@ from loopforge.domain.workspace import (
     PatchConstraints,
     WorkspaceStatus,
 )
+from loopforge.entrypoints.agent_config import (
+    GATE_LIMITS,
+    GateLimits,
+    agent_settings,
+    worker_profile,
+)
 from loopforge.entrypoints.campaign_evidence import (
     candidate_snapshot,
     required_reads,
@@ -825,7 +831,9 @@ class CodingVerifier:
         reporting_v3: bool = False,
         app_workload: bool = False,
         construction_credit: bool = False,
+        repeated_failures: int = GATE_LIMITS.repeated_check_failures,
     ) -> None:
+        self.repeated_failures = repeated_failures
         self.app_workload = app_workload
         self.construction_credit = construction_credit
         self.reporting_v3 = reporting_v3
@@ -871,7 +879,7 @@ class CodingVerifier:
             failure = (patch_identity(self.workspace), summary)
             self.repetitions = self.repetitions + 1 if failure == self.last_failure else 1
             self.last_failure = failure
-            self.blocked = self.repetitions >= 3
+            self.blocked = self.repetitions >= self.repeated_failures
             return VerificationResult(passed=False, score=0, summary=summary)
         files = candidate_snapshot(self.workspace)
         expected = set(self.workspace.status().files) | {"CAMPAIGN_PATCH.diff"}
@@ -920,7 +928,7 @@ class CodingVerifier:
             failure = (patch_identity(self.workspace), result.summary)
             self.repetitions = self.repetitions + 1 if failure == self.last_failure else 1
             self.last_failure = failure
-            self.blocked = self.repetitions >= 3 or result.inconclusive
+            self.blocked = self.repetitions >= self.repeated_failures or result.inconclusive
         if self.receipts is not None:
             result = replace(
                 result,
@@ -1036,7 +1044,9 @@ class RequiredChecksAwareModel:
         inherited_failure: Callable[[], str | None] | None = None,
         conversation_bookkeeping: bool = False,
         compact_bookkeeping: bool = False,
+        no_new_evidence_turns: int = GATE_LIMITS.no_new_evidence_turns,
     ) -> None:
+        self.no_new_evidence_turns = no_new_evidence_turns
         self.model, self.store, self.checks = model, store, checks
         # Opt-in: point at the conversation's latest verification instead of restating it.
         self.compact_bookkeeping = compact_bookkeeping
@@ -1094,7 +1104,7 @@ class RequiredChecksAwareModel:
             previous, stale = self.progress.get(key, (signature, -1))
             stale = stale + 1 if previous == signature else 0
             self.progress[key] = (signature, stale)
-            if stale >= 8:
+            if stale >= self.no_new_evidence_turns:
                 raise ModelTurnError(
                     ModelFailureClass.PERMANENT,
                     "CODING_NO_NEW_EVIDENCE",
@@ -1175,6 +1185,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
     store: StateStorePort,
     model: ModelPort | None = None,
     require_revision: bool = False,
+    gates: GateLimits = GATE_LIMITS,
 ) -> tuple[Runtime, OllamaModel | None]:
     commands = tuple(
         RepairCommand(
@@ -1234,12 +1245,13 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
         )
     )
     tools = ConfinedCodingTools(base_tools, task, workspace)
-    native = config.inference_profile == "qwen-native-v1"
+    worker = worker_profile(config)
+    native = worker.native_protocol
     profile = profile_for("coding", native=native, model=config.model, bounded_v2=not native)
     template = default_controller_template()
     template = replace(
         template,
-        version="1.9.0-native" if native else "1.1.0-bounded",
+        version=worker.template_version,
         sections=(
             *template.sections[:-1],
             PromptSection(
@@ -1316,7 +1328,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
                             },
                         ),
                     )
-                    if native
+                    if worker.import_formatter
                     else ()
                 ),
                 ModelToolSpec(
@@ -1341,11 +1353,11 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             preserve_thinking=profile.preserve_thinking,
             keep_alive=profile.keep_alive,
             thinking=profile.thinking,
-            max_history_chars=None if native else 96_000,
+            max_history_chars=worker.history_limit_chars,
             history_overflow="trim",
             conversation_mode=profile.conversation_mode,
             context_window_tokens=profile.context_tokens,
-            byte_ratio_admission=native,
+            byte_ratio_admission=worker.byte_ratio_admission,
             thinking_policy=profile.thinking_policy,
             history_replay=profile.history_replay,
             observation_format=profile.observation_format,
@@ -1355,7 +1367,7 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
                 else profile.working_budget_tokens
             ),
             # The engine switch is a transport; Ollama keeps OllamaModel's own client.
-            transport=lab_transport() if config.engine == "mlx" else None,
+            transport=lab_transport(agent_settings().mlx_lab) if config.engine == "mlx" else None,
         )
     )
     selected = model if model is not None else live
@@ -1374,10 +1386,11 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
         workspace,
         require_revision=require_revision,
         receipts=sandbox,
-        bounded_reporting=not native,
-        reporting_v3=not native,
-        app_workload=native,
-        construction_credit=native,
+        bounded_reporting=worker.bounded_reporting,
+        reporting_v3=worker.large_reporting,
+        app_workload=worker.app_reporting,
+        construction_credit=worker.construction_credit,
+        repeated_failures=gates.repeated_check_failures,
     )
 
     def inherited_failure() -> str | None:
@@ -1399,8 +1412,8 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
     tools.read_page_chars = profile.read_page_chars
     tools.edit_echo = profile.observation_format == "delimited"
     tools.multi_read = profile.read_page_chars > _SINGLE_PAGE_CHARS
-    tools.measured_checks = native
-    if native:
+    tools.measured_checks = worker.measured_checks
+    if worker.import_formatter:
         tools.import_formatter = PinnedImportFormatter(workspace.root, task.image).format_file
     runtime = Runtime(
         model=RequiredChecksAwareModel(
@@ -1409,23 +1422,24 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             tuple(c.name for c in commands),
             verifier,
             inherited_failure=inherited_failure,
-            conversation_bookkeeping=native,
+            conversation_bookkeeping=worker.conversation_bookkeeping,
             compact_bookkeeping=profile.observation_format == "delimited",
+            no_new_evidence_turns=gates.no_new_evidence_turns,
         ),
         tools=tools,
         verifier=verifier,
         store=store,
         control=ControlPolicy(
             BudgetLimit(
-                max_cost_usd=1,
+                max_cost_usd=gates.local_cost_usd,
                 max_iterations=config.max_iterations,
                 max_total_tokens=config.max_tokens,
                 max_elapsed_seconds=config.max_seconds,
             ),
-            no_progress_limit=min(8, config.max_iterations),
+            no_progress_limit=min(gates.no_progress_verifications, config.max_iterations),
         ),
         permissions=PermissionPolicy(frozenset({Permission.READ, Permission.LOCAL_WRITE})),
-        reliability=ReliabilityPolicy(),
+        reliability=ReliabilityPolicy(circuit_failure_threshold=gates.tool_circuit_failures),
         context=context,
         clock=clock,
         sleeper=SystemSleeper(),

@@ -11,7 +11,6 @@ from typing import cast
 
 from loopforge.adapters.acceptance_receipts import encode_acceptance
 from loopforge.adapters.gemini_review import GeminiReviewModel
-from loopforge.adapters.gemini_supervisor import load_gemini_key
 from loopforge.adapters.git_workspace import GitWorkspace, GitWorkspaceManager
 from loopforge.adapters.json_events import JsonEventCodec
 from loopforge.adapters.ollama_model import OllamaModel
@@ -25,6 +24,7 @@ from loopforge.domain.events import RunStopped
 from loopforge.domain.investigation import FailureKind
 from loopforge.domain.state import RunState, replay
 from loopforge.domain.types import ActionId, RunId, RunStatus
+from loopforge.entrypoints.agent_config import agent_settings, worker_profile
 from loopforge.entrypoints.campaign_coding import (
     PROTECTED,
     AssignmentGuidanceModel,
@@ -132,7 +132,7 @@ def prepared_check_model(
 
 def coding_objective(config: CampaignConfig, contract: CodingTaskConfig) -> str:
     """The coding run objective: the frozen task objective plus profile working rules."""
-    if config.inference_profile == "qwen-native-v1":
+    if worker_profile(config).native_protocol:
         return (
             contract.objective
             + "\nThis is one continuous conversation: your earlier tool calls and "
@@ -432,7 +432,7 @@ class CodingCoordinator:
                         msg_0 = "Frontier review requires the parent paid budget"
                         raise ValueError(msg_0)  # noqa: TRY301 - explicit boundary dispatch/normalization
                     frontier = GeminiReviewModel(
-                        load_gemini_key(Path(".loopforge/secrets.env")),
+                        agent_settings().gemini_key(),
                         self.parent_budget,
                         tool_specs(),
                         self.directory / "frontier-review" / task,

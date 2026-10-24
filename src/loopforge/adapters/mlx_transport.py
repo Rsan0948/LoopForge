@@ -23,7 +23,6 @@ from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
 MLX_BASE_URL: Final = "http://127.0.0.1:18181"
 MLX_MODEL_REVISION: Final = "38740b847e4cb78f352aba30aa41c76e08e6eb46"
-MLX_LAB: Final = Path(".loopforge/mlx-lab")
 # Tuned in the lab (scripts/tune_engine_sampling.py): a 2048-token presence window gave
 # shorter, far less variable reasoning on MLX with exact edit arguments intact.
 PRESENCE_CONTEXT_TOKENS: Final = 2048
@@ -258,7 +257,7 @@ class _LabModel(BaseModel):
     local_path: StrictStr
 
 
-def lab_transport(lab: Path = MLX_LAB) -> MlxChatTransport:
+def lab_transport(lab: Path) -> MlxChatTransport:
     """The transport for the pinned lab install (model manifest and built renderer)."""
     model = _LabModel.model_validate_json((lab / "model.json").read_text())
     if model.revision != MLX_MODEL_REVISION:

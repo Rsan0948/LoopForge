@@ -192,7 +192,12 @@ def test_engine_selects_its_transport_and_usage_budget(
 ) -> None:
     monkeypatch.setattr(coding, "ContainerSandbox", FakeChecks)
     lab = object()
-    monkeypatch.setattr(coding, "lab_transport", lambda: lab)
+
+    def open_lab(path: Path) -> object:
+        assert path.is_absolute()
+        return lab
+
+    monkeypatch.setattr(coding, "lab_transport", open_lab)
     captured: dict[str, object] = {}
 
     def factory(**kwargs: object) -> ollama_model.OllamaModel:
