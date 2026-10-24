@@ -47,6 +47,9 @@ from scripts import mlx_lab
 
 ROOT = Path(__file__).resolve().parents[1]
 TRIAL = ROOT / ".loopforge/tasks/reconciliation-forced-attempt/full-a3b-2026-10-23"
+# Another frozen goal intake (for example a from-scratch build) can be measured instead;
+# the environment variable reaches the per-trial child processes.
+INTAKE = Path(os.environ.get("LOOPFORGE_COMPARISON_INTAKE", TRIAL / "repository-intake.json"))
 ORACLE = ROOT / ".loopforge/mlx-lab/renderer-oracle/renderer-oracle"
 RENDER_TEMPLATE = (ROOT / "scripts/ollama_renderer/chat_template.jinja").read_text()
 OLLAMA = "http://127.0.0.1:11434"
@@ -169,7 +172,7 @@ class Transport(httpx.BaseTransport):
 
 def task_inputs():
     config = RepositoryGoalConfig.model_validate_json(
-        (TRIAL / "repository-intake.json").read_text()
+        INTAKE.read_text()
     )
     campaign = config.campaign.model_copy(
         update={
@@ -183,7 +186,8 @@ def task_inputs():
         }
     )
     assert campaign.model == MODEL and campaign.inference_profile == "qwen-native-v1"
-    assert config.task.sandbox_max_open_files == 1024
+    if INTAKE == TRIAL / "repository-intake.json":
+        assert config.task.sandbox_max_open_files == 1024
     return config, campaign
 
 
@@ -458,7 +462,8 @@ def run(output: Path, only: str | None, *, smoke: bool = False) -> None:  # noqa
         "ollama": ollama_identity,
         "ollama_kv_cache_type": ollama_kv_cache_type(),
         "mlx_model": mlx_lab.model_info(),
-        "task_intake_sha256": sha(TRIAL / "repository-intake.json"),
+        "task_intake": str(INTAKE),
+        "task_intake_sha256": sha(INTAKE),
         "seconds": SECONDS,
         "turns": TURNS,
         "schedule": schedule,
