@@ -1,5 +1,6 @@
 """Code-owned review termination: after coverage, a frozen call allowance, then report."""
 
+import contextlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -313,10 +314,9 @@ def test_report_schema_is_shown_only_once_coverage_is_complete(
             report_schema=ReviewReport.model_json_schema(),
         )
         reviewer.progress = tools
-        try:
+        # The scripted reply may name a tool that is not offered; only the request matters.
+        with contextlib.suppress(ModelTurnError):
             reviewer.propose_action(_context(None))
-        except ModelTurnError:
-            pass
     contents = cast("list[dict[str, list[dict[str, str]]]]", bodies[0]["contents"])
     packet = json.loads(contents[0]["parts"][0]["text"])
     if covered:
