@@ -118,6 +118,8 @@ pythonVersion = "3.12"
 
 [tool.pytest.ini_options]
 addopts = "-ra --strict-markers --strict-config"
+# Tests import shared helpers from tests/ and lab code from scripts/; do not rely on the shell.
+pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.coverage.run]
