@@ -257,7 +257,7 @@ def child(directory: Path, engine: str, probe_calls: int | None = None) -> None:
     started = time.monotonic()
     transport = Transport(engine, directory, started + SECONDS, probe_calls)
     original = coding.OllamaModel
-    coding.OllamaModel = lambda **kw: OllamaModel(**kw, transport=transport)  # type: ignore[assignment]
+    coding.OllamaModel = lambda **kw: OllamaModel(**{**kw, "transport": transport})  # type: ignore[assignment]
     result: dict[str, object] = {"engine": engine}
     runtime = run_id = live = None
     try:

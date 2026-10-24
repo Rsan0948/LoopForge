@@ -17,6 +17,7 @@ import httpx
 
 from loopforge.adapters.gemini_supervisor import GeminiSupervisor, load_gemini_key
 from loopforge.adapters.goal_journal import SQLiteGoalJournal
+from loopforge.adapters.mlx_transport import lab_transport, mlx_ready
 from loopforge.entrypoints.campaign_coding import preflight
 from loopforge.entrypoints.repository_goal_models import RepositoryGoalConfig
 from loopforge.entrypoints.repository_supervisor import RepositoryGoalService
@@ -64,12 +65,18 @@ def dependencies(directory: Path) -> None:
     cls = RepositoryGoalConfig if filename.startswith("repository") else PreparedGoalConfig
     config = cls.model_validate_json((directory / filename).read_text())
     preflight(config.task)
-    with httpx.Client(timeout=5, trust_env=False) as client:
-        response = client.get("http://127.0.0.1:11434/api/tags")
-        response.raise_for_status()
-        if config.campaign.model not in {m["name"] for m in response.json()["models"]}:
-            msg = "Configured local model is unavailable"
+    if config.campaign.engine == "mlx":
+        if not mlx_ready():
+            msg = "The MLX server is unavailable"
             raise ValueError(msg)
+        lab_transport().close()  # Pinned model revision and renderer must be present.
+    else:
+        with httpx.Client(timeout=5, trust_env=False) as client:
+            response = client.get("http://127.0.0.1:11434/api/tags")
+            response.raise_for_status()
+            if config.campaign.model not in {m["name"] for m in response.json()["models"]}:
+                msg = "Configured local model is unavailable"
+                raise ValueError(msg)
     if config.remote_data != "none":
         load_gemini_key(Path(".loopforge/secrets.env"))
 

@@ -42,6 +42,9 @@ class CampaignConfig(StrictRecord):
         "qwen-session-v1",
         "qwen-native-v1",
     ] = "baseline-v1"
+    # Local inference engine for the coding worker. MLX serves the same native protocol
+    # through adapters.mlx_transport; endpoint, model revision and renderer are code-owned.
+    engine: Literal["ollama", "mlx"] = "ollama"
     max_iterations: int = Field(default=96, ge=2, le=192)
     max_tokens: int = Field(default=500_000, ge=1000, le=2_000_000)
     max_seconds: int = Field(default=7200, ge=30, le=14_400)
@@ -63,6 +66,8 @@ class CampaignConfig(StrictRecord):
             data.pop("force_repair_attempt", None)
         if self.review_provider == "local":
             data.pop("review_provider", None)
+        if self.engine == "ollama":
+            data.pop("engine", None)
         if not self.repair_decisions:
             data.pop("repair_decisions", None)
         if self.repair_recovery_run_id is None:
@@ -75,6 +80,11 @@ class CampaignConfig(StrictRecord):
 
     @model_validator(mode="after")
     def safe_scope(self) -> "CampaignConfig":
+        if self.engine == "mlx" and (
+            self.model != "qwen3.6:35b-a3b" or self.inference_profile != "qwen-native-v1"
+        ):
+            msg = "The MLX engine serves only the native qwen3.6:35b-a3b profile"
+            raise ValueError(msg)
         if self.repair_escalation and self.inference_profile != "qwen-state-v1":
             msg = "Repair escalation requires the fresh-state profile"
             raise ValueError(msg)

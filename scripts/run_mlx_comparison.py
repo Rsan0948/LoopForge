@@ -298,7 +298,7 @@ def child(plan_path, job_index):
     original_model, original_profile = coding.OllamaModel, coding.profile_for
 
     def model_factory(**kwargs):
-        return OllamaModel(**kwargs, transport=transport)
+        return OllamaModel(**{**kwargs, "transport": transport})
 
     def profile_factory(*args, **kwargs):
         return replace(original_profile(*args, **kwargs), output_tokens=OUTPUT)

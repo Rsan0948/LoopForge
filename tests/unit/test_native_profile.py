@@ -59,7 +59,7 @@ def native_run(
     real = ollama_model.OllamaModel
 
     def factory(**kwargs: object) -> ollama_model.OllamaModel:
-        return real(**kwargs, transport=httpx.MockTransport(transport))  # type: ignore[arg-type]
+        return real(**{**kwargs, "transport": httpx.MockTransport(transport)})  # type: ignore[arg-type]
 
     monkeypatch.setattr(coding, "OllamaModel", factory)
     config = campaign_config(repo).model_copy(

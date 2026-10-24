@@ -19,6 +19,7 @@ from loopforge.adapters.context import CharsPerTokenCounter, StateContextBuilder
 from loopforge.adapters.file_tools import WorkspaceFileTools
 from loopforge.adapters.git_workspace import GitWorkspace, GitWorkspaceManager
 from loopforge.adapters.local_sandbox import SandboxLimits
+from loopforge.adapters.mlx_transport import lab_transport
 from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.adapters.ollama_profiles import profile_for
 from loopforge.adapters.python_formatter import FormattingError, PinnedImportFormatter
@@ -1384,6 +1385,8 @@ def build_coding(  # noqa: PLR0913 - explicit composition dependencies and revis
             history_replay=profile.history_replay,
             observation_format=profile.observation_format,
             working_budget_tokens=profile.working_budget_tokens,
+            # The engine switch is a transport; Ollama keeps OllamaModel's own client.
+            transport=lab_transport() if config.engine == "mlx" else None,
         )
     )
     selected = model if model is not None else live
