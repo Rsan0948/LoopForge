@@ -107,6 +107,10 @@ class ContainerSandboxConfig:
     user: str | None = None
     docker_executable: str = "docker"
     workspace_read_only: bool = False
+    # Code-owned extra read-only inputs, as (absolute host directory, absolute container
+    # path): for example a harness-written script kept outside the workspace. Never the
+    # workspace or /tmp; mounted read-only, so they grant no write path.
+    read_only_mounts: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.image.strip() or any(char.isspace() for char in self.image):
@@ -141,6 +145,22 @@ class ContainerSandboxConfig:
         if len(set(names)) != len(names):
             msg_6 = "sandbox command names must be unique"
             raise ValueError(msg_6)
+        targets = [target for _source, target in self.read_only_mounts]
+        for source, target in self.read_only_mounts:
+            if (
+                not Path(source).is_absolute()
+                or not target.startswith("/")
+                or ".." in Path(source).parts
+                or ".." in target.split("/")
+                or any(char in source + target for char in ",\n\0")
+                or target.rstrip("/") in {_WORKSPACE_MOUNT, "/tmp", ""}
+                or target.startswith((_WORKSPACE_MOUNT + "/", "/tmp/"))
+            ):
+                msg_8 = f"invalid read-only mount: {source!r} -> {target!r}"
+                raise ValueError(msg_8)
+        if len(set(targets)) != len(targets):
+            msg_9 = "read-only mount targets must be unique"
+            raise ValueError(msg_9)
 
 
 class ContainerSandbox:
@@ -184,6 +204,7 @@ class ContainerSandbox:
         self._user = config.user
         self._docker = config.docker_executable
         self._workspace_read_only = config.workspace_read_only
+        self._read_only_mounts = config.read_only_mounts
         self._active_container: str | None = None
 
     @property
@@ -317,6 +338,8 @@ class ContainerSandbox:
             f"type=bind,source={self._root},target={_WORKSPACE_MOUNT}"
             + (",readonly" if self._workspace_read_only else ""),
         ]
+        for source, target in self._read_only_mounts:
+            argv.extend(["--mount", f"type=bind,source={source},target={target},readonly"])
         if self._user is not None:
             argv.extend(["--user", self._user])
         for key, value in sorted(self._environment.items()):

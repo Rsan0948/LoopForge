@@ -379,6 +379,46 @@ def test_docker_run_argv_omits_user_when_unset(tmp_path: Path) -> None:
     assert argv[-4:] == (_TEST_IMAGE, "/bin/sh", "-c", "true")
 
 
+def test_read_only_mounts_are_bound_read_only(tmp_path: Path) -> None:
+    spec = _sh("true")
+    scratch = tmp_path / "scratch"
+    workspace = tmp_path / "ws"
+    scratch.mkdir()
+    workspace.mkdir()
+    config = _config(commands=(spec,), read_only_mounts=((str(scratch), "/scratch"),))
+    sandbox = _sandbox(workspace, config)
+    argv = sandbox._docker_run_argv(  # pyright: ignore[reportPrivateUsage]  # enforcement-surface pin
+        spec=spec, container_name="test-name"
+    )
+    assert f"type=bind,source={scratch},target=/scratch,readonly" in argv
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        ("relative/dir", "/scratch"),
+        ("/host", "scratch"),
+        ("/host", "/workspace"),
+        ("/host", "/workspace/inner"),
+        ("/host", "/tmp"),
+        ("/host,readonly=false", "/scratch"),
+        ("/host", "/a/../workspace"),
+    ],
+    ids=[
+        "relative-source",
+        "relative-target",
+        "workspace",
+        "inside-workspace",
+        "tmp",
+        "option-injection",
+        "traversal",
+    ],
+)
+def test_read_only_mounts_cannot_shadow_or_widen_the_sandbox(mount: tuple[str, str]) -> None:
+    with pytest.raises(ValueError, match="read-only mount"):
+        _config(read_only_mounts=(mount,))
+
+
 # --- Plumbing with a faked container runtime (no daemon required) ---
 
 
