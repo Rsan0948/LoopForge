@@ -1,5 +1,6 @@
 """Read-only review composition root: no shell, Git writes, or repair tools."""
 
+import hashlib
 import json
 from collections.abc import Mapping
 from dataclasses import replace
@@ -28,6 +29,7 @@ from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ContextItem, ContextSource, ModelContext, ModelRole
 from loopforge.domain.context_lifecycle import ContextTokenBudget
+from loopforge.domain.events import ToolFailed, ToolSucceeded
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.prompts import PromptSection, PromptTemplate
 from loopforge.domain.reliability import ReliabilityPolicy, ToolFailureClass
@@ -49,9 +51,10 @@ from loopforge.domain.types import (
     Permission,
     RiskLevel,
     RunId,
+    StopReason,
     UsageDelta,
 )
-from loopforge.entrypoints.agent_config import worker_profile
+from loopforge.entrypoints.agent_config import GATE_LIMITS, GateLimits, worker_profile
 from loopforge.entrypoints.campaign_evidence import missing_coverage, required_reads, source_page
 from loopforge.entrypoints.campaign_models import (
     CampaignConfig,
@@ -67,6 +70,7 @@ from loopforge.ports.model import (
     ModelToolSpec,
     ModelTurn,
     ModelTurnError,
+    RunGateStop,
 )
 from loopforge.ports.state_store import StateStorePort
 from loopforge.ports.tools import ToolExecutionRequest, ToolResult, UnknownToolError
@@ -447,7 +451,7 @@ class ReviewTools:
                 "submit_report now from what you have read; list checks you could not "
                 "settle as unresolved.",
                 error_code="REVIEW_REPORT_REQUIRED",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         result = self._execute_tool(request)
         self.calls += 1
@@ -538,7 +542,7 @@ class ReviewTools:
                 ok=False,
                 observation=str(exc),
                 error_code="REVIEW_ARGUMENTS",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
 
     def read_file(self, args: Mapping[str, str]) -> ToolResult:
@@ -806,6 +810,62 @@ class CompletionAwareModel:
                 "REVIEW_SOURCE_CIRCUIT_OPEN",
                 "Repeated invalid source requests opened a circuit; preserve evidence and stop",
             )
+        return self.model.propose_action(context)
+
+
+class ReviewLoopModel:
+    """Bound a reviewer that repeats itself without capping one that is correcting itself.
+
+    Every tool result, accepted or refused, is information when it is new: a corrected
+    report gets a different refusal, a new read returns new source. A reviewer whose
+    results keep repeating gets one explicit warning after ``turns`` repeats and is
+    stopped as stalled after ``turns`` more. Spend is bounded by the goal's authorized
+    paid budget, not by counting the reviewer's mistakes.
+    """
+
+    def __init__(self, model: ModelPort, store: StateStorePort, turns: int) -> None:
+        self.model, self.store, self.turns = model, store, turns
+        self.warned: set[str] = set()
+
+    @property
+    def capabilities(self) -> ModelCapabilities:
+        return self.model.capabilities
+
+    def propose_action(self, context: ModelContext) -> ModelTurn:
+        seen: set[str] = set()
+        repeats = 0
+        for event in self.store.events_for(context.run_id):
+            if isinstance(event, ToolSucceeded):
+                result = event.observation
+            elif isinstance(event, ToolFailed):
+                result = f"{event.error_code}:{event.error_message}"
+            else:
+                continue
+            digest = hashlib.sha256(result.encode()).hexdigest()
+            repeats = repeats + 1 if digest in seen else 0
+            seen.add(digest)
+        key = str(context.run_id)
+        if repeats >= 2 * self.turns:
+            raise RunGateStop(
+                StopReason.STALLED,
+                "REVIEW_REPEATING",
+                f"{repeats} tool results in a row repeated earlier ones after a warning; "
+                "preserve the review evidence",
+            )
+        if repeats >= self.turns and key not in self.warned:
+            self.warned.add(key)
+            warning = ContextItem(
+                item_id=ContextItemId(f"{key}:review-repetition-warning"),
+                content=f"Your last {repeats} actions returned results you already had. "
+                "Repeating them will end this review. Read something new, or submit a "
+                "corrected report that addresses the exact error you were given.",
+                trust=TrustClass.RUNTIME_POLICY,
+                source=ContextSource(
+                    origin=TrustClass.RUNTIME_POLICY, reference="review-repetition-warning"
+                ),
+                created_at=context.assembled_at,
+            )
+            context = replace(context, items=(*context.items, warning))
         return self.model.propose_action(context)
 
 
@@ -1345,7 +1405,11 @@ def build_review(  # noqa: PLR0913 - explicit trusted workload context tuning
     model: ModelPort | None = None,
     patch_review: bool = False,
     max_source_reads: int = 10,
+    max_cost_usd: float = 1.0,
+    gates: GateLimits = GATE_LIMITS,
 ) -> tuple[Runtime, ReviewTools, OllamaModel | None]:
+    """``max_cost_usd`` is the run's runtime cost ceiling: a paid reviewer passes the
+    goal's authorized paid envelope, which its per-call reservations already enforce."""
     tools = ReviewTools(files, previous, max_source_reads=max_source_reads)
     worker = worker_profile(config)
     profile = profile_for(
@@ -1393,13 +1457,19 @@ def build_review(  # noqa: PLR0913 - explicit trusted workload context tuning
     if profile.conversation_mode == "state":
         context_port = ReviewStateContext(context_builder, tools)
     runtime = Runtime(
-        model=CompletionAwareModel(DeadlineAwareModel(selected, store, config), store, tools),
+        model=CompletionAwareModel(
+            ReviewLoopModel(
+                DeadlineAwareModel(selected, store, config), store, gates.review_repeat_turns
+            ),
+            store,
+            tools,
+        ),
         tools=tools,
         verifier=tools,
         store=store,
         control=ControlPolicy(
             BudgetLimit(
-                max_cost_usd=1,
+                max_cost_usd=max_cost_usd,
                 max_iterations=config.max_iterations,
                 max_total_tokens=config.max_tokens,
                 max_elapsed_seconds=config.max_seconds,

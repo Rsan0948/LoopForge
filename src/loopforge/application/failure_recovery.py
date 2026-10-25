@@ -45,6 +45,7 @@ REASON_KINDS: Final[dict[str, FailureKind]] = {
     "CODING_NO_NEW_EVIDENCE": FailureKind.NO_PROGRESS,
     "CODING_REPAIR_UNABLE": FailureKind.NO_PROGRESS,
     "REVIEW_NO_NEW_EVIDENCE": FailureKind.NO_PROGRESS,
+    "REVIEW_REPEATING": FailureKind.NO_PROGRESS,
     # Checks could not run, or the harness was misconfigured.
     "CODING_REQUIRED_CHECK_CIRCUIT_OPEN": FailureKind.ENVIRONMENT,
     "CODING_AUTOMATIC_CHECK_BLOCKED": FailureKind.ENVIRONMENT,

@@ -130,6 +130,9 @@ class GateLimits:
     # Infrastructure failures of one tool without a success of that tool in between
     # (refused model input does not count).
     tool_circuit_failures: int = 3
+    # Reviewer tool results in a row that repeat earlier ones before a warning; as many
+    # again after it ends the review as stalled.
+    review_repeat_turns: int = 4
     # Local inference is free; the runtime still needs a finite cost ceiling.
     local_cost_usd: float = 1.0
     # Worker evidence larger than this reaches the supervisor as a retrievable artifact.
@@ -140,6 +143,7 @@ class GateLimits:
             self.no_progress_verifications,
             self.no_new_evidence_turns,
             self.tool_circuit_failures,
+            self.review_repeat_turns,
             self.supervisor_evidence_bytes,
         )
         if any(type(value) is not int or value < 1 for value in counts) or not (

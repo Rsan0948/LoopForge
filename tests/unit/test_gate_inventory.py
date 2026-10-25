@@ -35,7 +35,9 @@ WRAPPER_STOPS = {
     "CODING_NO_NEW_EVIDENCE": "N turns with an unchanged patch and no new tool result, "
     "then one warning, then N more: stalled",
     "MODEL_DEADLINE": "run deadline reached before a model call",
-    "REVIEW_NO_NEW_EVIDENCE": "reviewer repeats itself",
+    "REVIEW_NO_NEW_EVIDENCE": "local reviewer: six turns without new source",
+    "REVIEW_REPEATING": "reviewer tool results repeat N times, then a warning, then N more: "
+    "stalled (replaces counting refused reviewer input toward circuits)",
     "REVIEW_SOURCE_CIRCUIT_OPEN": "reviewer source tool circuit opened",
     "REVIEW_REPORT_CIRCUIT_OPEN": "reviewer report tool circuit opened",
     "REVIEW_REQUIRED_READ_LIMIT": "reviewer read capacity exhausted",

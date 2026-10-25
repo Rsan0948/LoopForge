@@ -14,8 +14,10 @@ from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import ScriptedModel
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.campaign import CampaignEvent, CampaignState, reduce_campaign
+from loopforge.domain.context import ModelContext
 from loopforge.domain.security import TrustClass
-from loopforge.domain.types import ActionId, RunStatus
+from loopforge.domain.state import RunState
+from loopforge.domain.types import ActionId, RunStatus, UsageDelta
 from loopforge.entrypoints import campaign as module
 from loopforge.entrypoints.campaign import CampaignHarness
 from loopforge.entrypoints.campaign_models import (
@@ -25,6 +27,7 @@ from loopforge.entrypoints.campaign_models import (
     ShortReferencedReport,
 )
 from loopforge.entrypoints.campaign_review import ReviewTools, build_review
+from loopforge.ports.model import ModelTurn
 from loopforge.ports.tools import ToolExecutionRequest, UnknownToolError
 
 
@@ -614,25 +617,44 @@ def test_model_change_denied_with_worker_or_any_slot(
     harness.close()
 
 
-def test_review_stops_before_inference_once_required_report_circuit_is_open() -> None:
+def test_an_identical_invalid_report_forever_ends_as_a_repeating_review() -> None:
     store = InMemoryEventStore()
     actions = [
         ActionProposal(ActionId(f"bad-{i}"), "submit_report", {"report": json.dumps(report())})
-        for i in range(3)
+        for i in range(30)
     ]
-    actions.append(ActionProposal(ActionId("never-called"), "read_file", {"path": "a.py"}))
     runtime, tools, _ = build_review(
         config(), files={"a.py": "bad()"}, previous="", store=store, model=ScriptedModel(actions)
     )
     state = runtime.run("Review only")
-    assert state.status == RunStatus.FAILED
-    assert state.open_circuit_tools == ("submit_report",)
+    assert state.status == RunStatus.STALLED
+    assert not state.open_circuit_tools  # refused input never opens a circuit
     assert tools.source_reads == 0
     events = store.events_for(state.run_id)
-    assert sum(type(e).__name__ == "ActionProposed" for e in events) == 3
-    assert any(
-        type(e).__name__ == "RunStopped" and "REVIEW_REPORT_CIRCUIT_OPEN" in str(e) for e in events
+    # The first result is new; four repeats, a warning, four more.
+    assert sum(type(e).__name__ == "ActionProposed" for e in events) == 9
+    assert any(type(e).__name__ == "RunStopped" and "REVIEW_REPEATING" in str(e) for e in events)
+    assert not any(type(e).__name__ == "ModelAttemptFailed" for e in events)
+
+
+def test_a_reviewer_that_keeps_correcting_its_report_is_not_capped() -> None:
+    store = InMemoryEventStore()
+    # Five refused reports (beyond the old three-strike circuit), then a read and a
+    # valid report: the review completes.
+    actions = [
+        ActionProposal(ActionId(f"bad-{i}"), "submit_report", {"report": json.dumps(report())})
+        for i in range(5)
+    ]
+    actions += [
+        ActionProposal(ActionId("read"), "read_file", {"path": "a.py"}),
+        ActionProposal(ActionId("valid"), "submit_report", {"report": json.dumps(report())}),
+    ]
+    runtime, tools, _ = build_review(
+        config(), files={"a.py": "bad()"}, previous="", store=store, model=ScriptedModel(actions)
     )
+    state = runtime.run("Review only")
+    assert state.status == RunStatus.SUCCEEDED
+    assert tools.report is not None
 
 
 def test_review_allows_correction_before_circuit_threshold_and_ignores_forged_source_status() -> (
@@ -703,20 +725,21 @@ def test_park_rejects_a_live_worker_or_occupied_slot(
 
 
 @pytest.mark.parametrize("tool_name", ["read_file", "search_source"])
-def test_review_stops_on_source_circuit_without_repeated_blocked_inference(tool_name: str) -> None:
+def test_invalid_source_requests_do_not_end_a_review_that_recovers(tool_name: str) -> None:
     args = {"path": "missing"} if tool_name == "read_file" else {"prefix": "", "query": ""}
     actions = [ActionProposal(ActionId(f"bad-{i}"), tool_name, args) for i in range(3)]
-    actions.append(ActionProposal(ActionId("never"), "previous_reports", {}))
+    actions += [
+        ActionProposal(ActionId("read"), "read_file", {"path": "a.py"}),
+        ActionProposal(ActionId("valid"), "submit_report", {"report": json.dumps(report())}),
+    ]
     store = InMemoryEventStore()
     runtime, tools, _ = build_review(
-        config(), files={}, previous="", store=store, model=ScriptedModel(actions)
+        config(), files={"a.py": "bad()"}, previous="", store=store, model=ScriptedModel(actions)
     )
     state = runtime.run("Review only")
-    assert state.status == RunStatus.FAILED
-    assert tools.report is None
-    events = store.events_for(state.run_id)
-    assert sum(type(e).__name__ == "ActionProposed" for e in events) == 3
-    assert any("REVIEW_SOURCE_CIRCUIT_OPEN" in str(e) for e in events)
+    assert state.status == RunStatus.SUCCEEDED
+    assert not state.open_circuit_tools
+    assert tools.report is not None
 
 
 def test_last_source_excerpt_directs_submission_and_report_remains_allowed() -> None:
@@ -885,3 +908,60 @@ def test_short_report_still_rejects_oversized_single_line() -> None:
     data["findings"][0]["evidence"] = [{"excerpt_id": "e1", "start_line": 1, "line_count": 1}]  # pyright: ignore[reportIndexIssue, reportUnknownMemberType]
     with pytest.raises(ValueError, match="1000"):
         tools.referenced_report(ShortReferencedReport.model_validate(data).referenced())
+
+
+class _Charging(ScriptedModel):
+    """A paid reviewer: each turn costs a fixed amount and records what it was shown."""
+
+    def __init__(self, actions: list[ActionProposal], cost_usd: float) -> None:
+        super().__init__(actions)
+        self.cost_usd = cost_usd
+        self.seen: list[ModelContext] = []
+
+    def propose_action(self, context: ModelContext) -> ModelTurn:
+        self.seen.append(context)
+        turn = super().propose_action(context)
+        return replace(turn, usage=UsageDelta(cost_usd=self.cost_usd))
+
+
+def _paid_review(max_cost_usd: float) -> RunState:
+    actions = [ActionProposal(ActionId(f"r{i}"), "read_file", {"path": "a.py"}) for i in range(3)]
+    actions.append(
+        ActionProposal(ActionId("valid"), "submit_report", {"report": json.dumps(report())})
+    )
+    runtime, _, _ = build_review(
+        config(),
+        files={"a.py": "bad()"},
+        previous="",
+        store=InMemoryEventStore(),
+        model=_Charging(actions, cost_usd=0.4),
+        max_cost_usd=max_cost_usd,
+    )
+    return runtime.run("Review only")
+
+
+def test_a_paid_review_is_bounded_by_its_authorized_envelope_not_a_fixed_dollar() -> None:
+    assert _paid_review(max_cost_usd=5.0).status == RunStatus.SUCCEEDED
+    capped = _paid_review(max_cost_usd=1.0)
+    assert capped.status == RunStatus.BUDGET_EXHAUSTED
+
+
+def test_a_repeating_reviewer_is_warned_once_before_it_is_stopped() -> None:
+    model = _Charging(
+        [
+            ActionProposal(ActionId(f"bad-{i}"), "submit_report", {"report": json.dumps(report())})
+            for i in range(30)
+        ],
+        cost_usd=0.0,
+    )
+    runtime, _, _ = build_review(
+        config(), files={"a.py": "bad()"}, previous="", store=InMemoryEventStore(), model=model
+    )
+    runtime.run("Review only")
+    warned = [
+        index
+        for index, context in enumerate(model.seen)
+        if any(str(item.item_id).endswith(":review-repetition-warning") for item in context.items)
+    ]
+    assert len(warned) == 1
+    assert warned[0] < len(model.seen) - 1

@@ -465,6 +465,11 @@ class CodingCoordinator:
                     patch_review=True,
                     model=frontier,
                     max_source_reads=contract.max_review_reads,
+                    # A paid review is bounded by the goal's authorized envelope (its
+                    # reservations enforce it), not by a fixed per-run dollar figure.
+                    max_cost_usd=self.parent_budget.account().ceiling / 1_000_000
+                    if frontier is not None and self.parent_budget is not None
+                    else 1.0,
                 )
                 review_tools.post_coverage_calls = contract.max_review_calls_after_coverage
                 if frontier is not None:

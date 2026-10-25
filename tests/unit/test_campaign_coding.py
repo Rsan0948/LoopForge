@@ -622,8 +622,10 @@ def test_serial_coding_review_acceptance(  # noqa: PLR0915 - complete sequential
         patch_review: bool = False,
         max_source_reads: int = 10,
         model: ModelPort | None = None,
+        max_cost_usd: float = 1.0,
     ):
         assert patch_review
+        assert max_cost_usd == 1.0  # a local review keeps the local ceiling
         assert max_source_reads >= 10
         model = ScriptedModel(
             [

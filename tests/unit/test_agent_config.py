@@ -102,7 +102,17 @@ def test_gate_limits_reach_every_rule_they_name(
 
 
 def test_default_gate_limits_are_todays_values() -> None:
-    assert GateLimits(8, 8, 3, 1.0, 24_000) == GATE_LIMITS
+    assert (
+        GateLimits(
+            no_progress_verifications=8,
+            no_new_evidence_turns=8,
+            tool_circuit_failures=3,
+            review_repeat_turns=4,
+            local_cost_usd=1.0,
+            supervisor_evidence_bytes=24_000,
+        )
+        == GATE_LIMITS
+    )
 
 
 @pytest.mark.parametrize(
