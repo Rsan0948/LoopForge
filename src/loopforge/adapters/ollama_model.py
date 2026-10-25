@@ -1052,8 +1052,14 @@ class OllamaModel:
         if len(calls) != 1:
             history = self._conversations.get(context.run_id)
             if history is not None:
-                # Code-owned protocol feedback only: never replay malformed
-                # provider content as an instruction or execute a partial batch.
+                # Keep the rejected reply as the model's own turn, then correct it. The
+                # conversation stays append-only, so the server's prompt cache extends
+                # instead of re-reading everything: a model with recurrent layers cannot
+                # rewind its cache to before the reply (live 2026-10-25: 12 of 16 full
+                # re-reads, 30-44k tokens each, followed a dropped reply). It stays
+                # assistant-role model inference, never an instruction, and no tool runs.
+                history.append(self._rejected_reply(response))
+                # Code-owned protocol feedback only: never execute a partial batch.
                 history.append(
                     {
                         "role": self._correction_role(),
@@ -1118,6 +1124,22 @@ class OllamaModel:
             tool_name=function.name,
             arguments=arguments,
         )
+
+    def _rejected_reply(self, response: ChatResponse) -> dict[str, object]:
+        """A reply with no runnable action, as history: the same content and thinking
+        bounds as an accepted reply, and no tool calls."""
+        thinking = response.message.thinking if self._preserve_thinking else ""
+        content = response.message.content
+        if self._history_replay == "bounded":
+            if len(thinking.encode()) > 4096:
+                thinking = ""
+            if len(content.encode()) > 4096:
+                content = "[Optional model commentary omitted whole.]"
+        return {
+            "role": "assistant",
+            "content": content,
+            **({"thinking": thinking} if thinking else {}),
+        }
 
     def _cost(self, response: ChatResponse) -> float:
         return (

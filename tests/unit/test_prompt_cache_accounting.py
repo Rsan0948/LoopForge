@@ -2,15 +2,17 @@
 
 import json
 from dataclasses import replace
+from typing import cast
 
 import httpx
+import pytest
 
 from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.domain.context import ModelContext
 from loopforge.domain.policy import ControlPolicy
 from loopforge.domain.state import RunState
 from loopforge.domain.types import BudgetLimit, RunId
-from loopforge.ports.model import ModelToolSpec
+from loopforge.ports.model import ModelToolSpec, ModelTurnError
 from tests.unit.test_ollama_model import (
     TEMPLATE,
     TOOLS,
@@ -110,3 +112,23 @@ def test_the_token_budget_counts_work_tokens_not_repeated_input() -> None:
     assert policy.evaluate(cached).reason_code == "CONTINUE_WITHIN_POLICY"
     over = replace(cached, cached_input_tokens=99_999)
     assert over.work_tokens == 200  # a cache count larger than input never goes negative
+
+
+def test_a_rejected_reply_stays_in_history_so_the_retry_extends_the_cache() -> None:
+    # A model with recurrent layers cannot rewind its prompt cache to before its own
+    # reply; dropping a rejected reply forced a full re-read of the conversation.
+    rejected = _chat_payload(tool_calls=[], prompt_tokens=10_000)
+    message = cast("dict[str, object]", rejected["message"])
+    message["content"] = "I will read the file next."
+    transport, sent = _replies(rejected, _chat_payload(prompt_tokens=10_060))
+    model = _history_model(transport)
+    with pytest.raises(ModelTurnError):
+        model.propose_action(_context())
+    model.propose_action(_context())
+    first = cast("list[dict[str, object]]", sent[0]["messages"])
+    retry = cast("list[dict[str, object]]", sent[1]["messages"])
+    assert retry[: len(first)] == first
+    reply, correction = retry[len(first)], retry[len(first) + 1]
+    assert reply == {"role": "assistant", "content": "I will read the file next."}
+    assert "Protocol correction" in str(correction["content"])
+    assert correction["role"] != "assistant"

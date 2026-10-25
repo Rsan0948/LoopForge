@@ -540,7 +540,10 @@ def test_rejected_batch_gets_protocol_feedback_before_valid_retry(count: int) ->
     assert isinstance(messages[-1]["content"], str)
     assert "exactly ONE tool call" in messages[-1]["content"]
     assert "untrusted" not in messages[-1]["content"]
-    assert all(message["role"] != "assistant" for message in messages)
+    # The rejected reply stays as the model's own turn (append-only history for the
+    # prompt cache), carrying no tool call: nothing from it ran or will run.
+    assistant = [message for message in messages if message["role"] == "assistant"]
+    assert assistant == [{"role": "assistant", "content": ""}]
 
 
 def test_negative_token_counts_fail_explicitly() -> None:
