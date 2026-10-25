@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -2199,3 +2199,44 @@ def test_passing_verification_clears_historical_inconclusive_status(
         assert detail["last_verification_passed"] is True
         assert detail["last_verification_task_complete"] is task_complete
         assert detail["last_verification_inconclusive"] is False
+
+
+class _Extension:
+    """An application mounted into the server: one route and a background service."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def router(self) -> APIRouter:
+        router = APIRouter()
+
+        @router.get("/api/extension/ping")
+        def ping() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+            return {"pong": "yes"}
+
+        return router
+
+    def start(self) -> None:
+        self.events.append("start")
+
+    def close(self) -> None:
+        self.events.append("close")
+
+
+def test_an_extension_is_served_and_its_service_runs_for_the_app_lifetime(
+    tmp_path: Path,
+) -> None:
+    extension = _Extension()
+    settings = ServerSettings(
+        store_kind="sqlite", sqlite_path=str(tmp_path / "events.db"), data_dir=tmp_path / "data"
+    )
+    app = create_app(settings, bundle_factory=FakeBundleFactory([], []), extensions=(extension,))
+    with TestClient(app) as client:
+        assert extension.events == ["start"]
+        assert client.get("/api/extension/ping").json() == {"pong": "yes"}
+    assert extension.events == ["start", "close"]
+
+
+def test_without_extensions_the_core_server_has_no_goal_routes(tmp_path: Path) -> None:
+    with _client(tmp_path, FakeBundleFactory([], [])) as client:
+        assert client.get("/api/goals").status_code == 404

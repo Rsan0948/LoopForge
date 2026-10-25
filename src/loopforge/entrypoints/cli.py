@@ -897,7 +897,6 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
     static_dir: str | None,
     evals_dir: str | None,
     policies_dir: str | None,
-    goals_dir: str | None = None,
 ) -> int:
     """Run the operator server (PACS-014): REST + WebSocket over the durable store.
 
@@ -924,7 +923,6 @@ def _serve(  # noqa: PLR0913 - CLI wiring keeps server options explicit
         static_dir=resolved_static,
         evals_dir=Path(evals_dir) if evals_dir else None,
         policies_dir=Path(policies_dir) if policies_dir else None,
-        goals_dir=Path(goals_dir) if goals_dir else None,
     )
     uvicorn.run(create_app(settings), host=host, port=port)
     return 0
@@ -1305,12 +1303,6 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
         "(default: DATA-DIR/evals)",
     )
     parser.add_argument(
-        "--goals-dir",
-        metavar="DIR",
-        default=None,
-        help="serve only: operator-owned goal directories (default: DATA-DIR/goals)",
-    )
-    parser.add_argument(
         "--policies-dir",
         metavar="DIR",
         default=None,
@@ -1438,7 +1430,6 @@ def main() -> int:  # noqa: PLR0911, PLR0912, PLR0915 - CLI dispatch keeps one r
             static_dir=args.static_dir,
             evals_dir=args.evals_dir,
             policies_dir=args.policies_dir,
-            goals_dir=args.goals_dir,
         )
     return 2
 

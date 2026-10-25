@@ -1,8 +1,8 @@
 # ADR-0021: Separate the open-source core from the agent product
 
 Date: 2026-10-24  
-Status: accepted (user decision). The physical split is deferred; this record governs where new
-work goes from now on.
+Status: accepted (user decision). The physical split was done on 2026-10-24 (WorkBuddy migration
+step 4); see "Split done" below.
 
 ## Context
 
@@ -75,3 +75,25 @@ Still open:
   feature ledger remain, because feature work has the same "progress inside a probe" problem.
 - Until the split happens, both live in this repository. Import-linter can enforce the boundary
   early with an independence contract once B's modules move under one package.
+
+## Split done (2026-10-24)
+
+The agent product now lives in WorkBuddy (`Rsan0948/WorkBuddy`), with the core's layers. Moved:
+the goal domain (goals, investigation, goal review), the coding and review lifecycles, the paid
+budget, the supervisor and paid-budget ports, `GoalCoordinator` and failure recovery (they were
+not generic goal control: they encode the Gemini supervisor, campaigns and the coding worker),
+the Gemini, MLX, journal and store adapters, every goal and campaign entrypoint, their tests and
+the trial tooling. The core keeps no reference to WorkBuddy (an architecture test enforces it).
+
+Two core changes made the cut clean:
+
+- **`ServerExtension`** (`entrypoints/server.py`): the operator server no longer hosts goals. An
+  application passes extensions (routes plus a background service) to `create_app` or
+  `run_console`. `--goals-dir` is gone from the core CLI; `workbuddy-console` mounts goals.
+- **`adapters/repair_commands.py`**: the generic helpers that lower repair commands into sandbox
+  specs and tool bindings moved out of the repair entrypoint so applications can use them.
+
+The MLX server script and renderer stay in `scripts/` until the installed `local.loopforge.mlx`
+service is reinstalled from WorkBuddy; WorkBuddy's agent state still lives in this checkout's
+`.loopforge`.
+

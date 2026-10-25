@@ -102,8 +102,11 @@ class TestRunConsole:
 
         captured: dict[str, Any] = {}
 
-        def _create_app(settings: server_module.ServerSettings) -> object:
+        def _create_app(
+            settings: server_module.ServerSettings, *, extensions: tuple[object, ...] = ()
+        ) -> object:
             captured["settings"] = settings
+            captured["extensions"] = extensions
             return object()
 
         def _open(url: str) -> None:

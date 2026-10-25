@@ -52,8 +52,6 @@ dev = [
 [project.scripts]
 loopforge = "loopforge.entrypoints.cli:main"
 loopforge-console = "loopforge.entrypoints.cli:main"
-loopforge-supervisor = "loopforge.entrypoints.goal_commands:prepared_main"
-loopforge-repository-supervisor = "loopforge.entrypoints.goal_commands:repository_main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/loopforge"]

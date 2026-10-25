@@ -81,3 +81,13 @@ def test_domain_has_no_external_runtime_dependencies() -> None:
                 if root not in allowed:
                     violations.append(f"{path.name}: from {node.module}")
     assert violations == [], "Domain external dependencies:\n" + "\n".join(violations)
+
+
+def test_the_core_never_depends_on_applications_built_on_it() -> None:
+    """ADR-0021: WorkBuddy (the agent product) depends on the core, never the reverse."""
+    offenders = [
+        str(path.relative_to(SRC))
+        for path in SRC.rglob("*.py")
+        if "workbuddy" in path.read_text().lower()
+    ]
+    assert offenders == []
