@@ -206,7 +206,7 @@ def test_explicit_generation_settings_are_sent_without_changing_default() -> Non
     [
         (64, list[dict[str, object]](), True),
         (63, list[dict[str, object]](), False),
-        (64, [dict[str, object](function={"name": "read_file", "arguments": {}})] * 2, False),
+        (64, [dict[str, object](function={"name": "  ", "arguments": {}})], False),
     ],
 )
 def test_exhausted_actionless_thinking_falls_back_without_expanding_budget(
@@ -497,13 +497,6 @@ def test_incomplete_generation_fails_explicitly() -> None:
 
 _BAD_CALL_SHAPES: list[tuple[list[dict[str, object]], str]] = [
     ([], "0 tool actions"),
-    (
-        [
-            {"function": {"name": "read_file", "arguments": {"path": "a"}}},
-            {"function": {"name": "run_tests", "arguments": {}}},
-        ],
-        "2 tool actions",
-    ),
     ([{"function": {"name": "  ", "arguments": {}}}], "empty tool name"),
 ]
 
@@ -525,7 +518,7 @@ def test_non_string_argument_value_fails_explicitly() -> None:
         model.propose_action(_context())
 
 
-@pytest.mark.parametrize("count", [0, 2])
+@pytest.mark.parametrize("count", [0])
 def test_rejected_batch_gets_protocol_feedback_before_valid_retry(count: int) -> None:
     requests: list[dict[str, object]] = []
 
@@ -1489,14 +1482,11 @@ def test_protocol_correction_does_not_become_a_user_query_in_exact_mode(
     replay: str, role: str
 ) -> None:
     requests: list[dict[str, object]] = []
-    two_calls = [
-        {"function": {"name": "read_file", "arguments": {"path": "a.py"}}},
-        {"function": {"name": "read_file", "arguments": {"path": "b.py"}}},
-    ]
+    no_calls: list[dict[str, object]] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(json.loads(request.content))
-        calls = two_calls if len(requests) == 1 else None
+        calls = no_calls if len(requests) == 1 else None
         return httpx.Response(200, json=_chat_payload(tool_calls=calls))
 
     model = OllamaModel(
@@ -1594,3 +1584,42 @@ def test_compaction_frees_headroom_instead_of_trimming_one_turn_per_request() ->
     index = turns.index(compacted[0])
     following = [t.context_admission for t in turns[index + 1 : index + 3]]
     assert all(a is not None and a.compacted_turns == first.compacted_turns for a in following)
+
+
+_TWO_CALLS = [
+    {"function": {"name": "read_file", "arguments": {"path": "adder.py"}}},
+    {"function": {"name": "run_tests", "arguments": {"secret": "untrusted-argument"}}},
+]
+
+
+@pytest.mark.parametrize("mode", ["history", "state"])
+def test_a_reply_with_several_calls_runs_the_first_and_says_what_did_not_run(mode: str) -> None:
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        payload = _chat_payload(tool_calls=_TWO_CALLS) if len(requests) == 1 else _chat_payload()
+        return httpx.Response(200, json=payload)
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        transport=httpx.MockTransport(respond),
+        conversation_mode=mode,  # type: ignore[arg-type]
+    )
+    first = model.propose_action(_context())
+    assert first.action.tool_name == "read_file"
+    assert first.action.arguments == {"path": "adder.py"}
+    model.propose_action(_context())
+    messages = cast(list[dict[str, object]], requests[1]["messages"])
+    text = json.dumps(messages)
+    assert "only the first (read_file) ran. Not run: run_tests" in text
+    assert "untrusted-argument" not in text  # dropped calls' arguments are never echoed
+    calls = [
+        call
+        for message in messages
+        if message["role"] == "assistant"
+        for call in cast(list[object], message.get("tool_calls") or [])
+    ]
+    assert len(calls) == (1 if mode == "history" else 0)

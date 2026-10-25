@@ -159,6 +159,9 @@ class OllamaModel:
             raise ValueError(msg)
         self._conversation_mode = conversation_mode
         self._protocol_feedback: dict[RunId, str] = {}
+        # Code-owned note for the next turn when a reply carried several tool calls and
+        # only the first ran.
+        self._dropped_calls: dict[RunId, str] = {}
         if not model.strip():
             msg = "ollama model name cannot be empty"
             raise ValueError(msg)
@@ -334,6 +337,7 @@ class OllamaModel:
 
     def close(self) -> None:
         self._protocol_feedback.clear()
+        self._dropped_calls.clear()
         self._conversations.clear()
         self._seen_items.clear()
         self._pending_calls.clear()
@@ -764,6 +768,7 @@ class OllamaModel:
     def drop_conversation(self, run_id: RunId) -> None:
         """Discard conversation state for a finished run (memory hygiene)."""
         self._protocol_feedback.pop(run_id, None)
+        self._dropped_calls.pop(run_id, None)
         self._conversations.pop(run_id, None)
         self._seen_items.pop(run_id, None)
         self._pending_calls.pop(run_id, None)
@@ -789,6 +794,9 @@ class OllamaModel:
             correction = self._protocol_feedback.get(context.run_id)
             if correction is not None:
                 messages.append({"role": "user", "content": correction})
+            dropped = self._dropped_calls.pop(context.run_id, None)
+            if dropped is not None:
+                messages.append({"role": "user", "content": dropped})
             if (
                 self._max_history_chars is not None
                 and len(json.dumps(messages, ensure_ascii=False)) > self._max_history_chars
@@ -869,6 +877,9 @@ class OllamaModel:
                     self._present(context.run_id, item) for item in new_items
                 )
                 new_items = []
+            dropped = self._dropped_calls.pop(context.run_id, None)
+            if dropped is not None:
+                result += "\n" + dropped
             history.append({"role": "tool", "tool_name": pending, "content": result})
         if new_items:
             lines = "\n".join(self._present(context.run_id, item) for item in new_items)
@@ -1026,6 +1037,17 @@ class OllamaModel:
 
     def _parse_action(self, context: ModelContext, response: ChatResponse) -> ActionProposal:
         calls = response.message.tool_calls or []
+        if len(calls) > 1:
+            # Several calls in one reply (live: three reads at once). Run the first, keep
+            # only it in the conversation, and say which did not run, instead of failing
+            # the turn: three such replies in a row used to end the run.
+            dropped = ", ".join(_bounded(call.function.name)[:80] for call in calls[1:])
+            self._dropped_calls[context.run_id] = (
+                f"Runtime note: your last reply had {len(calls)} tool calls; only the first "
+                f"({_bounded(calls[0].function.name)[:80]}) ran. Not run: {dropped}. "
+                "One tool call runs per turn; request any still needed next."
+            )
+            calls = calls[:1]
         if len(calls) != 1:
             history = self._conversations.get(context.run_id)
             if history is not None:
