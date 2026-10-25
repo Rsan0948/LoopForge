@@ -473,6 +473,7 @@ def _construct_run_stopped(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return RunStopped(
         **base,
         reason=StopReason(_required_str(data, "reason")),
+        reason_code=_required_str(data, "reason_code") if "reason_code" in data else "",
         summary=_required_str(data, "summary"),
     )
 

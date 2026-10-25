@@ -1232,6 +1232,22 @@ def test_budget_ignores_tokens_when_no_token_limit() -> None:
 # --- property tests ---
 
 
+@pytest.mark.parametrize(("reported_cached", "expected_cached"), [(50, 50), (1000, 100)])
+def test_cache_credit_cannot_spill_into_another_requests_work(
+    reported_cached: int, expected_cached: int
+) -> None:
+    events = (
+        _started(1),
+        _budget(2, usage=UsageDelta(input_tokens=100, cached_input_tokens=reported_cached)),
+        _budget(3, usage=UsageDelta(input_tokens=900, output_tokens=20)),
+    )
+    state = replay(RUN, events)
+    assert state.input_tokens == 1000
+    assert state.cached_input_tokens == expected_cached
+    assert state.work_tokens == 1020 - expected_cached
+    assert budget_exceeded(state, BudgetLimit(1, 5, max_total_tokens=900))
+
+
 @settings(derandomize=True, max_examples=60, database=None)
 @given(
     usages=st.lists(
@@ -1261,7 +1277,7 @@ def test_budget_debits_accumulate_additively(usages: list[UsageDelta]) -> None:
         expected_cost += usage.cost_usd
         expected_input += usage.input_tokens
         expected_output += usage.output_tokens
-        expected_cached += usage.cached_input_tokens
+        expected_cached += min(usage.cached_input_tokens, usage.input_tokens)
 
     assert state.version == len(usages) + 1
     assert state.cost_usd == expected_cost

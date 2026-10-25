@@ -433,6 +433,13 @@ def validate_operator_text(value: str, field: str) -> None:
 class RunStopped(DomainEvent):
     reason: StopReason
     summary: str
+    reason_code: str = ""
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if type(self.reason_code) is not str or len(self.reason_code) > 200:
+            msg = "stop reason code must be a bounded string"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

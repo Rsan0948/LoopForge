@@ -74,7 +74,7 @@ def _git_environment() -> dict[str, str]:
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_ATTR_NOSYSTEM": "1",
-        "GIT_LITERAL_PATHSPEMS": "1",
+        "GIT_LITERAL_PATHSPECS": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_AUTHOR_NAME": _FIXED_IDENTITY,
         "GIT_AUTHOR_EMAIL": "fixture@loopforge.invalid",

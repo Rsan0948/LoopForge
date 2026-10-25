@@ -478,7 +478,10 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 cost_usd=base.cost_usd + usage.cost_usd,
                 input_tokens=base.input_tokens + usage.input_tokens,
                 output_tokens=base.output_tokens + usage.output_tokens,
-                cached_input_tokens=base.cached_input_tokens + usage.cached_input_tokens,
+                # Cache credit belongs only to this request. An overreported count
+                # cannot become credit against a later request's uncached work.
+                cached_input_tokens=base.cached_input_tokens
+                + min(usage.cached_input_tokens, usage.input_tokens),
             )
         case ModelAttemptFailed():
             return base

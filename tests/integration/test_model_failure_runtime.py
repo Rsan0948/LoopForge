@@ -10,6 +10,8 @@ from __future__ import annotations
 from collections import deque
 from datetime import UTC, datetime
 
+import pytest
+
 from loopforge.adapters.context import BasicContextBuilder
 from loopforge.adapters.memory import InMemoryEventStore
 from loopforge.adapters.scripted import (
@@ -150,6 +152,26 @@ def test_permanent_model_failure_stops_run_explicitly() -> None:
     resumed = runtime.resume(state.run_id)
     assert resumed.status is RunStatus.FAILED
     assert model.calls == 1
+
+
+@pytest.mark.parametrize(
+    "failure_class", [ModelFailureClass.PERMANENT, ModelFailureClass.TRANSIENT]
+)
+def test_oversized_adapter_reason_code_still_terminates_the_run(
+    failure_class: ModelFailureClass,
+) -> None:
+    store = InMemoryEventStore()
+    code = "MODEL_" + "X" * 250
+    errors: list[ModelTurnError | ActionProposal] = [
+        ModelTurnError(failure_class, code, "adapter diagnostic") for _ in range(3)
+    ]
+    model = FlakyModel(errors)
+    runtime = _runtime(model, sleeper=RecordingSleeper(), store=store)
+    state = runtime.run("objective")
+    assert state.status is RunStatus.FAILED
+    stop = next(event for event in store.events_for(state.run_id) if isinstance(event, RunStopped))
+    assert stop.reason_code == code[:200]
+    assert runtime.resume(state.run_id) == state
 
 
 # --- Transient failures -----------------------------------------------------------

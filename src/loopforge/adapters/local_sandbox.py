@@ -210,6 +210,7 @@ class ConstrainedLocalSandbox:
             msg_11 = "write target must be a regular non-symlink file"
             raise SandboxPathError(msg_11)
         try:
+            mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
             fd, temp_name = tempfile.mkstemp(prefix=".loopforge-", dir=path.parent)
         except OSError as exc:
             msg_27 = f"write failed: {exc}"
@@ -217,6 +218,7 @@ class ConstrainedLocalSandbox:
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(encoded)
+                os.fchmod(handle.fileno(), mode)
                 handle.flush()
                 os.fsync(handle.fileno())
             Path(temp_name).replace(path)

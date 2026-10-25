@@ -100,7 +100,7 @@ class ChatResponse(BaseModel):
     prompt_eval_count: int = Field(ge=0)
     eval_count: int = Field(ge=0)
     # Prompt tokens served from the server's prefix cache, when the server reports it.
-    prompt_eval_cached_count: int = Field(default=0, ge=0)
+    prompt_eval_cached_count: int | None = Field(default=None, ge=0)
 
 
 class _ProviderError(BaseModel):
@@ -558,13 +558,14 @@ class OllamaModel:
         append-only conversation the server's prefix cache serves). A compaction or
         trim breaks the prefix and counts in full.
         """
-        sent = [
+        sent = [json.dumps({"model": payload["model"], "tools": payload["tools"]}, sort_keys=True)]
+        sent += [
             json.dumps(message, sort_keys=True, ensure_ascii=False)
             for message in cast("list[object]", payload["messages"])
         ]
         previous = self._previous_prompt.get(run_id)
         self._previous_prompt[run_id] = (sent, response.prompt_eval_count)
-        if response.prompt_eval_cached_count:
+        if response.prompt_eval_cached_count is not None:
             cached = response.prompt_eval_cached_count
         elif previous is not None and sent[: len(previous[0])] == previous[0]:
             cached = previous[1]

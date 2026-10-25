@@ -1239,6 +1239,7 @@ class Runtime:
                 occurred_at=occurred_at,
                 sequence=sequence,
                 reason=reason,
+                reason_code=reason_code[:200],
                 summary=summary or reason_code,
             ),
         )

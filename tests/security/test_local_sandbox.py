@@ -29,6 +29,23 @@ EXIT_OK = frozenset({0})
 _SAFE_COMPONENT = st.from_regex(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,11}", fullmatch=True)
 
 
+@pytest.mark.parametrize("mode", [0o600, 0o644, 0o755])
+def test_atomic_writes_preserve_existing_file_permissions(tmp_path: Path, mode: int) -> None:
+    target = tmp_path / "script.py"
+    target.write_text("old\n")
+    target.chmod(mode)
+    sandbox = ConstrainedLocalSandbox(tmp_path, commands=[])
+    sandbox.write_text("script.py", "new\n")
+    assert target.read_text() == "new\n"
+    assert target.stat().st_mode & 0o777 == mode
+
+
+def test_new_files_keep_private_default_permissions(tmp_path: Path) -> None:
+    sandbox = ConstrainedLocalSandbox(tmp_path, commands=[])
+    sandbox.write_text("new.py", "new\n")
+    assert (tmp_path / "new.py").stat().st_mode & 0o777 == 0o600
+
+
 def _rlimit_as_supported() -> bool:
     probe = "import resource; resource.setrlimit(resource.RLIMIT_AS, (268435456, 268435456))"
     completed = subprocess.run([sys.executable, "-c", probe], capture_output=True, check=False)

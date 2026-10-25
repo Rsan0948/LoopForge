@@ -6,9 +6,11 @@ from dataclasses import replace
 import httpx
 
 from loopforge.adapters.ollama_model import OllamaModel
+from loopforge.domain.context import ModelContext
 from loopforge.domain.policy import ControlPolicy
 from loopforge.domain.state import RunState
 from loopforge.domain.types import BudgetLimit, RunId
+from loopforge.ports.model import ModelToolSpec
 from tests.unit.test_ollama_model import (
     TEMPLATE,
     TOOLS,
@@ -63,6 +65,39 @@ def test_a_rewritten_prefix_is_charged_in_full() -> None:
     turn = model.propose_action(_context())
     assert turn.usage.cached_input_tokens == 0
     assert len(sent) == 2
+
+
+def test_an_explicit_cache_miss_is_not_replaced_by_a_prefix_estimate() -> None:
+    transport, _ = _replies(
+        _chat_payload(prompt_tokens=10_000),
+        {**_chat_payload(prompt_tokens=10_400), "prompt_eval_cached_count": 0},
+    )
+    model = _history_model(transport)
+    model.propose_action(_context())
+    assert model.propose_action(_context()).usage.cached_input_tokens == 0
+
+
+def test_changing_tool_schemas_invalidates_the_estimated_cached_prefix() -> None:
+    transport, _ = _replies(
+        _chat_payload(prompt_tokens=10_000), _chat_payload(prompt_tokens=10_400)
+    )
+    version = 0
+
+    def filter_spec(context: ModelContext, spec: ModelToolSpec) -> ModelToolSpec:
+        del context
+        return replace(spec, description=spec.description + str(version))
+
+    model = OllamaModel(
+        model="m",
+        tools=TOOLS,
+        template=TEMPLATE,
+        transport=transport,
+        conversation_mode="history",
+        tool_spec_filter=filter_spec,
+    )
+    model.propose_action(_context())
+    version = 1
+    assert model.propose_action(_context()).usage.cached_input_tokens == 0
 
 
 def test_the_token_budget_counts_work_tokens_not_repeated_input() -> None:

@@ -64,6 +64,13 @@ def test_materialize_supports_explicit_workspace_id(tmp_path: Path) -> None:
     assert workspace.root.name == "assigned-1"
 
 
+def test_git_path_arguments_are_literal_even_outside_checkout(tmp_path: Path) -> None:
+    workspace = _manager(tmp_path).materialize(_fixture())
+    assert workspace.run_git("ls-files", "--", "module.py").strip() == "module.py"
+    assert workspace.run_git("ls-files", "--", "*.py") == ""
+    assert workspace.run_git("ls-files", "--", ":(glob)**/*.py") == ""
+
+
 def test_adopt_existing_uses_current_head_without_overwriting(tmp_path: Path) -> None:
     manager = _manager(tmp_path)
     original = manager.materialize(_fixture(), workspace_id=WorkspaceId("source"))
