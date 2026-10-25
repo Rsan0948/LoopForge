@@ -193,12 +193,17 @@ def test_tier_two_failure_keeps_the_tier_one_result(error: type[Exception]) -> N
     )
 
 
-def test_full_failure_is_presented_again_after_a_compaction() -> None:
+def test_a_repeated_failure_after_a_compaction_still_has_its_full_report() -> None:
+    # A repeat may be abbreviated only while the full report it refers to is present.
     model, requests = _model()
     _grow(model, 3)
     _turn(model, 7, verified=True)
     _turn(model, 8, verified=True)
-    assert "same checks" not in str(_messages(requests[-1])[-1]["content"])
+    text = json.dumps(_messages(requests[-1]))
+    if "same checks" in str(_messages(requests[-1])[-1]["content"]):
+        assert "assert 7 == 3" in text
+    else:
+        assert "assert 8 == 3" in text
 
 
 def _unused_summarizer(middle: Messages, previous: str | None) -> str:
@@ -265,3 +270,41 @@ def test_no_repeated_rewrite_until_the_prompt_has_grown_by_one_cycle() -> None:
     _turn(model, 5, size=200)
     _turn(model, 6, verified=True, size=200)
     assert len(model.compaction_log) == first
+
+
+def _failing_turn(model: OllamaModel, n: int, failure: str) -> None:
+    model.propose_action(
+        _context_with(
+            _item("objective", "Repair the adder regression.", TrustClass.AUTHORIZED_HUMAN),
+            _item(
+                f"obs{n}",
+                f"Source 'src/f{n}.py', sha256={n:064x}.\n" + f"line {n}\n" * 400,
+                TrustClass.UNTRUSTED_CONTENT,
+            ),
+            # Receipts differ per run and are outside the failure fingerprint.
+            _item(
+                "verifier-failure",
+                f"{failure}\nCheck receipts: run {n}",
+                TrustClass.DETERMINISTIC_OBSERVATION,
+            ),
+        )
+    )
+
+
+def test_the_current_failure_report_survives_compaction() -> None:
+    # Live 2026-10-25: after a checkpoint the worker took only read-only turns, so no new
+    # verification arrived; the full report naming the failing requirement had been
+    # stubbed, and the worker lost the failure and declared itself done.
+    model, requests = _model()
+    failure = (
+        "verification failed: command:check_project: failed (E   assert rows == 422)\n"
+        "held-out acceptance failed: rows_strict: Only the appropriate row type may appear."
+    )
+    model.propose_action(_context())
+    _failing_turn(model, 1, failure)
+    for n in range(2, 10):
+        _turn(model, n)
+    assert model.compaction_log, "the history was compacted"
+    text = json.dumps(_messages(requests[-1]))
+    assert "omitted at a context checkpoint" in text  # other output was compacted
+    assert "Only the appropriate row type may appear." in text

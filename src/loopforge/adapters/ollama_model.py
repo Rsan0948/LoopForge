@@ -27,6 +27,7 @@ import json
 import math
 import re
 from collections.abc import Callable
+from functools import partial
 from typing import Final, Literal, cast
 
 import httpx
@@ -269,6 +270,9 @@ class OllamaModel:
         self._observation_format = observation_format
         # Per run: fingerprint of the last verification failure presented in full.
         self._presented_failure: dict[RunId, str] = {}
+        # The latest full verification report as presented. Later turns refer back to it
+        # ("same as the last full report above"), so compaction never stubs it.
+        self._pinned_report: dict[RunId, str] = {}
         # Checkpoint compaction (code-owned usage budget below the allocated window).
         if working_budget_tokens is not None and (
             type(working_budget_tokens) is not int
@@ -620,7 +624,7 @@ class OllamaModel:
             return -(-size // 3)
         return math.ceil(size * calibration[1] / calibration[0])
 
-    def _checkpoint_compact(  # noqa: PLR0912 - ordered checkpoint, tier-1 and tier-2 gates
+    def _checkpoint_compact(  # noqa: PLR0912, PLR0915 - ordered checkpoint, tier-1 and tier-2 gates
         self, payload: dict[str, object], messages: list[dict[str, object]], context: ModelContext
     ) -> None:
         """Compact at a deterministic checkpoint so usage stays under the working budget.
@@ -664,16 +668,17 @@ class OllamaModel:
         for index in assistants[:-1]:
             messages[index].pop("thinking", None)
         payload["messages"] = list(messages)
+        compactable = partial(self._compactable, context.run_id)
         for index in range(2, keep_from):
             if self._estimate(payload, context) <= target:
                 break
-            if messages[index].get("role") == "tool":
+            if compactable(messages[index]):
                 messages[index]["content"] = checkpoint_stub(str(messages[index]["content"]))
                 payload["messages"] = list(messages)
         if self._estimate(payload, context) > target:
             # Two retained exchanges still exceed the target: keep only the latest one.
             for index in range(keep_from, assistants[-1]):
-                if messages[index].get("role") == "tool":
+                if compactable(messages[index]):
                     messages[index]["content"] = checkpoint_stub(str(messages[index]["content"]))
             keep_from = assistants[-1]
             payload["messages"] = list(messages)
@@ -685,6 +690,7 @@ class OllamaModel:
                 record["tier2_error"] = type(exc).__name__
             else:
                 self._handoffs[context.run_id] = handoff
+                carried = any(m.get("role") == "tool" and not compactable(m) for m in middle)
                 kept = [m for m in messages[2:keep_from] if m.get("role") == "system"]
                 messages[2:keep_from] = kept
                 first_tool = next(
@@ -704,12 +710,16 @@ class OllamaModel:
                     )
                 )
                 messages[first_tool]["content"] = (
-                    block + "\n" + str(messages[first_tool]["content"])
+                    block
+                    + "\n"
+                    + (f"{self._pinned_report[context.run_id]}\n" if carried else "")
+                    + str(messages[first_tool]["content"])
                 )
                 record["tier"] = 2
                 payload["messages"] = list(messages)
-        # Earlier full failure reports may now be stubs: present the next one in full.
-        self._presented_failure.pop(context.run_id, None)
+        # The pinned report normally survives; if it did not, present the next in full.
+        if all(compactable(m) for m in messages if m.get("role") == "tool"):
+            self._presented_failure.pop(context.run_id, None)
         self._history_compactions[context.run_id] = (
             self._history_compactions.get(context.run_id, 0) + 1
         )
@@ -778,6 +788,7 @@ class OllamaModel:
         self._ratio_bound_violated.discard(run_id)
         self._calibration.pop(run_id, None)
         self._presented_failure.pop(run_id, None)
+        self._pinned_report.pop(run_id, None)
         self._checkpoint_due.discard(run_id)
         self._handoffs.pop(run_id, None)
         self._compacted_to.pop(run_id, None)
@@ -913,7 +924,21 @@ class OllamaModel:
                     f"failing tests and assertions as the last full report above: {fingerprint}"
                 )
             self._presented_failure[run_id] = fingerprint
+            self._pinned_report[run_id] = delimited(item)
+            return self._pinned_report[run_id]
         return delimited(item)
+
+    def _compactable(self, run_id: RunId, message: dict[str, object]) -> bool:
+        """A tool result compaction may stub: never the one holding the pinned report.
+
+        Live 2026-10-25: the report naming the failing requirement was stubbed while later
+        turns still said "same as the last full report above"; the worker lost the
+        failure and declared itself done.
+        """
+        pinned = self._pinned_report.get(run_id)
+        return message.get("role") == "tool" and not (
+            pinned and pinned in str(message.get("content", ""))
+        )
 
     def _correction_role(self) -> str:
         """Runtime-owned corrections; in exact replay a mid-conversation system message.
