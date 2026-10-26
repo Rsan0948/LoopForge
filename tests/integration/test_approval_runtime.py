@@ -129,20 +129,20 @@ def test_approval_gated_action_quiesces_the_run_until_granted() -> None:
     waiting = runtime.step(run_id)
 
     assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
-    assert waiting.current_action_id == "gated-1"
+    assert waiting.current_action_id == f"{run_id}:action:1"
     requested = [e for e in store.events_for(run_id) if isinstance(e, ApprovalRequested)]
     assert len(requested) == 1
-    assert requested[0].action_id == ActionId("gated-1")
+    assert requested[0].action_id == ActionId(f"{run_id}:action:1")
     # Quiescent: stepping/resuming while waiting appends nothing.
     version = store.current_version(run_id)
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
     assert runtime.resume(run_id).status is RunStatus.WAITING_FOR_APPROVAL
     assert store.current_version(run_id) == version
 
-    granted = runtime.grant_approval(run_id, ActionId("gated-1"))
+    granted = runtime.grant_approval(run_id, ActionId(f"{run_id}:action:1"))
 
     assert granted.status is RunStatus.READY
-    assert granted.approved_action_ids == ("gated-1",)
+    assert granted.approved_action_ids == (f"{run_id}:action:1",)
     assert len([e for e in store.events_for(run_id) if isinstance(e, ApprovalGranted)]) == 1
 
     final = runtime.resume(run_id)
@@ -172,7 +172,7 @@ def test_rejected_approval_clears_the_proposal_and_the_run_replans() -> None:
     run_id = runtime.start("reject then steer")
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
 
-    rejected = runtime.reject_approval(run_id, ActionId("gated-1"), reason="too risky")
+    rejected = runtime.reject_approval(run_id, ActionId(f"{run_id}:action:1"), reason="too risky")
 
     assert rejected.status is RunStatus.READY
     assert rejected.current_proposal is None
@@ -185,7 +185,7 @@ def test_rejected_approval_clears_the_proposal_and_the_run_replans() -> None:
     # the operator channel never becomes an autonomous retry loop.
     waiting = runtime.resume(run_id)
     assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
-    assert waiting.current_action_id == "gated-2"
+    assert waiting.current_action_id == f"{run_id}:action:2"
     assert len([e for e in store.events_for(run_id) if isinstance(e, ApprovalRequested)]) == 2
 
 
@@ -250,7 +250,7 @@ def test_grant_requires_a_waiting_run_with_the_matching_action() -> None:
     run_id = runtime.start("grant validation")
 
     with pytest.raises(InvalidTransitionError, match="not waiting for approval"):
-        runtime.grant_approval(run_id, ActionId("gated-1"))
+        runtime.grant_approval(run_id, ActionId(f"{run_id}:action:1"))
 
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
     with pytest.raises(InvalidTransitionError, match="not waiting on action"):
@@ -267,7 +267,7 @@ def test_reject_requires_a_waiting_run_with_the_matching_action() -> None:
     run_id = runtime.start("reject validation")
 
     with pytest.raises(InvalidTransitionError, match="not waiting for approval"):
-        runtime.reject_approval(run_id, ActionId("gated-1"), reason="no")
+        runtime.reject_approval(run_id, ActionId(f"{run_id}:action:1"), reason="no")
 
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
     with pytest.raises(InvalidTransitionError, match="not waiting on action"):
@@ -315,7 +315,7 @@ def test_paused_run_survives_process_restart_and_resumes_after_grant(
     assert second.state_for(run_id).status is RunStatus.WAITING_FOR_APPROVAL
     assert second.resume(run_id).status is RunStatus.WAITING_FOR_APPROVAL
 
-    granted = second.grant_approval(run_id, ActionId("gated-1"))
+    granted = second.grant_approval(run_id, ActionId(f"{run_id}:action:1"))
     assert granted.status is RunStatus.READY
 
     final = second.resume(run_id)
@@ -331,13 +331,15 @@ def test_rejection_survives_process_restart(tmp_path: Path) -> None:
     assert first.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
 
     second = _runtime(_model("gated-2"), store=SQLiteEventStore(db, codec=codec))
-    rejected = second.reject_approval(run_id, ActionId("gated-1"), reason="denied after restart")
+    rejected = second.reject_approval(
+        run_id, ActionId(f"{run_id}:action:1"), reason="denied after restart"
+    )
     assert rejected.status is RunStatus.READY
     assert rejected.last_approval_rejection == "denied after restart"
 
     waiting = second.resume(run_id)
     assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
-    assert waiting.current_action_id == "gated-2"
+    assert waiting.current_action_id == f"{run_id}:action:2"
 
 
 # --- Operator instructions -------------------------------------------------------
@@ -438,7 +440,7 @@ def test_spent_grant_is_not_re_executed_after_failed_verification() -> None:
     )
     run_id = runtime.start("approved edit, failed verification")
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
-    runtime.grant_approval(run_id, ActionId("turn-1"))
+    runtime.grant_approval(run_id, ActionId(f"{run_id}:action:1"))
 
     ready = runtime.step(run_id)  # executes turn-1; verification fails; re-plans
 
@@ -446,17 +448,17 @@ def test_spent_grant_is_not_re_executed_after_failed_verification() -> None:
     # The grant is spent by the successful execution.
     assert ready.approved_action_ids == ()
     succeeded = [e for e in store.events_for(run_id) if isinstance(e, ToolSucceeded)]
-    assert [(e.action_id, e.attempt) for e in succeeded] == [(ActionId("turn-1"), 1)]
+    assert [(e.action_id, e.attempt) for e in succeeded] == [(ActionId(f"{run_id}:action:1"), 1)]
 
     # The next cycle proposes a FRESH action instead of re-executing the stale
     # approved one — and the fresh gated action re-quiesces the run.
     waiting = runtime.step(run_id)
 
     assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
-    assert waiting.current_action_id == "turn-2"
+    assert waiting.current_action_id == f"{run_id}:action:2"
     events = store.events_for(run_id)
     started = [e for e in events if isinstance(e, ToolExecutionStarted)]
-    assert [(e.action_id, e.attempt) for e in started] == [(ActionId("turn-1"), 1)]
+    assert [(e.action_id, e.attempt) for e in started] == [(ActionId(f"{run_id}:action:1"), 1)]
     assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 2
     # The stream stays fully replayable from a fresh runtime (poison guard).
     fresh = _runtime(_model(), store=store)
@@ -489,7 +491,7 @@ def test_failed_approved_action_spends_its_grant_and_replans_safely() -> None:
     )
     run_id = runtime.start("approved edit, failed execution")
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
-    runtime.grant_approval(run_id, ActionId("turn-1"))
+    runtime.grant_approval(run_id, ActionId(f"{run_id}:action:1"))
 
     ready = runtime.step(run_id)  # executes turn-1; permanent failure; re-plans
 
@@ -497,14 +499,14 @@ def test_failed_approved_action_spends_its_grant_and_replans_safely() -> None:
     # The grant is spent by the failed execution.
     assert ready.approved_action_ids == ()
     started = [e for e in store.events_for(run_id) if isinstance(e, ToolExecutionStarted)]
-    assert [(e.action_id, e.attempt) for e in started] == [(ActionId("turn-1"), 1)]
+    assert [(e.action_id, e.attempt) for e in started] == [(ActionId(f"{run_id}:action:1"), 1)]
 
     # The next cycle proposes a FRESH action instead of re-executing the stale
     # approved one — and the fresh gated action re-quiesces the run.
     waiting = runtime.step(run_id)
 
     assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
-    assert waiting.current_action_id == "turn-2"
+    assert waiting.current_action_id == f"{run_id}:action:2"
     events = store.events_for(run_id)
     assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 2
     # The stream stays fully replayable from a fresh runtime (poison guard).
@@ -515,10 +517,8 @@ def test_failed_approved_action_spends_its_grant_and_replans_safely() -> None:
 def test_reused_action_id_after_failed_grant_requires_fresh_approval() -> None:
     """A spent grant must not silently authorize a later proposal with the same id.
 
-    Action ids are not unique across adapter rebuilds (the Ollama adapter
-    restarts its turn counter after a process restart), so a proposal can
-    legitimately re-use an id that was once granted. Approval is per-action,
-    not per-id-forever: the re-proposed gated action must quiesce again.
+    The adapter repeats its local counter after a rebuild. Runtime identity
+    must distinguish the new proposal and require a fresh approval.
     """
     store = InMemoryEventStore()
     runtime = _runtime(
@@ -538,28 +538,28 @@ def test_reused_action_id_after_failed_grant_requires_fresh_approval() -> None:
     )
     run_id = runtime.start("reused action id")
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
-    runtime.grant_approval(run_id, ActionId("turn-1"))
+    runtime.grant_approval(run_id, ActionId(f"{run_id}:action:1"))
     # Executed once, failed permanently, re-planned back to READY.
     assert runtime.step(run_id).status is RunStatus.READY
 
     waiting = runtime.step(run_id)  # the model re-proposes the same action id
 
     assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
-    assert waiting.current_action_id == "turn-1"
+    assert waiting.current_action_id == f"{run_id}:action:2"
     events = store.events_for(run_id)
     assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 2
     # Nothing executed without the second grant.
     started = [e for e in events if isinstance(e, ToolExecutionStarted)]
-    assert [(e.action_id, e.attempt) for e in started] == [(ActionId("turn-1"), 1)]
+    assert [(e.action_id, e.attempt) for e in started] == [(ActionId(f"{run_id}:action:1"), 1)]
 
-    runtime.grant_approval(run_id, ActionId("turn-1"))
+    runtime.grant_approval(run_id, ActionId(f"{run_id}:action:2"))
     final = runtime.resume(run_id)
 
     assert final.status is RunStatus.SUCCEEDED
     started = [e for e in store.events_for(run_id) if isinstance(e, ToolExecutionStarted)]
     assert [(e.action_id, e.attempt) for e in started] == [
-        (ActionId("turn-1"), 1),
-        (ActionId("turn-1"), 1),
+        (ActionId(f"{run_id}:action:1"), 1),
+        (ActionId(f"{run_id}:action:2"), 1),
     ]
 
 
@@ -595,7 +595,7 @@ def test_retried_approved_action_needs_no_second_grant() -> None:
     )
     run_id = runtime.start("approved flaky action")
     assert runtime.step(run_id).status is RunStatus.WAITING_FOR_APPROVAL
-    runtime.grant_approval(run_id, ActionId("turn-1"))
+    runtime.grant_approval(run_id, ActionId(f"{run_id}:action:1"))
 
     final = runtime.resume(run_id)
 
@@ -603,8 +603,8 @@ def test_retried_approved_action_needs_no_second_grant() -> None:
     events = store.events_for(run_id)
     started = [e for e in events if isinstance(e, ToolExecutionStarted)]
     assert [(e.action_id, e.attempt) for e in started] == [
-        (ActionId("turn-1"), 1),
-        (ActionId("turn-1"), 2),
+        (ActionId(f"{run_id}:action:1"), 1),
+        (ActionId(f"{run_id}:action:1"), 2),
     ]
     assert len([e for e in events if isinstance(e, ApprovalRequested)]) == 1
     assert len([e for e in events if isinstance(e, ApprovalGranted)]) == 1

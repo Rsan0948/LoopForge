@@ -486,7 +486,8 @@ def test_circuit_opens_exactly_at_threshold(threshold: int, consecutive_failures
 
 def test_keyed_tools_derive_run_scoped_idempotency_key() -> None:
     key = idempotency_key_for(_metadata(idempotency=IdempotencyClass.KEYED), RUN, ACTION)
-    assert key == "loopforge:run-1:act-1"
+    assert key is not None
+    assert key.startswith("loopforge:v2:")
 
 
 @pytest.mark.parametrize(
@@ -524,10 +525,21 @@ def test_keyed_idempotency_key_embeds_run_and_action_ids(
     run_id: RunId, action_id: ActionId
 ) -> None:
     key = idempotency_key_for(_metadata(idempotency=IdempotencyClass.KEYED), run_id, action_id)
-    assert key == f"loopforge:{run_id}:{action_id}"
+    assert key == idempotency_key_for(
+        _metadata(idempotency=IdempotencyClass.KEYED), run_id, action_id
+    )
+    assert key is not None
+    assert key.startswith("loopforge:v2:")
 
 
 def test_retry_decision_is_immutable_value() -> None:
     first = RetryDecision(True, "RETRY_TRANSIENT_FAILURE", next_attempt=2, delay_seconds=0.5)
     second = RetryDecision(True, "RETRY_TRANSIENT_FAILURE", next_attempt=2, delay_seconds=0.5)
     assert first == second
+
+
+def test_keyed_identity_has_no_delimiter_aliases() -> None:
+    metadata = _metadata(idempotency=IdempotencyClass.KEYED)
+    assert idempotency_key_for(metadata, RunId("a:b"), ActionId("c")) != idempotency_key_for(
+        metadata, RunId("a"), ActionId("b:c")
+    )

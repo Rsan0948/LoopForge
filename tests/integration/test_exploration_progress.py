@@ -232,7 +232,9 @@ def test_tuned_mode_records_no_verification_events_for_read_only_turns() -> None
     # Each read turn's tool outcome is followed directly by the re-plan that
     # moves the run out of VERIFYING — never by a verification event.
     for index, event in enumerate(events):
-        if isinstance(event, ToolSucceeded) and event.action_id != ActionId("write-1"):
+        if isinstance(event, ToolSucceeded) and event.action_id != ActionId(
+            f"{state.run_id}:action:3"
+        ):
             assert isinstance(events[index + 1], PlanCreated)
     # Exploration accrued no no-progress strikes.
     assert state.consecutive_no_progress == 0

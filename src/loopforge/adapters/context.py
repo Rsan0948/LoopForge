@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from datetime import datetime
 
@@ -253,7 +254,8 @@ class BudgetedContextBuilder:
                 ContextCandidate(
                     item=item(
                         "verifier-failure",
-                        f"verification failed: {state.last_verification}",
+                        f"verification failed: {state.last_verification}"
+                        + verification_facts(state),
                         TrustClass.DETERMINISTIC_OBSERVATION,
                         "latest verifier outcome (failed)",
                     ),
@@ -480,3 +482,16 @@ class StateContextBuilder(BudgetedContextBuilder):
             role=role,
             prompt_template=self._template.reference(),
         )
+
+
+def verification_facts(state: RunState) -> str:
+    if not state.last_verification_outcomes:
+        return ""
+    return "\nVerification facts: " + json.dumps(
+        [
+            {"name": o.name, "passed": o.passed, "executed": o.executed}
+            for o in state.last_verification_outcomes
+        ],
+        sort_keys=True,
+        separators=(",", ":"),
+    )

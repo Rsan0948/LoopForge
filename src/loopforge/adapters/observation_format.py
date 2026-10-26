@@ -20,8 +20,10 @@ model text.
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import re
-from typing import Final
+from typing import Final, cast
 
 from loopforge.domain.context import ContextItem
 
@@ -58,21 +60,67 @@ def delimited(item: ContextItem) -> str:
 def failure_fingerprint(content: str) -> str:
     """Stable identity of a check failure: check states, failing tests, assertions.
 
-    Progress dots, durations, warnings and receipts are excluded, so reruns of the same
-    failure on a different patch produce the same fingerprint.
+    The digest covers the complete normalized report. Excerpts and regex-selected
+    assertion lines are presentation only; none may hide a changed failure tail.
     """
-    text = readable(content).split("Check receipts:", 1)[0]
+    text = readable(content)
     checks = [f"{name}: {state}" for name, state in _CHECK.findall(text)]
     lines = [
         _DURATION.sub("", line.strip().strip("_").strip()).rstrip()
         for line in text.splitlines()
         if _FAILURE_LINES.match(line.strip()) and "Warning" not in line
     ]
+    facts = [line for line in text.splitlines() if line.startswith("Verification facts: ")]
+    # Legacy unstructured failures still need an identity that covers the entire
+    # report, including hidden requirements and arbitrary preflight reasons.
+    remainder = [
+        _DURATION.sub("", _receipt_metadata(line)).strip()
+        for line in text.splitlines()
+        if line.strip()
+        and not line.startswith("Candidate unchanged since this verification")
+        and "Warning" not in line
+    ]
+    digest = hashlib.sha256("\n".join([*facts, *remainder]).encode()).hexdigest()
     selected = list(dict.fromkeys([*checks, *lines]))
     summary = "; ".join(selected)
     if len(summary) > _FINGERPRINT_BUDGET:
-        summary = summary[: _FINGERPRINT_BUDGET - 3] + "..."
-    return summary
+        summary = summary[: _FINGERPRINT_BUDGET - 75] + "..."
+    return (summary[: _FINGERPRINT_BUDGET - 72] + " sha256:" + digest).strip()
+
+
+def _receipt_metadata(line: str) -> str:  # noqa: PLR0911 - strict shape guards preserve unknown content
+    """Normalize a complete receipt line, never discard text following a marker."""
+    prefix = "Check receipts: "
+    if not line.startswith(prefix):
+        return line
+    try:
+        parsed: object = json.loads(line[len(prefix) :])
+    except ValueError:
+        return line
+    if not isinstance(parsed, list):
+        return line
+    records: list[dict[str, object]] = []
+    for item in cast(list[object], parsed):
+        if not isinstance(item, dict):
+            return line
+        record = cast(dict[str, object], item)
+        if not set(record) <= {"command", "workspace", "reused", "passed", "seconds"}:
+            return line
+        seconds = record.get("seconds")
+        if seconds is not None and (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, (int, float))
+            or not math.isfinite(seconds)
+        ):
+            return line
+        records.append(
+            {
+                key: value
+                for key, value in record.items()
+                if key not in {"seconds", "workspace", "reused"}
+            }
+        )
+    return prefix + json.dumps(records, sort_keys=True)
 
 
 def is_verification_failure(item: ContextItem) -> bool:

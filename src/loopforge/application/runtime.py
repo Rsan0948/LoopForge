@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from uuid import uuid4
 
@@ -82,7 +82,12 @@ from loopforge.ports.tools import (
     ToolResult,
     UnknownToolError,
 )
-from loopforge.ports.verifier import VerificationResult, VerifierContractError, VerifierPort
+from loopforge.ports.verifier import (
+    VerificationObserverPort,
+    VerificationResult,
+    VerifierContractError,
+    VerifierPort,
+)
 
 EventFactory = Callable[[EventId, RunId, datetime, int], Event]
 
@@ -104,17 +109,14 @@ _INSTRUCTION_STATUSES = frozenset(
 class _DriveState:
     """Per-run drive-loop state shared by blocking and stepped drives.
 
-    The drive loop's routing/failure bookkeeping must survive between cycles
-    whether the cycles run back-to-back (``resume``) or interleaved by an
-    orchestrator one at a time (``step``, PACS-013).
+    Only the selected adapter handle is cached here. Retry history and model
+    identity are recovered from the authoritative event projection on every turn.
     """
 
-    model_failure_streak: int = 0
     # Under routing, ``active_model`` starts unset: the first selection is
     # the router's (ROUTE_INITIAL_SELECTION), not an assumption. Without a
     # router the wired model serves every turn, exactly as before.
     active_model: ModelPort | None = None
-    fallback_requested: bool = False
 
 
 @dataclass(slots=True)
@@ -166,6 +168,7 @@ class Runtime:
     # honest absence (a telemetry warning, no record), never a disturbance.
     shadow: ShadowPolicyPort | None = None
     _telemetry: RuntimeTelemetry = field(init=False, repr=False)
+    verification_observer: VerificationObserverPort | None = None
     _drive_states: dict[RunId, _DriveState] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -244,6 +247,11 @@ class Runtime:
         current = self.state_for(run_id)
         if current.status.is_terminal or current.status is RunStatus.WAITING_FOR_APPROVAL:
             return current
+        if current.last_verification_sequence is not None:
+            self._notify_verification(run_id)
+            current = self.state_for(run_id)
+            if current.status.is_terminal:
+                return current
         if current.status is RunStatus.PLANNING:
             self._persist_plan(run_id, "Resume persisted planning state with bounded execution.")
         elif current.status is RunStatus.ACTING:
@@ -494,6 +502,21 @@ class Runtime:
         scheduled instead of a proposal.
         """
         current = self.state_for(run_id)
+        if current.model_failure_streak >= self.reliability.retry.max_attempts:
+            self._stop(run_id, StopReason.FAILURE, "MODEL_RETRY_ATTEMPTS_EXHAUSTED")
+            return None
+        if current.last_model_failure_at is not None:
+            delay = min(
+                self.reliability.retry.base_delay_seconds * 2 ** (current.model_failure_streak - 1),
+                self.reliability.retry.max_delay_seconds,
+            )
+            remaining = delay - (self.clock.now() - current.last_model_failure_at).total_seconds()
+            if remaining > 0:
+                self.sleeper.sleep(remaining)
+            decision = self.control.evaluate(current, now=self.clock.now())
+            if decision.stop_reason is not None:
+                self._stop(run_id, decision.stop_reason, decision.reason_code)
+                return None
         if self.router is not None:
             # Routing selects which registered model serves this turn
             # (vertical tier escalation, horizontal provider fallback)
@@ -505,13 +528,12 @@ class Runtime:
                 run_id,
                 current,
                 active_model=drive.active_model,
-                model_failure_streak=drive.model_failure_streak,
-                fallback_requested=drive.fallback_requested,
+                model_failure_streak=current.model_failure_streak,
+                fallback_requested=current.model_failure_streak > 0,
             )
             if route is None:
                 return None
             drive.active_model = route
-            drive.fallback_requested = False
 
         with self._telemetry.span(run_id, name=SpanName.CONTEXT_BUILD) as context_span:
             model_context = self.context.build_context(current)
@@ -562,6 +584,13 @@ class Runtime:
             self._record_shadow(run_id, lambda: shadow_context.advise_context_budget(current))
 
         turn_model = drive.active_model if drive.active_model is not None else self.model
+        capabilities = turn_model.capabilities
+        if not isinstance(capabilities, ModelCapabilities):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = (
+                f"model adapter advertised {type(capabilities).__name__}, "
+                "expected ModelCapabilities"
+            )
+            raise ModelContractError(msg)
         try:
             with self._telemetry.span(run_id, name=SpanName.MODEL_TURN) as model_span:
                 turn = turn_model.propose_action(model_context)
@@ -602,6 +631,7 @@ class Runtime:
                         reason_code=failure_code,
                         summary=failure_summary,
                         context_admission=admission,
+                        model_capabilities=capabilities,
                     )
                 ),
             )
@@ -637,8 +667,7 @@ class Runtime:
                     summary=stop_summary,
                 )
                 return None
-            drive.model_failure_streak += 1
-            if drive.model_failure_streak >= self.reliability.retry.max_attempts:
+            if self.state_for(run_id).model_failure_streak >= self.reliability.retry.max_attempts:
                 self._stop(
                     run_id,
                     StopReason.FAILURE,
@@ -650,22 +679,7 @@ class Runtime:
             # iteration; with no compatible alternative it retains the
             # current model (FALLBACK_UNAVAILABLE) and the bounded
             # retry proceeds unchanged.
-            drive.fallback_requested = True
-            backoff = min(
-                self.reliability.retry.base_delay_seconds * 2 ** (drive.model_failure_streak - 1),
-                self.reliability.retry.max_delay_seconds,
-            )
-            self.sleeper.sleep(backoff)
             return None
-        drive.model_failure_streak = 0
-        # Boundary validation is intentional: adapters may violate port types.
-        capabilities = turn_model.capabilities
-        if not isinstance(capabilities, ModelCapabilities):  # pyright: ignore[reportUnnecessaryIsInstance]
-            msg_14 = (
-                f"model adapter advertised {type(capabilities).__name__} capabilities, "
-                "expected ModelCapabilities"
-            )
-            raise ModelContractError(msg_14)
         self._persist(
             run_id,
             lambda event_id, rid, occurred_at, sequence, usage=turn.usage: BudgetDebited(
@@ -681,7 +695,18 @@ class Runtime:
         # code-owned capabilities — provenance derives attribution from the
         # authoritative stream alone. Recorded even when the budget stop
         # below ends the run before the action is proposed.
-        turn_action_id = turn.action.action_id
+        # The runtime allocates identity from its journal, not adapter-local counters.
+        ordinal = self.state_for(run_id).model_turn_count + 1
+        used = {
+            event.action_id if isinstance(event, ModelTurnRecorded) else event.proposal.action_id
+            for event in self.store.events_for(run_id)
+            if isinstance(event, (ActionProposed, ModelTurnRecorded))
+        }
+        turn_action_id = ActionId(f"{run_id}:action:{ordinal}")
+        while turn_action_id in used:
+            ordinal += 1
+            turn_action_id = ActionId(f"{run_id}:action:{ordinal}")
+        turn = replace(turn, action=replace(turn.action, action_id=turn_action_id))
         self._persist(
             run_id,
             lambda event_id, rid, occurred_at, sequence, caps=capabilities, aid=turn_action_id: (
@@ -694,6 +719,7 @@ class Runtime:
                     model=caps.model,
                     action_id=aid,
                     context_admission=turn.context_admission,
+                    model_capabilities=caps,
                 )
             ),
         )
@@ -781,7 +807,7 @@ class Runtime:
         like the PACS-011 crash/resume path.
         """
         assert self.router is not None
-        current_capabilities: ModelCapabilities | None = None
+        current_capabilities: ModelCapabilities | None = state.last_model_capabilities
         if active_model is not None:
             current_capabilities = active_model.capabilities
             # Boundary validation is intentional: adapters may violate port types.
@@ -1120,6 +1146,9 @@ class Runtime:
                     occurred_at=occurred_at,
                     sequence=sequence,
                     summary=verification.summary,
+                    outcomes=verification.outcomes,
+                    evidence_identity=verification.evidence_identity,
+                    progress=verification.progress,
                     task_complete=verification.task_complete,
                     score=1.0 if verification.task_complete else verification.score,
                 ),
@@ -1133,12 +1162,30 @@ class Runtime:
                     occurred_at=occurred_at,
                     sequence=sequence,
                     summary=verification.summary,
+                    outcomes=verification.outcomes,
+                    evidence_identity=verification.evidence_identity,
+                    progress=verification.progress,
                     score=verification.score,
                     inconclusive=verification.inconclusive,
                     repeat=verification.repeat,
                 ),
             )
-        self._record_artifacts(run_id)
+        self._notify_verification(run_id)
+        if not self.state_for(run_id).status.is_terminal:
+            self._record_artifacts(run_id)
+
+    def _notify_verification(self, run_id: RunId) -> None:
+        if self.verification_observer is None:
+            return
+        try:
+            self.verification_observer.verification_recorded(self.state_for(run_id))
+        except Exception as error:
+            self._stop(
+                run_id,
+                StopReason.FAILURE,
+                "VERIFICATION_PROJECTION_FAILED",
+                summary=f"Verification projection failed: {type(error).__name__}",
+            )
 
     def _record_artifacts(self, run_id: RunId) -> None:
         """Persist workload-supplied evidence artifacts after verification.

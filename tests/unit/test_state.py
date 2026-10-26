@@ -1544,10 +1544,12 @@ def test_model_turn_recorded_is_evidence_only_in_ready() -> None:
 
     after = reduce_event(before, _model_turn_recorded(3))
 
-    # No control-state effect beyond the universal version/last-occurred fold:
-    # the identity lives in the stream, not RunState.
+    # Successful model history allocates fresh identities and resets retry state.
     assert after == replace(
-        before, version=before.version + 1, last_occurred_at=after.last_occurred_at
+        before,
+        version=before.version + 1,
+        last_occurred_at=after.last_occurred_at,
+        model_turn_count=1,
     )
 
 

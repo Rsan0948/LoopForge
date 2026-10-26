@@ -631,12 +631,14 @@ def test_approval_round_trip_through_http(tmp_path: Path) -> None:
 
         waiting = _wait_for_status(client, run_id, "waiting_for_approval")
         assert waiting["waiting_for_approval"] is True
-        assert waiting["pending_approval"]["action_id"] == "a1"
+        assert waiting["pending_approval"]["action_id"] == f"{run_id}:action:1"
         assert "deploy" in waiting["pending_approval"]["reason"]
         assert waiting["current_proposal"]["tool_name"] == "deploy"
-        assert waiting["current_proposal"]["action_id"] == "a1"
+        assert waiting["current_proposal"]["action_id"] == f"{run_id}:action:1"
 
-        approved = client.post(f"/api/sessions/{run_id}/approve", json={"action_id": "a1"})
+        approved = client.post(
+            f"/api/sessions/{run_id}/approve", json={"action_id": f"{run_id}:action:1"}
+        )
         assert approved.status_code == 200
 
         detail = _wait_for_status(client, run_id, "succeeded")
@@ -681,7 +683,7 @@ def test_reject_round_trip_replans_and_records_the_reason(tmp_path: Path) -> Non
 
         rejected = client.post(
             f"/api/sessions/{run_id}/reject",
-            json={"action_id": "a1", "reason": "too risky"},
+            json={"action_id": f"{run_id}:action:1", "reason": "too risky"},
         )
         assert rejected.status_code == 200
 
@@ -905,13 +907,16 @@ def test_websocket_streams_history_then_live_events(tmp_path: Path) -> None:
             )
             assert history[0]["event_type"] == "RunStarted"
             assert history[-1]["event_type"] == "ApprovalRequested"
-            assert all(frame["schema_version"] == 1 for frame in history)
+            assert all(frame["schema_version"] in {1, 3} for frame in history)
 
             # Client text frames are ignored (the socket streams only), and
             # idle queue polls must not disturb the stream.
             websocket.send_text("ignored")
             time.sleep(0.3)
-            client.post(f"/api/sessions/{run_id}/approve", json={"action_id": "a1"})
+            approved = client.post(
+                f"/api/sessions/{run_id}/approve", json={"action_id": f"{run_id}:action:1"}
+            )
+            assert approved.status_code == 200
 
             live_types: list[str] = []
             deadline = time.monotonic() + 10.0

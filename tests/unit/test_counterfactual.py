@@ -199,11 +199,11 @@ def _prefix_after(historical: tuple[Event, ...], event_type: type, occurrence: i
 
 
 def test_extract_replays_the_recorded_decisions_in_stream_order() -> None:
-    historical, _ = _two_turn_run()
+    historical, run_id = _two_turn_run()
     turns = extract_scripted_turns(historical)
     assert [proposal.action_id for proposal in turns.proposals] == [
-        ActionId("a1"),
-        ActionId("a2"),
+        ActionId(f"{run_id}:action:1"),
+        ActionId(f"{run_id}:action:2"),
     ]
     assert [result.observation for result in turns.tool_results] == [
         "nothing yet",
@@ -429,7 +429,7 @@ def test_approval_gate_prefix_cannot_self_approve() -> None:
     )
     waiting = runtime.run("approval probe")
     assert waiting.status is RunStatus.WAITING_FOR_APPROVAL
-    runtime.grant_approval(waiting.run_id, ActionId("a1"))
+    runtime.grant_approval(waiting.run_id, ActionId(str(waiting.current_action_id)))
     settled = runtime.resume(waiting.run_id)
     assert settled.status is RunStatus.SUCCEEDED
     historical = store.events_for(waiting.run_id)
@@ -644,3 +644,23 @@ def test_admission_diagnostics_do_not_manufacture_counterfactual_behavior_diverg
     )
     result = _redrive(historical, run_id, prefix_length=_prefix_after(historical, PlanCreated))
     assert result.outcome is ReplayOutcome.MATCHED
+
+
+def test_replay_uses_recorded_capabilities_and_legacy_missing_metadata_is_not_divergence() -> None:
+    historical, run_id = _two_turn_run()
+    recorded = next(e for e in historical if isinstance(e, ModelTurnRecorded))
+    assert recorded.model_capabilities is not None
+    actual = replace(recorded.model_capabilities, context_window_tokens=16384)
+    richer = tuple(
+        replace(e, model_capabilities=actual) if isinstance(e, ModelTurnRecorded) else e
+        for e in historical
+    )
+    runtime = build_counterfactual_runtime(richer, store=InMemoryEventStore(), budget=BUDGET)
+    assert runtime.model.capabilities == actual
+    legacy = tuple(
+        replace(e, model_capabilities=None) if isinstance(e, ModelTurnRecorded) else e
+        for e in historical
+    )
+    assert _redrive(legacy, run_id, prefix_length=_prefix_after(legacy, PlanCreated)).outcome is (
+        ReplayOutcome.MATCHED
+    )

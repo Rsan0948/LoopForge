@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from dataclasses import dataclass
 from enum import StrEnum
 
@@ -110,5 +112,6 @@ class ReliabilityPolicy:
 
 def idempotency_key_for(metadata: ToolMetadata, run_id: RunId, action_id: ActionId) -> str | None:
     if metadata.idempotency is IdempotencyClass.KEYED:
-        return f"loopforge:{run_id}:{action_id}"
+        identity = json.dumps([run_id, action_id], separators=(",", ":"), ensure_ascii=True)
+        return "loopforge:v2:" + hashlib.sha256(identity.encode()).hexdigest()
     return None

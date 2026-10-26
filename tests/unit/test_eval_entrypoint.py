@@ -543,7 +543,7 @@ def test_drive_with_approvals_grants_the_pending_action_and_succeeds() -> None:
     events = tuple(store.events_for(state.run_id))
     granted = [event for event in events if isinstance(event, ApprovalGranted)]
     assert len(granted) == 1
-    assert granted[0].action_id == ActionId("gated-1")
+    assert granted[0].action_id == ActionId(f"{state.run_id}:action:1")
     # The grant is the counted human intervention (M4 trajectory metric).
     assert count_human_interventions(events) == 1
 

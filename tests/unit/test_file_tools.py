@@ -264,20 +264,14 @@ def test_search_files_skips_unreadable_files_with_an_honest_note(workspace: Path
     assert "skipped 1 unreadable file(s)" in result.observation
 
 
-def test_non_string_argument_values_fail_as_tool_arguments(workspace: Path) -> None:
-    tools = _tools(workspace)
-    proposals = [
-        ActionProposal(ActionId("a1"), "read_file", {"path": 123}),  # pyright: ignore[reportArgumentType]
-        ActionProposal(ActionId("a1"), "write_file", {"path": ["x"], "content": "y"}),  # pyright: ignore[reportArgumentType]
-        ActionProposal(ActionId("a1"), "edit_file", {"path": "a", "old": None, "new": "b"}),  # pyright: ignore[reportArgumentType]
-    ]
-    for proposal in proposals:
-        result = tools.execute(
-            ToolExecutionRequest(proposal=proposal, attempt=1, timeout_seconds=5.0)
-        )
-        assert not result.ok
-        assert result.error_code == "TOOL_ARGUMENTS"
-        assert result.failure_class is ToolFailureClass.INVALID_INPUT
+def test_non_string_argument_values_fail_before_tool_execution(workspace: Path) -> None:
+    for arguments in (
+        {"path": 123},
+        {"path": ["x"], "content": "y"},
+        {"path": "a", "old": None, "new": "b"},
+    ):
+        with pytest.raises(TypeError, match="string keys and values"):
+            ActionProposal(ActionId("a1"), "read_file", arguments)  # pyright: ignore[reportArgumentType]
 
 
 def test_edit_file_preserves_crlf_line_endings(workspace: Path) -> None:

@@ -5,7 +5,11 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from loopforge.domain.state import RunState
-from loopforge.domain.verification import CheckOutcome
+from loopforge.domain.verification import (
+    CheckOutcome,
+    VerificationProgress,
+    validate_verification_evidence,
+)
 
 
 class VerifierContractError(TypeError):
@@ -33,23 +37,22 @@ class VerificationResult:
     """
 
     outcomes: tuple[CheckOutcome, ...] = ()
+    progress: VerificationProgress | None = None
+    evidence_identity: str | None = None
 
     def __post_init__(self) -> None:
-        if type(self.outcomes) is not tuple or any(
-            not isinstance(outcome, CheckOutcome)  # pyright: ignore[reportUnnecessaryIsInstance]
-            for outcome in self.outcomes
-        ):
-            msg = "verification outcomes must be immutable typed checks"
+        validate_verification_evidence(
+            self.outcomes,
+            self.progress,
+            summary=self.summary,
+            passed=self.passed,
+            task_complete=self.task_complete,
+            inconclusive=self.inconclusive,
+            evidence_identity=self.evidence_identity,
+        )
+        if not isinstance(self.repeat, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "verification repeat must be a bool"
             raise TypeError(msg)
-        if len({outcome.name for outcome in self.outcomes}) != len(self.outcomes):
-            msg = "verification check names must be unique"
-            raise ValueError(msg)
-        if self.passed and any(
-            not outcome.passed or not outcome.executed for outcome in self.outcomes
-        ):
-            msg = "passing verification cannot contradict check evidence"
-            raise ValueError(msg)
-
         if not isinstance(self.task_complete, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
             msg = "verification task_complete must be a bool"
             raise TypeError(msg)
@@ -77,3 +80,9 @@ class VerificationResult:
 
 class VerifierPort(Protocol):
     def verify(self, state: RunState) -> VerificationResult: ...
+
+
+class VerificationObserverPort(Protocol):
+    """Rebuildable workload projections consume an already committed measurement."""
+
+    def verification_recorded(self, state: RunState) -> None: ...

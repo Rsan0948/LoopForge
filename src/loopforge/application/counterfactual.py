@@ -66,7 +66,7 @@ from loopforge.ports.verifier import VerificationResult
 _VOLATILE_FIELDS = frozenset({"event_id", "run_id", "occurred_at", "sequence", "caused_by"})
 # A scripted redrive does not send a provider request. Preserve historical
 # measurements in the journal, but never fabricate measurements for the replay.
-_DIAGNOSTIC_FIELDS = frozenset({"context_admission"})
+_DIAGNOSTIC_FIELDS = frozenset({"context_admission", "model_capabilities"})
 
 
 class ReplayOutcome(StrEnum):
@@ -166,11 +166,24 @@ def extract_scripted_turns(events: tuple[Event, ...]) -> ScriptedTurns:
             metadata.setdefault(event.tool_metadata.name, event.tool_metadata)
     verifications = tuple(
         VerificationResult(
-            passed=True, summary=event.summary, task_complete=event.task_complete, score=event.score
+            passed=True,
+            summary=event.summary,
+            task_complete=event.task_complete,
+            score=event.score,
+            outcomes=event.outcomes,
+            progress=event.progress,
+            evidence_identity=event.evidence_identity,
         )
         if isinstance(event, VerificationPassed)
         else VerificationResult(
-            passed=False, summary=event.summary, score=event.score, inconclusive=event.inconclusive
+            passed=False,
+            summary=event.summary,
+            score=event.score,
+            inconclusive=event.inconclusive,
+            repeat=event.repeat,
+            outcomes=event.outcomes,
+            progress=event.progress,
+            evidence_identity=event.evidence_identity,
         )
         for event in events
         if isinstance(event, (VerificationPassed, VerificationFailed))

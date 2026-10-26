@@ -278,3 +278,138 @@ def test_failure_streak_resets_after_a_successful_turn() -> None:
     state = runtime.run("objective")
     assert state.status is RunStatus.SUCCEEDED
     assert model.calls == 6
+
+
+def test_runtime_rebuild_preserves_model_failure_allowance() -> None:
+    store = InMemoryEventStore()
+    first = _runtime(
+        FlakyModel([_transient(), _transient()]), sleeper=RecordingSleeper(), store=store
+    )
+    run_id = first.start("objective")
+    first.step(run_id)
+    state = first.step(run_id)
+    assert state.model_failure_streak == 2
+    second = _runtime(FlakyModel([_transient()]), sleeper=RecordingSleeper(), store=store)
+    assert second.step(run_id).status is RunStatus.FAILED
+    assert second.state_for(run_id).model_failure_streak == 3
+
+
+def test_rebuilt_adapter_cannot_reuse_an_action_identity() -> None:
+    store = InMemoryEventStore()
+    repeated = ActionProposal(ActionId("adapter-counter-1"), "inspect", {})
+    first = _runtime(
+        FlakyModel([repeated]), sleeper=RecordingSleeper(), store=store, observations=["not done"]
+    )
+    run_id = first.start("objective")
+    first.step(run_id)
+    second = _runtime(FlakyModel([repeated]), sleeper=RecordingSleeper(), store=store)
+    second.resume(run_id)
+    from loopforge.domain.events import ActionProposed  # noqa: PLC0415
+
+    ids = [e.proposal.action_id for e in store.events_for(run_id) if isinstance(e, ActionProposed)]
+    assert len(ids) == len(set(ids)) == 2
+
+
+def test_verification_projection_only_consumes_committed_event() -> None:
+    from loopforge.domain.events import VerificationPassed  # noqa: PLC0415
+    from loopforge.domain.state import RunState  # noqa: PLC0415
+
+    store = InMemoryEventStore()
+    observed: list[int] = []
+
+    class Observer:
+        def verification_recorded(self, state: RunState) -> None:
+            event = store.events_for(state.run_id)[-1]
+            assert isinstance(event, VerificationPassed)
+            assert event.sequence == state.version
+            observed.append(state.version)
+
+    runtime = _runtime(
+        FlakyModel([ActionProposal(ActionId("local"), "inspect", {})]),
+        sleeper=RecordingSleeper(),
+        store=store,
+    )
+    runtime.verification_observer = Observer()
+    assert runtime.run("objective").status is RunStatus.SUCCEEDED
+    assert len(observed) == 1
+
+
+def test_verification_projection_failure_stops_without_false_success() -> None:
+    from loopforge.domain.state import RunState  # noqa: PLC0415
+
+    class BrokenProjection:
+        def verification_recorded(self, state: RunState) -> None:
+            del state
+            msg = "unavailable projection"
+            raise OSError(msg)
+
+    store = InMemoryEventStore()
+    runtime = _runtime(
+        FlakyModel([ActionProposal(ActionId("local"), "inspect", {})]),
+        sleeper=RecordingSleeper(),
+        store=store,
+    )
+    runtime.verification_observer = BrokenProjection()
+    final = runtime.run("objective")
+    assert final.status is RunStatus.FAILED
+    stopped = [e for e in store.events_for(final.run_id) if isinstance(e, RunStopped)]
+    assert stopped[-1].reason_code == "VERIFICATION_PROJECTION_FAILED"
+
+
+def test_rebuild_notifies_committed_verification_before_next_model_call() -> None:
+    from loopforge.domain.state import RunState  # noqa: PLC0415
+
+    class Crash(BaseException):
+        pass
+
+    class CrashProjection:
+        def verification_recorded(self, state: RunState) -> None:
+            del state
+            raise Crash
+
+    store = InMemoryEventStore()
+    action = ActionProposal(ActionId("counter"), "inspect", {})
+    original = _runtime(
+        FlakyModel([action]), sleeper=RecordingSleeper(), store=store, observations=["not repaired"]
+    )
+    original.verification_observer = CrashProjection()
+    run_id = original.start("objective")
+    with pytest.raises(Crash):
+        original.step(run_id)
+    committed = original.state_for(run_id)
+    assert committed.status is RunStatus.REFLECTING
+    model = FlakyModel([action])
+    sequences: list[int | None] = []
+
+    class Projection:
+        def verification_recorded(self, state: RunState) -> None:
+            if not sequences:
+                assert model.calls == 0
+                assert state.last_verification_sequence == committed.last_verification_sequence
+            sequences.append(state.last_verification_sequence)
+
+    rebuilt = _runtime(model, sleeper=RecordingSleeper(), store=store)
+    rebuilt.verification_observer = Projection()
+    assert rebuilt.resume(run_id).status is RunStatus.SUCCEEDED
+    assert len(sequences) == 2
+
+
+@pytest.mark.parametrize("failed", [False, True])
+def test_capabilities_are_snapshotted_before_inference_and_not_read_again(failed: bool) -> None:
+    class OneReadModel(FlakyModel):
+        capability_reads = 0
+
+        @property
+        def capabilities(self) -> ModelCapabilities:
+            self.capability_reads += 1
+            assert self.capability_reads == 1
+            return super().capabilities
+
+    store = InMemoryEventStore()
+    model = OneReadModel(
+        [_transient()] if failed else [ActionProposal(ActionId("a"), "inspect", {})]
+    )
+    runtime = _runtime(model, sleeper=RecordingSleeper(), store=store)
+    run_id = runtime.start("objective")
+    runtime.step(run_id)
+    assert model.capability_reads == 1
