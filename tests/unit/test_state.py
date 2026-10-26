@@ -1550,6 +1550,7 @@ def test_model_turn_recorded_is_evidence_only_in_ready() -> None:
         version=before.version + 1,
         last_occurred_at=after.last_occurred_at,
         model_turn_count=1,
+        model_attempts_since_progress=1,
     )
 
 

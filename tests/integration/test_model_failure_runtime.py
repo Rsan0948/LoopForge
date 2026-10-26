@@ -8,7 +8,8 @@ failure seam without any provider I/O.
 from __future__ import annotations
 
 from collections import deque
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -23,7 +24,7 @@ from loopforge.adapters.scripted import (
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
-from loopforge.domain.events import RunStopped
+from loopforge.domain.events import RunStopped, ToolExecutionStarted
 from loopforge.domain.policy import ControlPolicy, PermissionPolicy
 from loopforge.domain.reliability import ReliabilityPolicy, RetrySettings
 from loopforge.domain.routing import ModelCapabilities
@@ -130,6 +131,51 @@ def _stopped_summary(store: InMemoryEventStore, run_id: RunId) -> str:
     stopped = [event for event in store.events_for(run_id) if isinstance(event, RunStopped)]
     assert len(stopped) == 1
     return stopped[0].summary
+
+
+@pytest.mark.parametrize("seconds", [479, 480])
+def test_first_write_deadline_checks_a_returned_model_turn_before_executing_it(
+    seconds: int,
+) -> None:
+    class Clock:
+        current = NOW
+
+        def now(self) -> datetime:
+            return self.current
+
+    clock = Clock()
+
+    class Delayed(FlakyModel):
+        def propose_action(self, context: ModelContext) -> ModelTurn:
+            clock.current = NOW + timedelta(seconds=seconds)
+            return super().propose_action(context)
+
+    model = Delayed([ActionProposal(ActionId("edit"), "inspect", {})])
+    runtime = _runtime(model, sleeper=RecordingSleeper())
+    runtime.clock = clock
+    runtime.control = replace(runtime.control, first_local_write_seconds=480)
+    runtime.tools = ScriptedTools(
+        [ToolResult(ok=True, observation="all tests pass")],
+        metadata=[
+            replace(
+                _metadata(),
+                side_effect=SideEffectClass.LOCAL_WRITE,
+                required_permission=Permission.LOCAL_WRITE,
+                risk=RiskLevel.LOCAL_WRITE,
+            )
+        ],
+    )
+    state = runtime.run("Edit within eight minutes")
+    assert state.cost_usd == 0.01  # Late responses still retain their actual usage.
+    events = runtime.store.events_for(state.run_id)
+    if seconds == 480:
+        assert state.status is RunStatus.FAILED
+        assert not any(isinstance(e, ToolExecutionStarted) for e in events)
+        assert isinstance(events[-1], RunStopped)
+        assert events[-1].reason_code == "STOP_FIRST_WRITE_DEADLINE"
+    else:
+        assert state.status is RunStatus.SUCCEEDED
+        assert state.first_local_write_at == clock.current
 
 
 # --- Permanent failures ---------------------------------------------------------

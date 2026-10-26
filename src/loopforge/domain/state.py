@@ -38,7 +38,7 @@ from loopforge.domain.events import (
 from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome, WorkerProjection
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.routing import ModelCapabilities
-from loopforge.domain.tooling import ToolMetadata
+from loopforge.domain.tooling import SideEffectClass, ToolMetadata
 from loopforge.domain.types import BudgetLimit, RunId, RunStatus, StopReason
 from loopforge.domain.verification import CheckOutcome, VerificationProgress
 
@@ -99,6 +99,8 @@ class RunState:
     last_verification_progress: VerificationProgress | None = None
     best_verification_progress: VerificationProgress | None = None
     consecutive_no_progress: int = 0
+    model_attempts_since_progress: int = 0
+    first_local_write_at: datetime | None = None
     last_reflection: str | None = None
     last_context_items: tuple[ContextItemSnapshot, ...] | None = None
     tool_failure_streaks: tuple[ToolFailureStreak, ...] = ()
@@ -401,6 +403,12 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 last_observation=observation,
                 last_observation_sequence=event.sequence,
                 last_tool_failure_class=None,
+                first_local_write_at=(
+                    base.first_local_write_at or event.occurred_at
+                    if base.current_tool_metadata is not None
+                    and base.current_tool_metadata.side_effect is SideEffectClass.LOCAL_WRITE
+                    else base.first_local_write_at
+                ),
                 current_attempt=attempt,
                 execution_in_flight=False,
                 tool_failure_streaks=_update_streak(
@@ -495,6 +503,11 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 last_verification_task_complete=task_complete,
                 last_verification_score=score,
                 best_verification_score=best_score,
+                model_attempts_since_progress=(
+                    0
+                    if progress is not None and no_progress == 0
+                    else base.model_attempts_since_progress
+                ),
                 consecutive_no_progress=0 if task_complete else no_progress,
                 status=RunStatus.VERIFYING if task_complete else RunStatus.REFLECTING,
             )
@@ -550,6 +563,11 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 last_verification_task_complete=False,
                 last_verification_score=score,
                 best_verification_score=best_score,
+                model_attempts_since_progress=(
+                    0
+                    if progress is not None and not repeat and not inconclusive and no_progress == 0
+                    else base.model_attempts_since_progress
+                ),
                 consecutive_no_progress=no_progress,
                 status=RunStatus.REFLECTING,
             )
@@ -578,6 +596,7 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
         case ModelAttemptFailed(model_capabilities=capabilities):
             return replace(
                 base,
+                model_attempts_since_progress=base.model_attempts_since_progress + 1,
                 model_failure_streak=base.model_failure_streak + 1,
                 last_model_capabilities=capabilities or base.last_model_capabilities,
                 last_model_failure_at=event.occurred_at,
@@ -588,6 +607,7 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             return replace(
                 base,
                 model_turn_count=base.model_turn_count + 1,
+                model_attempts_since_progress=base.model_attempts_since_progress + 1,
                 model_failure_streak=0,
                 last_model_failure_at=None,
                 last_model_capabilities=capabilities or base.last_model_capabilities,

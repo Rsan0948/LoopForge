@@ -27,15 +27,37 @@ class PermissionPolicy:
 class ControlPolicy:
     budget: BudgetLimit
     no_progress_limit: int = 3
+    first_local_write_seconds: int | None = None
 
     def __post_init__(self) -> None:
         if self.no_progress_limit <= 0:
             msg = "no_progress_limit must be positive"
             raise ValueError(msg)
+        if self.first_local_write_seconds is not None and (
+            type(self.first_local_write_seconds) is not int or self.first_local_write_seconds <= 0
+        ):
+            msg = "first_local_write_seconds must be a positive integer"
+            raise ValueError(msg)
 
     def evaluate(  # noqa: PLR0911 - flat prioritized rule chain keeps stop precedence explicit
-        self, state: RunState, *, now: datetime | None = None
+        self,
+        state: RunState,
+        *,
+        now: datetime | None = None,
+        action_admitted: bool = False,
     ) -> ControlDecision:
+        if (
+            self.first_local_write_seconds is not None
+            and state.started_at is not None
+            and now is not None
+            and ((state.first_local_write_at or now) - state.started_at).total_seconds()
+            >= self.first_local_write_seconds
+        ):
+            return ControlDecision(
+                ControlDecisionKind.STOP_FAILURE,
+                "STOP_FIRST_WRITE_DEADLINE",
+                StopReason.FAILURE,
+            )
         if state.last_verification_passed is True and state.last_verification_task_complete:
             return ControlDecision(
                 ControlDecisionKind.STOP_SUCCESS,
@@ -74,7 +96,11 @@ class ControlPolicy:
                 "STOP_STALLED_NO_PROGRESS",
                 StopReason.STALLED,
             )
-        if self.budget.max_iterations is not None and state.iteration >= self.budget.max_iterations:
+        if self.budget.max_iterations is not None and (
+            state.iteration > self.budget.max_iterations
+            if action_admitted
+            else state.iteration >= self.budget.max_iterations
+        ):
             return ControlDecision(
                 ControlDecisionKind.STOP_FAILURE,
                 "STOP_MAX_ITERATIONS",

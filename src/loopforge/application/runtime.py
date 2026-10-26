@@ -933,6 +933,17 @@ class Runtime:
         idempotency_key: str | None,
         record_start: bool,
     ) -> None:
+        # Recovery and retry dispatch bypass model/action admission. Recheck
+        # control here so elapsed deadlines cannot authorize another side effect.
+        # The pending action has already consumed its iteration; it may execute
+        # at the cap, while an additional action still cannot be admitted.
+        state = self.state_for(run_id)
+        if state.status.is_terminal:
+            return
+        decision = self.control.evaluate(state, now=self.clock.now(), action_admitted=True)
+        if decision.stop_reason is not None:
+            self._stop(run_id, decision.stop_reason, decision.reason_code)
+            return
         if record_start:
             self._persist(
                 run_id,
