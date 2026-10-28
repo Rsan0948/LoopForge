@@ -172,7 +172,9 @@ class OpenRouterModel(OllamaModel):
             finally:
                 self.request_tracker.end()
         except httpx.RequestError as exc:
-            msg = "OpenRouter transport failed; billing may be unsettled"
+            # The exception class is code-owned and carries no request data; without it a
+            # live failure could not be diagnosed.
+            msg = f"OpenRouter transport failed ({type(exc).__name__}); billing may be unsettled"
             raise ModelTurnError(
                 ModelFailureClass.PERMANENT, "MODEL_BILLING_UNCERTAIN", msg
             ) from exc
