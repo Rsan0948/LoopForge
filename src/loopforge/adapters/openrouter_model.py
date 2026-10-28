@@ -175,8 +175,11 @@ class OpenRouterModel(OllamaModel):
             # The exception class is code-owned and carries no request data; without it a
             # live failure could not be diagnosed.
             msg = f"OpenRouter transport failed ({type(exc).__name__}); billing may be unsettled"
+            # Transient: the runtime retries the turn with bounded backoff. Any paid
+            # reservation stays held at its maximum, so a retry spends only within the cap.
+            # Live 2026-10-28: ReadError ended attempts that were otherwise progressing.
             raise ModelTurnError(
-                ModelFailureClass.PERMANENT, "MODEL_BILLING_UNCERTAIN", msg
+                ModelFailureClass.TRANSIENT, "MODEL_BILLING_UNCERTAIN", msg
             ) from exc
         if raw.status_code != 200:
             msg = f"OpenRouter request failed (HTTP {raw.status_code})"
