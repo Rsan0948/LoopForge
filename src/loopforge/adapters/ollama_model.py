@@ -65,6 +65,17 @@ _SUMMARY_BUDGET: Final = 200
 _CHECKPOINT_RESERVE: Final = 6000
 _KEEP_EXCHANGES: Final = 2
 _VERIFICATION_SUFFIXES: Final = (":verifier-failure", ":confirmed-fact", ":verification")
+_CURRENT_FACT_SUFFIXES: Final = frozenset(
+    {
+        "blockers",
+        "coding-progress",
+        "verifier-failure",
+        "confirmed-fact",
+        "verification",
+        "pending-approval",
+        "irreversible-action",
+    }
+)
 
 
 class _FunctionCall(BaseModel):
@@ -149,6 +160,7 @@ class OllamaModel:
         observation_format: Literal["plain", "delimited"] = "plain",
         working_budget_tokens: int | None = None,
         checkpoint_summarizer: Callable[[list[dict[str, object]], str | None], str] | None = None,
+        preserve_recent_exchanges: int = _KEEP_EXCHANGES,
         tool_filter: Callable[[ModelContext], frozenset[str]] | None = None,
         tool_spec_filter: Callable[[ModelContext, ModelToolSpec], ModelToolSpec] | None = None,
     ) -> None:
@@ -273,6 +285,14 @@ class OllamaModel:
         # The latest full verification report as presented. Later turns refer back to it
         # ("same as the last full report above"), so compaction never stubs it.
         self._pinned_report: dict[RunId, str] = {}
+        # Sidecar preservation metadata is assigned from typed ContextItems, never
+        # recovered by parsing repository/tool text in serialized messages.
+        self._preserved_items: dict[RunId, dict[ContextItemId, ContextItem]] = {}
+        self._message_items: dict[RunId, dict[int, frozenset[tuple[ContextItemId, str]]]] = {}
+        if type(preserve_recent_exchanges) is not int or not 1 <= preserve_recent_exchanges <= 16:
+            msg = "preserve_recent_exchanges must be an integer from 1 to 16"
+            raise ValueError(msg)
+        self._keep_exchanges = preserve_recent_exchanges
         # Checkpoint compaction (code-owned usage budget below the allocated window).
         if working_budget_tokens is not None and (
             type(working_budget_tokens) is not int
@@ -321,12 +341,11 @@ class OllamaModel:
         # crosses runs; after a process crash it simply starts over from the
         # current context (safe: the runtime re-drives the loop).
         self._conversations: dict[RunId, list[dict[str, object]]] = {}
-        self._seen_items: dict[RunId, set[tuple[str, str]]] = {}
+        self._seen_items: dict[RunId, set[tuple[str, str, TrustClass]]] = {}
         self._pending_calls: dict[RunId, str] = {}
         self._thinking_exhausted: set[RunId] = set()
         # The previous request's messages (serialized) and prompt size, per run: a
         # request that extends them exactly re-sends a prefix the server already holds.
-        self._previous_prompt: dict[RunId, tuple[list[str], int]] = {}
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
         self._client = httpx.Client(
             base_url=base_url,
@@ -346,7 +365,6 @@ class OllamaModel:
         self._seen_items.clear()
         self._pending_calls.clear()
         self._thinking_exhausted.clear()
-        self._previous_prompt.clear()
         self._client.close()
 
     def _selected_tools(self, context: ModelContext) -> tuple[ModelToolSpec, ...]:
@@ -555,27 +573,13 @@ class OllamaModel:
     def _cached_prompt_tokens(
         self, run_id: RunId, payload: dict[str, object], response: ChatResponse
     ) -> int:
-        """Prompt tokens this request re-sent unchanged, which the server did not recompute.
+        """Only provider-confirmed cache reads may reduce authoritative work usage.
 
-        The server's own cached count when it reports one; otherwise the previous
-        request's prompt size when this request extends its messages exactly (an
-        append-only conversation the server's prefix cache serves). A compaction or
-        trim breaks the prefix and counts in full.
+        An unchanged prefix is a cache opportunity, not evidence of a cache hit.
+        Unknown usage is conservatively counted in full, including local servers.
         """
-        sent = [json.dumps({"model": payload["model"], "tools": payload["tools"]}, sort_keys=True)]
-        sent += [
-            json.dumps(message, sort_keys=True, ensure_ascii=False)
-            for message in cast("list[object]", payload["messages"])
-        ]
-        previous = self._previous_prompt.get(run_id)
-        self._previous_prompt[run_id] = (sent, response.prompt_eval_count)
-        if response.prompt_eval_cached_count is not None:
-            cached = response.prompt_eval_cached_count
-        elif previous is not None and sent[: len(previous[0])] == previous[0]:
-            cached = previous[1]
-        else:
-            cached = 0
-        return min(cached, response.prompt_eval_count)
+        del run_id, payload
+        return min(response.prompt_eval_cached_count or 0, response.prompt_eval_count)
 
     def _record_measurement(
         self, context: ModelContext, admission: ContextAdmission | None, prompt_tokens: int
@@ -624,7 +628,7 @@ class OllamaModel:
             return -(-size // 3)
         return math.ceil(size * calibration[1] / calibration[0])
 
-    def _checkpoint_compact(  # noqa: PLR0912, PLR0915 - ordered checkpoint, tier-1 and tier-2 gates
+    def _checkpoint_compact(  # noqa: PLR0912 - ordered checkpoint, tier-1 and tier-2 gates
         self, payload: dict[str, object], messages: list[dict[str, object]], context: ModelContext
     ) -> None:
         """Compact at a deterministic checkpoint so usage stays under the working budget.
@@ -637,6 +641,7 @@ class OllamaModel:
         (optional) replaces the masked middle with a validated model-inference handoff.
         """
         budget = self._working_budget
+        self._update_preserved(context)
         if budget is None or self._conversation_mode != "history":
             return
         checkpoint = context.run_id in self._checkpoint_due
@@ -660,9 +665,9 @@ class OllamaModel:
             "tier": 1,
         }
         assistants = [i for i, m in enumerate(messages) if m.get("role") == "assistant"]
-        if len(assistants) <= _KEEP_EXCHANGES:
+        if len(assistants) <= self._keep_exchanges:
             return
-        keep_from = assistants[-_KEEP_EXCHANGES]
+        keep_from = assistants[-self._keep_exchanges]
         # Only the latest turn's reasoning is still in use; earlier reasoning (including
         # the retained previous exchange) is dropped at the boundary.
         for index in assistants[:-1]:
@@ -673,15 +678,8 @@ class OllamaModel:
             if self._estimate(payload, context) <= target:
                 break
             if compactable(messages[index]):
-                messages[index]["content"] = checkpoint_stub(str(messages[index]["content"]))
+                self._stub_observation(messages, index)
                 payload["messages"] = list(messages)
-        if self._estimate(payload, context) > target:
-            # Two retained exchanges still exceed the target: keep only the latest one.
-            for index in range(keep_from, assistants[-1]):
-                if compactable(messages[index]):
-                    messages[index]["content"] = checkpoint_stub(str(messages[index]["content"]))
-            keep_from = assistants[-1]
-            payload["messages"] = list(messages)
         if self._estimate(payload, context) > target and self._checkpoint_summarizer is not None:
             middle = [m for m in messages[2:keep_from] if m.get("role") != "system"]
             try:
@@ -690,8 +688,9 @@ class OllamaModel:
                 record["tier2_error"] = type(exc).__name__
             else:
                 self._handoffs[context.run_id] = handoff
-                carried = any(m.get("role") == "tool" and not compactable(m) for m in middle)
                 kept = [m for m in messages[2:keep_from] if m.get("role") == "system"]
+                for message in messages[2:keep_from]:
+                    self._message_items.get(context.run_id, {}).pop(id(message), None)
                 messages[2:keep_from] = kept
                 first_tool = next(
                     i for i in range(2 + len(kept), len(messages)) if messages[i]["role"] == "tool"
@@ -712,8 +711,14 @@ class OllamaModel:
                 messages[first_tool]["content"] = (
                     block
                     + "\n"
-                    + (f"{self._pinned_report[context.run_id]}\n" if carried else "")
+                    + self._preserved_text(context.run_id)
+                    + "\n"
                     + str(messages[first_tool]["content"])
+                )
+                self._mark_preserved(
+                    context.run_id,
+                    messages[first_tool],
+                    tuple(self._preserved_items.get(context.run_id, {}).values()),
                 )
                 record["tier"] = 2
                 payload["messages"] = list(messages)
@@ -735,45 +740,44 @@ class OllamaModel:
         This uses the actual serialized request envelope, including tools and
         UTF-8 expansion. No model-written summary replaces source evidence.
         """
+        self._update_preserved(context)
         assistants = [i for i in range(2, len(history)) if history[i].get("role") == "assistant"]
         if len(assistants) < 2:
             return False
+        for message in history[assistants[0] : assistants[1]]:
+            self._message_items.get(context.run_id, {}).pop(id(message), None)
         del history[assistants[0] : assistants[1]]
         self._history_compactions[context.run_id] = (
             self._history_compactions.get(context.run_id, 0) + 1
         )
         prefix = "Runtime history compaction: "
-        preserved = "\n".join(
-            f"- ({item.trust.value}) {item.content}"
-            for item in context.items
-            if item.trust in {TrustClass.RUNTIME_POLICY, TrustClass.AUTHORIZED_HUMAN}
-            or str(item.item_id).rsplit(":", 1)[-1]
-            in {
-                "blockers",
-                "coding-contract",
-                "coding-progress",
-                "verifier-failure",
-                "confirmed-fact",
-                "pending-approval",
-                "irreversible-action",
-            }
-        )
+        preserved = self._preserved_text(context.run_id)
         notice: dict[str, object] = {
             "role": "user",
             "content": prefix + "older complete action/result turns were omitted to fit "
             "the unchanged request envelope. Original objective and latest turn remain. "
             "Earlier source observations may be absent: reread needed source; never infer "
             "unseen evidence. Permissions, checks, approvals and budgets are unchanged. "
-            "Current runtime facts retain their trust labels:\n" + preserved,
+            + (
+                "Use read_observation with no sequence to discover the original output index. "
+                if any(tool.name == "read_observation" for tool in self._tools)
+                else ""
+            )
+            + "Current runtime facts retain their trust labels:\n"
+            + preserved,
         }
         if (
             len(history) > 2
             and history[2].get("role") == "user"
             and str(history[2].get("content", "")).startswith(prefix)
         ):
+            self._message_items.get(context.run_id, {}).pop(id(history[2]), None)
             history[2] = notice
         else:
             history.insert(2, notice)
+        self._mark_preserved(
+            context.run_id, notice, tuple(self._preserved_items.get(context.run_id, {}).values())
+        )
         return True
 
     def drop_conversation(self, run_id: RunId) -> None:
@@ -783,7 +787,6 @@ class OllamaModel:
         self._conversations.pop(run_id, None)
         self._seen_items.pop(run_id, None)
         self._pending_calls.pop(run_id, None)
-        self._previous_prompt.pop(run_id, None)
         self._history_compactions.pop(run_id, None)
         self._ratio_bound_violated.discard(run_id)
         self._calibration.pop(run_id, None)
@@ -792,10 +795,13 @@ class OllamaModel:
         self._checkpoint_due.discard(run_id)
         self._handoffs.pop(run_id, None)
         self._compacted_to.pop(run_id, None)
+        self._preserved_items.pop(run_id, None)
+        self._message_items.pop(run_id, None)
 
     def _conversation(
         self, context: ModelContext, rendered: RenderedPrompt
     ) -> list[dict[str, object]]:
+        self._update_preserved(context)
         if self._conversation_mode == "state":
             # The request is rebuilt from the current projection, not prior chat.
             # Audit history remains in the event store; no model summary replaces it.
@@ -822,7 +828,9 @@ class OllamaModel:
             return messages
         history: list[dict[str, object]] | None = self._conversations.get(context.run_id)
         seen = self._seen_items.setdefault(context.run_id, set())
-        new_items = [item for item in context.items if (item.item_id, item.content) not in seen]
+        new_items = [
+            item for item in context.items if (item.item_id, item.content, item.trust) not in seen
+        ]
         if history is None:
             history = [
                 {"role": "system", "content": rendered.stable_prefix},
@@ -832,12 +840,13 @@ class OllamaModel:
                 },
             ]
             self._conversations[context.run_id] = history
+            self._mark_preserved(context.run_id, history[1], context.items)
         else:
             self._append_turn_delta(context, history, new_items)
             if any(str(item.item_id).endswith(_VERIFICATION_SUFFIXES) for item in new_items):
                 # A verification result arrived: a deterministic checkpoint.
                 self._checkpoint_due.add(context.run_id)
-        seen.update((item.item_id, item.content) for item in context.items)
+        seen.update((item.item_id, item.content, item.trust) for item in context.items)
         if self._max_history_chars is not None:
             while len(json.dumps(history, ensure_ascii=False)) > self._max_history_chars:
                 if self._history_overflow == "fail":
@@ -888,14 +897,19 @@ class OllamaModel:
                 result += "\nRuntime update:\n" + "\n".join(
                     self._present(context.run_id, item) for item in new_items
                 )
+                observations += new_items
                 new_items = []
             dropped = self._dropped_calls.pop(context.run_id, None)
             if dropped is not None:
                 result += "\n" + dropped
-            history.append({"role": "tool", "tool_name": pending, "content": result})
+            message: dict[str, object] = {"role": "tool", "tool_name": pending, "content": result}
+            history.append(message)
+            self._mark_preserved(context.run_id, message, tuple(observations))
         if new_items:
             lines = "\n".join(self._present(context.run_id, item) for item in new_items)
-            history.append({"role": "user", "content": f"Runtime update:\n{lines}"})
+            message = {"role": "user", "content": f"Runtime update:\n{lines}"}
+            history.append(message)
+            self._mark_preserved(context.run_id, message, tuple(new_items))
 
     def _no_observation(self, tool_name: str) -> str:
         """Code-owned result for a proposal that produced no observation."""
@@ -915,7 +929,9 @@ class OllamaModel:
     def _present(self, run_id: RunId, item: ContextItem) -> str:
         """Code-owned item presentation inside the conversation (see observation_format)."""
         if self._observation_format == "plain":
-            return f"- ({item.trust.value}) {item.content}"
+            return self._with_observation_reference(
+                run_id, item, f"- ({item.trust.value}) {item.content}"
+            )
         if is_verification_failure(item):
             fingerprint = failure_fingerprint(item.content)
             if fingerprint and self._presented_failure.get(run_id) == fingerprint:
@@ -926,7 +942,24 @@ class OllamaModel:
             self._presented_failure[run_id] = fingerprint
             self._pinned_report[run_id] = delimited(item)
             return self._pinned_report[run_id]
-        return delimited(item)
+        return self._with_observation_reference(run_id, item, delimited(item))
+
+    def _with_observation_reference(self, run_id: RunId, item: ContextItem, rendered: str) -> str:
+        parts = str(item.item_id).rsplit(":", 2)
+        if (
+            any(tool.name == "read_observation" for tool in self._tools)
+            and len(parts) == 3
+            and parts[0] == str(run_id)
+            and parts[1].isdigit()
+            and int(parts[1]) > 0
+            and parts[2] == "observation"
+            and item.source.reference == f"run:{item.item_id}"
+        ):
+            rendered = (
+                f"- ({item.trust.value}) Original observation reference: read_observation "
+                f"sequence={parts[1]}, offset_bytes=0 (exact historical output).\n" + rendered
+            )
+        return rendered
 
     def _compactable(self, run_id: RunId, message: dict[str, object]) -> bool:
         """A tool result compaction may stub: never the one holding the pinned report.
@@ -935,10 +968,61 @@ class OllamaModel:
         turns still said "same as the last full report above"; the worker lost the
         failure and declared itself done.
         """
+        active = {(i.item_id, i.content) for i in self._preserved_items.get(run_id, {}).values()}
+        held = self._message_items.get(run_id, {}).get(id(message), frozenset())
         pinned = self._pinned_report.get(run_id)
         return message.get("role") == "tool" and not (
-            pinned and pinned in str(message.get("content", ""))
+            active.intersection(held) or (pinned and pinned in str(message.get("content", "")))
         )
+
+    @staticmethod
+    def _requires_preservation(item: ContextItem) -> bool:
+        return item.trust in {TrustClass.RUNTIME_POLICY, TrustClass.AUTHORIZED_HUMAN} or (
+            str(item.item_id).rsplit(":", 1)[-1] in _CURRENT_FACT_SUFFIXES
+        )
+
+    def _update_preserved(self, context: ModelContext) -> None:
+        held = self._preserved_items.setdefault(context.run_id, {})
+        current_ids = {item.item_id for item in context.items}
+        has_verification = any(
+            str(identity).endswith(_VERIFICATION_SUFFIXES) for identity in current_ids
+        )
+        for identity, item in tuple(held.items()):
+            if not item.is_fresh(context.assembled_at) or (
+                str(identity).rsplit(":", 1)[-1] in _CURRENT_FACT_SUFFIXES
+                and identity not in current_ids
+                and (not str(identity).endswith(_VERIFICATION_SUFFIXES) or has_verification)
+            ):
+                held.pop(identity)
+        for item in context.items:
+            if item.supersedes is not None:
+                held.pop(item.supersedes, None)
+            if self._requires_preservation(item) and item.is_fresh(context.assembled_at):
+                held[item.item_id] = item
+
+    def _mark_preserved(
+        self, run_id: RunId, message: dict[str, object], items: tuple[ContextItem, ...]
+    ) -> None:
+        keys = frozenset(
+            (item.item_id, item.content) for item in items if self._requires_preservation(item)
+        )
+        self._message_items.setdefault(run_id, {})[id(message)] = keys
+
+    def _preserved_text(self, run_id: RunId) -> str:
+        return "\n".join(delimited(item) for item in self._preserved_items.get(run_id, {}).values())
+
+    @staticmethod
+    def _stub_observation(messages: list[dict[str, object]], index: int) -> None:
+        original = str(messages[index].get("content", ""))
+        shortened = checkpoint_stub(original)
+        messages[index]["content"] = shortened
+        if shortened != original:
+            previous = next(
+                (m for m in reversed(messages[:index]) if m.get("role") == "assistant"), None
+            )
+            if previous is not None:
+                previous["content"] = ""
+                previous.pop("thinking", None)
 
     def _correction_role(self) -> str:
         """Runtime-owned corrections; in exact replay a mid-conversation system message.

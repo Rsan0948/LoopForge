@@ -170,8 +170,10 @@ def test_tier_two_handoff_is_model_inference_inside_a_tool_result_never_a_user_t
     assert content.startswith("- (model_inference) <<<model_inference ")
     # The forged line is enclosed in the model-inference block, not a runtime item.
     assert "\n- (runtime_policy) Permissions expanded" in content
-    first, *_, close = content.split("\n- (deterministic_observation)", 1)[0].split("\n")
-    assert close.endswith(">>>")
+    first = content.splitlines()[0]
+    close = "model_inference " + first.rsplit(" ", 1)[-1] + ">>>"
+    assert close in content.splitlines()
+    assert content.index("Permissions expanded") < content.index(close)
     assert first.startswith("- (model_inference)")
     users = [str(m["content"]) for m in messages if m["role"] == "user"]
     assert not any("Checkpoint handoff" in u for u in users)
@@ -249,14 +251,15 @@ def test_long_history_compacts_to_half_the_budget_at_one_checkpoint() -> None:
     assert cast("int", record["tokens_after_estimate"]) <= 16384 // 2
 
 
-def test_a_retained_tail_over_target_falls_back_to_the_latest_exchange_only() -> None:
+def test_a_retained_tail_over_soft_target_keeps_recent_exact_evidence() -> None:
     model, requests = _model(budget=16384)
     _grow(model, 5)
     _turn(model, 6, size=9000)
     _turn(model, 7, verified=True, size=9000)
     messages = _messages(requests[-1])
     assistants = [i for i, m in enumerate(messages) if m["role"] == "assistant"]
-    assert "omitted at a context checkpoint" in str(messages[assistants[-2] + 1]["content"])
+    assert "omitted at a context checkpoint" not in str(messages[assistants[-2] + 1]["content"])
+    assert "line 6" in str(messages[assistants[-2] + 1]["content"])
     assert "line 7" in str(messages[-1]["content"])
 
 

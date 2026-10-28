@@ -977,6 +977,7 @@ class Runtime:
                     attempt=attempt,
                     timeout_seconds=metadata.timeout_seconds,
                     idempotency_key=idempotency_key,
+                    run_id=run_id,
                 )
             )
             # Boundary validation is intentional: adapters may violate port return types.

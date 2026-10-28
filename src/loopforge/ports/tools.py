@@ -7,6 +7,7 @@ from typing import Protocol
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.reliability import ToolFailureClass
 from loopforge.domain.tooling import ToolMetadata
+from loopforge.domain.types import RunId
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +16,7 @@ class ToolExecutionRequest:
     attempt: int
     timeout_seconds: float
     idempotency_key: str | None = None
+    run_id: RunId | None = None
 
     def __post_init__(self) -> None:
         if self.attempt <= 0:

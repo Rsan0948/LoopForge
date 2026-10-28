@@ -1,4 +1,4 @@
-"""Token budgets count work: a re-sent conversation prefix is not charged again. No network."""
+"""Only confirmed cache reads reduce authoritative work usage. No network."""
 
 import json
 from dataclasses import replace
@@ -10,7 +10,7 @@ import pytest
 from loopforge.adapters.ollama_model import OllamaModel
 from loopforge.domain.context import ModelContext
 from loopforge.domain.policy import ControlPolicy
-from loopforge.domain.state import RunState
+from loopforge.domain.state import RunState, budget_exceeded
 from loopforge.domain.types import BudgetLimit, RunId
 from loopforge.ports.model import ModelToolSpec, ModelTurnError
 from tests.unit.test_ollama_model import (
@@ -37,7 +37,7 @@ def _history_model(transport: httpx.MockTransport) -> OllamaModel:
     )
 
 
-def test_a_request_that_extends_the_last_one_is_charged_only_for_the_new_part() -> None:
+def test_an_extended_prefix_without_cache_confirmation_is_charged_in_full() -> None:
     transport, sent = _replies(
         _chat_payload(prompt_tokens=10_000), _chat_payload(prompt_tokens=10_400)
     )
@@ -46,7 +46,7 @@ def test_a_request_that_extends_the_last_one_is_charged_only_for_the_new_part() 
     second = model.propose_action(_context())
     assert sent[1]["messages"][: len(sent[0]["messages"])] == sent[0]["messages"]  # type: ignore[index]
     assert first.usage.cached_input_tokens == 0
-    assert second.usage.cached_input_tokens == 10_000
+    assert second.usage.cached_input_tokens == 0
 
 
 def test_a_server_reported_cache_count_wins_and_never_exceeds_the_prompt() -> None:
@@ -110,6 +110,7 @@ def test_the_token_budget_counts_work_tokens_not_repeated_input() -> None:
     assert cached.work_tokens == 700
     assert cached.total_tokens == 5_200  # reports keep the full count
     assert policy.evaluate(cached).reason_code == "CONTINUE_WITHIN_POLICY"
+    assert not budget_exceeded(cached, policy.budget)
     over = replace(cached, cached_input_tokens=99_999)
     assert over.work_tokens == 200  # a cache count larger than input never goes negative
 

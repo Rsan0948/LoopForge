@@ -127,7 +127,10 @@ def is_verification_failure(item: ContextItem) -> bool:
     return str(item.item_id).endswith(":verifier-failure")
 
 
-_OMITTED = "[omitted at a context checkpoint: {size} characters; re-run the tool to view]"
+_OMITTED = (
+    "[omitted at a context checkpoint: {size} characters; use an original observation "
+    "reference if provided. Re-running a tool measures current state, not this historical output.]"
+)
 _BLOCK_OPEN = re.compile(r"^- \((\w+)\) <<<(\w+) ([0-9a-f]{12})$")
 
 

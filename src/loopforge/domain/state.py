@@ -696,7 +696,7 @@ def budget_exceeded(state: RunState, limit: BudgetLimit) -> bool:
         return True
     if limit.max_iterations is not None and state.iteration >= limit.max_iterations:
         return True
-    return limit.max_total_tokens is not None and state.total_tokens >= limit.max_total_tokens
+    return limit.max_total_tokens is not None and state.work_tokens >= limit.max_total_tokens
 
 
 _TERMINAL_STATUS_BY_REASON: dict[StopReason, RunStatus] = {

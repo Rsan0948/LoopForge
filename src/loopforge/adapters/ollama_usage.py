@@ -42,6 +42,22 @@ class ProviderRequestTracker:
             self.history.append({"mode_change": reason, "at": datetime.now(UTC).isoformat()})
             self.history = self.history[-256:]
 
+    def record_provider_usage(
+        self, usage: UsageDelta, *, response_id: str, cache_write_tokens: int
+    ) -> None:
+        """Validated adapter usage for reconciliation, never a new budget source."""
+        with self.lock:
+            self.history.append(
+                {
+                    "provider_usage": {
+                        **asdict(usage),
+                        "response_id": response_id,
+                        "cache_write_tokens": cache_write_tokens,
+                    }
+                }
+            )
+            self.history = self.history[-256:]
+
     def record_admission(self, admission: ContextAdmission) -> None:
         with self.lock:
             self.history.append(
