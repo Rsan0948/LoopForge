@@ -27,6 +27,7 @@ from pathlib import Path
 
 import mlx.core as mx
 from mlx_lm import server
+from mlx_lm.models import cache
 
 _upstream_tokenize = server.ResponseGenerator._tokenize
 _TAIL_WINDOW = 11  # upstream's thinking-tail search window
@@ -88,6 +89,12 @@ def _tokenize(self, tokenizer, request, args):
     prompt, segments, segment_types, initial_state, vision = _upstream_tokenize(
         self, tokenizer, request, args
     )
+    if not prompt:
+        # Raised here, the error reaches only this request. Upstream would insert the
+        # empty prompt and its generation thread would die, failing every later request
+        # until restart (live 2026-10-29: a chat request without the rendered prompt).
+        msg = "request renders to an empty prompt"
+        raise ValueError(msg)
     _Cap.thinking = initial_state == "reasoning"
     messages = getattr(request, "messages", None) or []
     if (
@@ -110,6 +117,26 @@ def _tokenize(self, tokenizer, request, args):
     return prompt, segments, segment_types, initial_state, vision
 
 
+_upstream_fetch = cache.LRUPromptCache.fetch_nearest_cache
+
+
+def _fetch_nearest_cache(self, model, tokens):
+    """Never leave a prompt with nothing to process.
+
+    Upstream returns an exact match with no remaining tokens; the generator then
+    rejects the empty prompt and its thread dies (an identical retry would do it).
+    Reuse all but the last token instead, or run the request uncached.
+    """
+    prompt_cache, rest = _upstream_fetch(self, model, tokens)
+    if rest or not tokens or prompt_cache is None:
+        return prompt_cache, rest
+    if cache.can_trim_prompt_cache(prompt_cache):
+        cache.trim_prompt_cache(prompt_cache, 1)
+        return prompt_cache, tokens[-1:]
+    return None, tokens
+
+
+cache.LRUPromptCache.fetch_nearest_cache = _fetch_nearest_cache
 server.ResponseGenerator._tokenize = _tokenize
 server._make_logits_processors = _make_logits_processors
 
