@@ -78,8 +78,15 @@ class OpenRouterModel(OllamaModel):
     enforce a shared paid ledger before requests, without a product import here.
     """
 
+    _PROVIDER = "openrouter"
+
     def __init__(
-        self, *, api_key: str | None, capabilities: ModelCapabilities | None, **kwargs: object
+        self,
+        *,
+        api_key: str | None,
+        capabilities: ModelCapabilities | None,
+        reasoning_tokens: int | None = None,
+        **kwargs: object,
     ) -> None:
         if (
             not api_key
@@ -92,13 +99,28 @@ class OpenRouterModel(OllamaModel):
         if kwargs.get("model") != capabilities.model:
             msg = "OpenRouter model identity must match its capability contract"
             raise ValueError(msg)
+        # A reasoning allowance inside the output limit, so long reasoning leaves room for
+        # the action. Probed 2026-10-30 (DeepSeek V4.1 Flash at DeepInfra): with one shared
+        # 4,096 limit reasoning took 3,823 tokens and no tool call came back; capped at 512
+        # inside 1,536 it took 922 and the call came back. The cap is soft, so the rest of
+        # the output limit must cover overshoot as well as the action.
+        output_limit = kwargs.get("max_output_tokens")
+        if reasoning_tokens is not None and (
+            type(reasoning_tokens) is not int
+            or reasoning_tokens <= 0
+            or type(output_limit) is not int
+            or reasoning_tokens >= output_limit
+        ):
+            msg = "reasoning_tokens must be a positive integer below max_output_tokens"
+            raise ValueError(msg)
+        self._reasoning_tokens = reasoning_tokens
         # The parent constructor's rich conversation options remain its contract.
         super().__init__(
             api_key=api_key,
             base_url="https://openrouter.ai/api/v1",
+            capabilities=capabilities,
             **kwargs,  # type: ignore[arg-type]
         )
-        self._capabilities = capabilities
         self._charged = 0.0
         self._reasoning_details: list[dict[str, object]] | None = None
 
@@ -161,6 +183,15 @@ class OpenRouterModel(OllamaModel):
         # counted only from usage, never from this request hint.
         if self.capabilities.model.startswith("anthropic/"):
             body["cache_control"] = {"type": "ephemeral"}
+        if self._reasoning_tokens is not None:
+            # A turn the parent marked think=False (after output ran out without an
+            # action) reaches the provider; without a reasoning allowance the flag is
+            # not sent, since some endpoints refuse disabling mandatory reasoning.
+            body["reasoning"] = (
+                {"enabled": False}
+                if payload.get("think") is False
+                else {"max_tokens": self._reasoning_tokens}
+            )
         if self.request_recorder is not None:
             self.request_recorder(body)
         try:

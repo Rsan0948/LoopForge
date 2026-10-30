@@ -132,6 +132,10 @@ class OllamaModel:
     runtime's synchronous control loop.
     """
 
+    # The provider a subclass serves, checked against its capability record so that
+    # the requested window is admitted against the deployed model's real window.
+    _PROVIDER: str = "ollama"
+
     def __init__(  # noqa: PLR0912, PLR0913, PLR0915 - explicit provider wiring and validation
         self,
         *,
@@ -217,11 +221,11 @@ class OllamaModel:
         # capabilities.model, so a wiring typo that diverges the two must
         # fail at construction, not silently query a different model.
         if capabilities is not None and (
-            capabilities.provider != "ollama" or capabilities.model != model
+            capabilities.provider != self._PROVIDER or capabilities.model != model
         ):
             msg_9 = (
-                "ollama capabilities identity must match the wired provider "
-                f"and model (expected ollama/{model})"
+                f"{self._PROVIDER} capabilities identity must match the wired provider "
+                f"and model (expected {self._PROVIDER}/{model})"
             )
             raise ValueError(msg_9)
         self._capabilities = capabilities or ModelCapabilities(

@@ -173,3 +173,94 @@ def test_provider_failure_is_classified_without_echoing_secrets(
         assert "secret" not in str(error.value)
     finally:
         model.close()
+
+
+def _reasoning_model(
+    respond: httpx.MockTransport, *, reasoning_tokens: int | None = 512
+) -> OpenRouterModel:
+    return OpenRouterModel(
+        api_key="offline",
+        capabilities=CAPABILITIES,
+        model=CAPABILITIES.model,
+        tools=TOOLS,
+        template=TEMPLATE,
+        transport=respond,
+        max_output_tokens=1536,
+        thinking=True,
+        reasoning_tokens=reasoning_tokens,
+    )
+
+
+def test_reasoning_allowance_sits_inside_the_output_limit() -> None:
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=payload())
+
+    model = _reasoning_model(httpx.MockTransport(respond))
+    try:
+        model.propose_action(_context())
+        assert requests[0]["max_tokens"] == 1536
+        assert requests[0]["reasoning"] == {"max_tokens": 512}
+    finally:
+        model.close()
+
+
+def test_output_exhausted_without_an_action_disables_reasoning_on_the_wire() -> None:
+    requests: list[dict[str, object]] = []
+    exhausted = payload()
+    exhausted["choices"] = [
+        {"message": {"role": "assistant", "content": ""}, "finish_reason": "length"}
+    ]
+    exhausted["usage"] = {"prompt_tokens": 100, "completion_tokens": 1536, "cost": 0.00002}
+    replies = [exhausted, payload()]
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=replies[len(requests) - 1])
+
+    model = _reasoning_model(httpx.MockTransport(respond))
+    try:
+        with pytest.raises(ModelTurnError) as error:
+            model.propose_action(_context())
+        assert "next calls disable thinking" in error.value.summary
+        model.propose_action(_context())
+        assert requests[0]["reasoning"] == {"max_tokens": 512}
+        assert requests[1]["reasoning"] == {"enabled": False}
+    finally:
+        model.close()
+
+
+def test_without_a_reasoning_allowance_no_reasoning_field_is_sent() -> None:
+    requests: list[dict[str, object]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json=payload())
+
+    model = _reasoning_model(httpx.MockTransport(respond), reasoning_tokens=None)
+    try:
+        model.propose_action(_context())
+        assert "reasoning" not in requests[0]
+    finally:
+        model.close()
+
+
+@pytest.mark.parametrize(
+    ("reasoning_tokens", "max_output_tokens"),
+    [(0, 1536), (1536, 1536), (2048, 1536), (512, None), (True, 1536)],
+)
+def test_a_reasoning_allowance_must_leave_room_for_the_action(
+    reasoning_tokens: int, max_output_tokens: int | None
+) -> None:
+    with pytest.raises(ValueError, match="reasoning_tokens"):
+        OpenRouterModel(
+            api_key="offline",
+            capabilities=CAPABILITIES,
+            model=CAPABILITIES.model,
+            tools=TOOLS,
+            template=TEMPLATE,
+            max_output_tokens=max_output_tokens,
+            reasoning_tokens=reasoning_tokens,
+        )
