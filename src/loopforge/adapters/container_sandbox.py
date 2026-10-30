@@ -163,6 +163,66 @@ class ContainerSandboxConfig:
             raise ValueError(msg_9)
 
 
+def hardened_run_argv(
+    config: ContainerSandboxConfig,
+    root: Path,
+    *,
+    container_name: str,
+    cpu_seconds: int,
+    detached: bool = False,
+) -> tuple[str, ...]:
+    """The enforced ``docker run`` contract up to and including the image.
+
+    One builder for every container this package starts, so a one-shot command and a
+    persistent session can never drift apart in isolation flags.
+    """
+    argv = [
+        config.docker_executable,
+        "run",
+        *(("--detach",) if detached else ()),
+        "--rm",
+        "--init",
+        "--pull",
+        "never",
+        "--name",
+        container_name,
+        "--network",
+        config.network.value,
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--log-driver",
+        "none",
+        "--pids-limit",
+        str(config.pids_limit),
+        "--memory",
+        str(config.limits.max_memory_bytes),
+        "--memory-swap",
+        str(config.limits.max_memory_bytes),
+        "--ulimit",
+        f"nofile={config.limits.max_open_files}:{config.limits.max_open_files}",
+        "--ulimit",
+        f"cpu={cpu_seconds}:{cpu_seconds}",
+        "--tmpfs",
+        f"/tmp:rw,noexec,nosuid,size={config.tmpfs_bytes}",
+        "--workdir",
+        _WORKSPACE_MOUNT,
+        "--mount",
+        f"type=bind,source={root},target={_WORKSPACE_MOUNT}"
+        + (",readonly" if config.workspace_read_only else ""),
+    ]
+    for source, target in config.read_only_mounts:
+        argv.extend(["--mount", f"type=bind,source={source},target={target},readonly"])
+    if config.user is not None:
+        argv.extend(["--user", config.user])
+    for key, value in sorted((config.environment or {}).items()):
+        argv.extend(["--env", f"{key}={value}"])
+    argv.append(config.image)
+    return tuple(argv)
+
+
 class ContainerSandbox:
     """Hardened container sandbox for untrusted repository/build execution.
 
@@ -205,6 +265,7 @@ class ContainerSandbox:
         self._docker = config.docker_executable
         self._workspace_read_only = config.workspace_read_only
         self._read_only_mounts = config.read_only_mounts
+        self._config = config
         self._active_container: str | None = None
 
     @property
@@ -302,51 +363,15 @@ class ContainerSandbox:
         self.destroy()
 
     def _docker_run_argv(self, *, spec: CommandSpec, container_name: str) -> tuple[str, ...]:
-        argv = [
-            self._docker,
-            "run",
-            "--rm",
-            "--init",
-            "--pull",
-            "never",
-            "--name",
-            container_name,
-            "--network",
-            self._network.value,
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--log-driver",
-            "none",
-            "--pids-limit",
-            str(self._pids_limit),
-            "--memory",
-            str(self._limits.max_memory_bytes),
-            "--memory-swap",
-            str(self._limits.max_memory_bytes),
-            "--ulimit",
-            f"nofile={self._limits.max_open_files}:{self._limits.max_open_files}",
-            "--ulimit",
-            f"cpu={spec.cpu_seconds}:{spec.cpu_seconds}",
-            "--tmpfs",
-            f"/tmp:rw,noexec,nosuid,size={self._tmpfs_bytes}",
-            "--workdir",
-            _WORKSPACE_MOUNT,
-            "--mount",
-            f"type=bind,source={self._root},target={_WORKSPACE_MOUNT}"
-            + (",readonly" if self._workspace_read_only else ""),
-        ]
-        for source, target in self._read_only_mounts:
-            argv.extend(["--mount", f"type=bind,source={source},target={target},readonly"])
-        if self._user is not None:
-            argv.extend(["--user", self._user])
-        for key, value in sorted(self._environment.items()):
-            argv.extend(["--env", f"{key}={value}"])
-        argv.append(self._image)
-        argv.extend(spec.argv)
-        return tuple(argv)
+        return (
+            *hardened_run_argv(
+                self._config,
+                self._root,
+                container_name=container_name,
+                cpu_seconds=spec.cpu_seconds,
+            ),
+            *spec.argv,
+        )
 
     def _kill_container(
         self, container_name: str, *, process: subprocess.Popen[bytes] | None
