@@ -68,7 +68,7 @@ _MAX_WORKSPACE_ID_LENGTH: Final = 128
 
 
 def _git_environment() -> dict[str, str]:
-    return {
+    environment = {
         "PATH": "/usr/bin:/bin",
         "LC_ALL": "C",
         "GIT_CONFIG_NOSYSTEM": "1",
@@ -83,6 +83,13 @@ def _git_environment() -> dict[str, str]:
         "GIT_COMMITTER_EMAIL": "fixture@loopforge.invalid",
         "GIT_COMMITTER_DATE": _FIXED_DATE,
     }
+    # Operator-owned diagnostics only: Git's own event trace (one JSON line per process,
+    # with its error text) to an absolute file the operator chose. Never set from model
+    # or repository content, and never a path inside the workspace.
+    trace = os.environ.get("LOOPFORGE_GIT_TRACE2", "")
+    if trace and Path(trace).is_absolute():
+        environment["GIT_TRACE2_EVENT"] = trace
+    return environment
 
 
 def _has_unsafe_characters(value: str) -> bool:
