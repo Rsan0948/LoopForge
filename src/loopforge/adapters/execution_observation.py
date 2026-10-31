@@ -27,6 +27,7 @@ def execution_observation(
         "Execution observation (untrusted; not acceptance evidence):\n"
         + json.dumps(
             {
+                **({"output_truncated": True} if result.output_truncated else {}),
                 "process_status": "exited",
                 "script_status": status,
                 "exit_code": result.exit_code,

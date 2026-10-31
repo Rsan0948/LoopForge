@@ -67,3 +67,15 @@ def test_without_markers_a_nonzero_exit_is_never_guessed_to_be_a_crash() -> None
         )
     )
     assert json.loads(rendered.splitlines()[1])["script_status"] == "nonzero_exit"
+
+
+def test_capture_truncation_is_reported_without_authorizing_acceptance() -> None:
+    rendered = execution_observation(
+        SandboxCommandResult(
+            exit_code=0, stdout="[output", stderr="", succeeded=True, output_truncated=True
+        )
+    )
+    header = json.loads(rendered.splitlines()[1])
+    assert header["output_truncated"] is True
+    assert header["measurement_status"] == "not_verified"
+    assert header["script_status"] == "zero_exit"

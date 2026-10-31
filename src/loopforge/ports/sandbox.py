@@ -35,6 +35,8 @@ class SandboxCommandResult:
     stdout: str
     stderr: str
     succeeded: bool
+    output_truncated: bool = False
+    """True when this execution adapter discarded captured process output."""
     resource_limits_skipped: tuple[str, ...] = ()
     """Resource limits the platform rejected before exec (e.g. ``("RLIMIT_AS",)``
     on macOS). Empty when every requested limit was enforced. The workload can

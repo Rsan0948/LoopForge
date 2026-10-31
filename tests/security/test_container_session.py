@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import selectors
 import stat
 import subprocess
 import time
@@ -15,6 +16,7 @@ from test_container_sandbox import (  # pyright: ignore[reportPrivateUsage]
 from loopforge.adapters import container_session
 from loopforge.adapters.container_sandbox import ContainerSandboxConfig
 from loopforge.adapters.container_session import ContainerSession, ContainerSessionConfig
+from loopforge.adapters.local_sandbox import SandboxLimits
 from loopforge.ports.sandbox import SandboxError, SandboxPolicyError, SandboxTimeoutError
 
 # A stand-in Docker CLI: records every call, and runs FAKE_EXEC for `docker exec`.
@@ -46,6 +48,7 @@ def _session(
     *,
     command_timeout_seconds: int = 120,
     max_session_seconds: int = 3600,
+    max_output_bytes: int | None = None,
 ) -> ContainerSession:
     return ContainerSession(
         tmp_path / "work",
@@ -55,6 +58,9 @@ def _session(
                 commands=(),
                 docker_executable=str(docker),
                 workspace_read_only=True,
+                limits=SandboxLimits()
+                if max_output_bytes is None
+                else SandboxLimits(max_output_bytes=max_output_bytes),
             ),
             command_timeout_seconds=command_timeout_seconds,
             max_session_seconds=max_session_seconds,
@@ -95,6 +101,7 @@ def test_the_session_starts_lazily_once_with_the_hardened_contract(
     assert first.stdout == "out\n"
     assert first.stderr == "err\n"
     assert first.succeeded
+    assert not first.output_truncated
 
 
 def test_each_command_runs_in_the_named_session_under_a_kill_timeout(
@@ -188,6 +195,7 @@ def test_close_kills_the_container_and_refuses_further_commands(tmp_path: Path, 
         session.run("echo hi")
         name = session.active_container
     assert f"kill {name}" in _calls(tmp_path)
+    assert f"rm --force {name}" in _calls(tmp_path)
     with pytest.raises(SandboxPolicyError, match="closed"):
         session.run("echo hi")
 
@@ -242,7 +250,7 @@ def test_capabilities_are_the_container_sandboxes(tmp_path: Path, fake: Path) ->
 # --- live: a real session keeps state, and its isolation holds -------------------------
 
 
-def _live(tmp_path: Path) -> ContainerSession:
+def _live(tmp_path: Path, *, max_output_bytes: int = 1_000_000) -> ContainerSession:
     (tmp_path / "work").mkdir(exist_ok=True)
     (tmp_path / "work" / "app.txt").write_text("source\n")
     return ContainerSession(
@@ -253,6 +261,7 @@ def _live(tmp_path: Path) -> ContainerSession:
                 commands=(),
                 workspace_read_only=True,
                 user=f"{os.getuid()}:{os.getgid()}",
+                limits=SandboxLimits(max_output_bytes=max_output_bytes),
             ),
             command_timeout_seconds=20,
             max_session_seconds=120,
@@ -289,3 +298,170 @@ def test_live_a_timed_out_command_leaves_the_session_usable(tmp_path: Path) -> N
         with pytest.raises(SandboxTimeoutError, match="session continues"):
             session.run("sleep 30", timeout_seconds=2)
         assert session.run("echo alive").stdout == "alive\n"
+
+
+@pytest.mark.parametrize("exit_code", [0, 7])
+@pytest.mark.parametrize("output_limit", [8, 128])
+def test_output_flood_is_drained_with_bounded_capture_and_explicit_truncation(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int, output_limit: int
+) -> None:
+    session = _session(tmp_path, fake, max_output_bytes=output_limit)
+    monkeypatch.setenv(
+        "FAKE_EXEC",
+        "i=0; while [ $i -lt 20000 ]; do printf abcdefghijklmnop; "
+        f"printf ABCDEFGHIJKLMNOP >&2; i=$((i+1)); done; exit {exit_code}",
+    )
+    with session:
+        result = session.run("flood")
+    assert result.output_truncated
+    assert result.exit_code == exit_code
+    assert result.succeeded == (exit_code == 0)
+    assert len(result.stdout.encode()) <= output_limit
+    assert len(result.stderr.encode()) <= output_limit
+    if output_limit >= 128:
+        assert result.stdout.startswith("abcdefghijklmnop")
+        assert result.stderr.startswith("ABCDEFGHIJKLMNOP")
+        assert result.stdout.endswith("\n[output truncated]")
+        assert result.stderr.endswith("\n[output truncated]")
+
+
+def test_output_flood_cannot_bypass_the_host_timeout(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(container_session, "_EXEC_GRACE_SECONDS", 0.1)
+    monkeypatch.setenv("FAKE_EXEC", "while :; do printf flood; printf flood >&2; done")
+    session = _session(tmp_path, fake, command_timeout_seconds=1)
+    with pytest.raises(SandboxTimeoutError, match="destroyed"):
+        session.run("flood")
+    assert session.active_container is None
+    assert any(call.startswith("kill ") for call in _calls(tmp_path))
+
+
+def test_command_exit_does_not_drop_buffered_output_below_the_cap(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "FAKE_EXEC",
+        'python3 -c \'import os; os.write(1, b"x" * 200000); os.write(2, b"y" * 200000)\'',
+    )
+    with _session(tmp_path, fake) as session:
+        result = session.run("buffered")
+    assert result.succeeded
+    assert result.stdout == "x" * 200000
+    assert result.stderr == "y" * 200000
+    assert not result.output_truncated
+
+
+def test_capture_drains_a_finished_process_even_when_selector_reports_no_events(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MissedWakeupSelector(selectors.DefaultSelector):
+        def select(self, timeout: float | None = None) -> list[tuple[selectors.SelectorKey, int]]:
+            del timeout  # Deliberately miss the wakeup despite readable pipes.
+            return []
+
+    monkeypatch.setattr(container_session.selectors, "DefaultSelector", MissedWakeupSelector)
+    session = _session(tmp_path, fake)
+    with subprocess.Popen(
+        ["/bin/sh", "-c", "printf 'last stdout'; printf 'last stderr' >&2"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as process:
+        process.wait(timeout=2)
+        captured = session._capture_output(process, 1)  # pyright: ignore[reportPrivateUsage]
+    assert captured.stdout == "last stdout"
+    assert captured.stderr == "last stderr"
+    assert not captured.truncated
+
+
+@pytest.mark.parametrize(
+    "case",
+    [("ff" * 8, 8, True), ("e282", 2, True), ("c3a9", 2, False), ("61626364", 4, False)],
+)
+def test_returned_utf8_bytes_respect_the_capture_allowance(
+    tmp_path: Path,
+    fake: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: tuple[str, int, bool],
+) -> None:
+    hex_bytes, limit, truncated = case
+    monkeypatch.setenv(
+        "FAKE_EXEC",
+        "python3 -c 'import os; "
+        f'os.write(1, bytes.fromhex("{hex_bytes}")); '
+        f'os.write(2, bytes.fromhex("{hex_bytes}"))' + "'",
+    )
+    with _session(tmp_path, fake, max_output_bytes=limit) as session:
+        result = session.run("bytes")
+    assert result.succeeded
+    assert len(result.stdout.encode()) <= limit
+    assert len(result.stderr.encode()) <= limit
+    assert result.output_truncated is truncated
+    if not truncated:
+        assert result.stdout == bytes.fromhex(hex_bytes).decode()
+        assert result.stderr == bytes.fromhex(hex_bytes).decode()
+
+
+def test_truncated_daemon_error_is_still_an_infrastructure_failure(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FAKE_EXEC", "echo 'docker: synthetic runtime failure' >&2; exit 125")
+    with (
+        _session(tmp_path, fake, max_output_bytes=8) as session,
+        pytest.raises(SandboxError, match="container runtime failed"),
+    ):
+        session.run("unavailable")
+
+
+@pytest.mark.parametrize("failure", [OSError, KeyboardInterrupt])
+def test_capture_failure_reaps_the_cli_closes_pipes_and_disables_the_session(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    seen: list[subprocess.Popen[bytes]] = []
+
+    def broken_capture(process: subprocess.Popen[bytes], timeout: float) -> None:
+        assert timeout > 0
+        seen.append(process)
+        msg = "injected capture failure"
+        raise failure(msg)
+
+    monkeypatch.setenv("FAKE_EXEC", "while :; do :; done")
+    session = _session(tmp_path, fake)
+    monkeypatch.setattr(session, "_capture_output", broken_capture)
+    expected = SandboxError if failure is OSError else KeyboardInterrupt
+    with pytest.raises(expected, match="injected capture failure"):
+        session.run("probe")
+    assert len(seen) == 1
+    process = seen[0]
+    assert process.poll() is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert session.active_container is None
+    assert any(call.startswith("kill ") for call in _calls(tmp_path))
+    with pytest.raises(SandboxPolicyError, match="closed"):
+        session.run("must not restart")
+
+
+@_REQUIRES_DOCKER
+@pytest.mark.parametrize("exit_code", [0, 7])
+def test_live_output_flood_is_bounded_and_does_not_end_the_session(
+    tmp_path: Path, exit_code: int
+) -> None:
+    with _live(tmp_path, max_output_bytes=128) as session:
+        result = session.run(
+            "i=0; while [ $i -lt 10000 ]; do printf abcdefghijklmnop; "
+            f"printf ABCDEFGHIJKLMNOP >&2; i=$((i+1)); done; exit {exit_code}"
+        )
+        assert result.exit_code == exit_code
+        assert result.succeeded == (exit_code == 0)
+        assert result.output_truncated
+        assert len(result.stdout.encode()) <= 128
+        assert len(result.stderr.encode()) <= 128
+        assert result.stdout.endswith("[output truncated]")
+        assert result.stderr.endswith("[output truncated]")
+        later = session.run("echo usable")
+        assert later.succeeded
+        assert later.stdout == "usable\n"
+        assert not later.output_truncated

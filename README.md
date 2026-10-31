@@ -213,7 +213,9 @@ scope and remaining rollout gates.
 
 The experimental review-campaign product (review lanes, issues, n8n loops) was retired on
 2026-10-24; see [ADR-0021](docs/decisions/ADR-0021-core-and-agent-product-split.md). The
-repository-goal agent is moving to its own project, WorkBuddy, which depends on this core.
+repository-goal agent now lives in the sibling WorkBuddy project, which depends on this core.
+WorkBuddy owns goal supervision, coding/review lifecycles and product configuration;
+LoopForge owns the generic runtime and adapters.
 
 - `docs/architecture/overview.md` — system overview; `docs/architecture/` also
   covers the kernel contract, durable event store, sandbox contract,

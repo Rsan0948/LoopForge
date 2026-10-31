@@ -24,14 +24,15 @@ time, so time is bounded twice:
 from __future__ import annotations
 
 import math
+import os
+import selectors
 import subprocess
-import tempfile
 import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Final
+from typing import Final, cast
 
 from loopforge.adapters.container_sandbox import (
     ContainerSandbox,
@@ -80,6 +81,15 @@ class ContainerSessionConfig:
             raise ValueError(msg)
 
 
+@dataclass(frozen=True, slots=True)
+class _CapturedOutput:
+    stdout: str
+    stderr: str
+    truncated: bool
+    # Infrastructure classification uses captured bytes before display markers.
+    stderr_prefix: str
+
+
 class ContainerSession:
     """One long-lived hardened container, started lazily and destroyed on close."""
 
@@ -100,7 +110,9 @@ class ContainerSession:
     def active_container(self) -> str | None:
         return self._name
 
-    def run(self, command: str, *, timeout_seconds: int | None = None) -> SandboxCommandResult:
+    def run(  # noqa: PLR0915 - keep bounded execution and cleanup ordering together
+        self, command: str, *, timeout_seconds: int | None = None
+    ) -> SandboxCommandResult:
         """Run one shell command in the session; its processes may outlive the call."""
         if self._closed:
             msg = "session is closed"
@@ -133,48 +145,55 @@ class ContainerSession:
             *self._config.shell,
             command,
         )
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
-            try:
-                process = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
-                    shell=False,
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            except OSError as exc:
-                msg = f"container runtime failed to start: {exc}"
-                raise SandboxError(msg) from exc
-            began = time.monotonic()
-            try:
-                process.wait(timeout=limit + _EXEC_GRACE_SECONDS)
-            except subprocess.TimeoutExpired as exc:
-                # The in-container bound did not end the command: nothing in the session
-                # can be trusted to stop, so the whole session goes.
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=False,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as exc:
+            msg = f"container runtime failed to start: {exc}"
+            raise SandboxError(msg) from exc
+        began = time.monotonic()
+        try:
+            captured = self._capture_output(process, limit + _EXEC_GRACE_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            process.kill()
+            process.wait()
+            self.close()
+            msg = f"command outlived its {limit}s bound; the session was destroyed"
+            raise SandboxTimeoutError(msg) from exc
+        except BaseException as exc:
+            with suppress(OSError):
                 process.kill()
-                process.wait()
-                self.close()
-                msg = f"command outlived its {limit}s bound; the session was destroyed"
-                raise SandboxTimeoutError(msg) from exc
-            stdout = self._read_output(stdout_file)
-            stderr = self._read_output(stderr_file)
+            process.wait()
+            self.close()
+            if isinstance(exc, OSError):
+                msg = f"container output capture failed: {str(exc)[:300]}"
+                raise SandboxError(msg) from exc
+            raise
+        finally:
+            _close_pipes(process)
         # 137 is also any SIGKILL (the memory limit, for one); only a kill at the bound
         # is the timeout's.
         if process.returncode == _KILLED_EXIT and time.monotonic() - began >= limit:
             msg = f"command exceeded {limit}s and was killed; the session continues"
             raise SandboxTimeoutError(msg)
-        if process.returncode in {125, 126, 127} and stderr.startswith(
+        if process.returncode in {125, 126, 127} and captured.stderr_prefix.startswith(
             ("Error response from daemon", "docker: ")
         ):
-            msg = f"container runtime failed: {stderr[:300]}"
+            msg = f"container runtime failed: {captured.stderr_prefix}"
             raise SandboxError(msg)
         return SandboxCommandResult(
             exit_code=process.returncode,
-            stdout=stdout,
-            stderr=stderr,
+            stdout=captured.stdout,
+            stderr=captured.stderr,
             succeeded=process.returncode == 0,
+            output_truncated=captured.truncated,
         )
 
     def close(self) -> None:
@@ -196,7 +215,19 @@ class ContainerSession:
                 )
                 # Killed, or already gone (its keepalive ended and --rm removed it).
                 if done.returncode == 0 or b"No such container" in done.stderr:
-                    return
+                    # With --rm, Docker can acknowledge kill before the daemon has
+                    # removed the stopped container. Explicit rm makes close()'s
+                    # cleanup guarantee synchronous for callers and tests.
+                    removed = subprocess.run(
+                        [self._config.sandbox.docker_executable, "rm", "--force", name],
+                        stdin=subprocess.DEVNULL,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.PIPE,
+                        timeout=_KILL_TIMEOUT_SECONDS,
+                        check=False,
+                    )
+                    if removed.returncode == 0 or b"No such container" in removed.stderr:
+                        return
             time.sleep(0.1)
 
     def __enter__(self) -> ContainerSession:
@@ -239,8 +270,91 @@ class ContainerSession:
         self._started_at = time.monotonic()
         return name
 
-    def _read_output(self, handle: BinaryIO) -> str:
+    def _capture_output(self, process: subprocess.Popen[bytes], timeout: float) -> _CapturedOutput:
+        """Drain both pipes without spooling; retain at most the configured bytes each.
+
+        Excess bytes are discarded while the command continues. Pipe draining stays
+        bounded even when descendants keep their inherited handles open after CLI exit.
+        This changes capture, not command authority or successful exit semantics.
+        """
+        assert process.stdout is not None
+        assert process.stderr is not None
+        streams = (process.stdout, process.stderr)
+        buffers = (bytearray(), bytearray())
+        truncated = [False, False]
         limit = self._config.sandbox.limits.max_output_bytes
-        handle.seek(0)
-        data = handle.read(limit + 1)[:limit]
-        return data.decode("utf-8", errors="replace")
+        deadline = time.monotonic() + timeout
+        try:
+            with selectors.DefaultSelector() as selector:
+                for index, stream in enumerate(streams):
+                    os.set_blocking(stream.fileno(), False)
+                    selector.register(stream, selectors.EVENT_READ, index)
+                while selector.get_map():
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired(process.args, timeout)
+                    ready = selector.select(min(remaining, 0.05))
+                    for key, _ in ready:
+                        data = os.read(key.fd, 65536)
+                        if not data:
+                            selector.unregister(key.fileobj)
+                            continue
+                        index = cast("int", key.data)
+                        available = limit - len(buffers[index])
+                        buffers[index].extend(data[:available])
+                        truncated[index] |= len(data) > available
+                    if process.poll() is not None:
+                        # A writer can exit just after filling a pipe. Drain the
+                        # remaining prefix without waiting for inherited handles.
+                        # Stop after cap+1 bytes even if a descendant keeps writing.
+                        for pending in list(selector.get_map().values()):
+                            index = cast("int", pending.data)
+                            if not truncated[index]:
+                                truncated[index] = _drain_exited_pipe(
+                                    pending.fd, buffers[index], limit
+                                )
+                        break
+                process.wait(timeout=max(0.001, deadline - time.monotonic()))
+        finally:
+            _close_pipes(process)
+        stdout, stdout_cut = _render_output(buffers[0], truncated[0], limit)
+        stderr, stderr_cut = _render_output(buffers[1], truncated[1], limit)
+        return _CapturedOutput(
+            stdout,
+            stderr,
+            stdout_cut or stderr_cut,
+            bytes(buffers[1][:300]).decode("utf-8", errors="replace"),
+        )
+
+
+def _drain_exited_pipe(fd: int, buffer: bytearray, limit: int) -> bool:
+    """Drain an exited command's available prefix; never wait on descendants."""
+    while True:
+        available = limit - len(buffer)
+        try:
+            tail = os.read(fd, min(65536, available + 1))
+        except BlockingIOError:
+            return False
+        if not tail:
+            return False
+        buffer.extend(tail[:available])
+        if len(tail) > available:
+            return True
+
+
+def _render_output(data: bytearray, overflow: bool, limit: int) -> tuple[str, bool]:
+    """Bound UTF-8 text bytes after replacement, including the truncation marker."""
+    decoded = data.decode("utf-8", errors="replace")
+    encoded = decoded.encode("utf-8")
+    overflow = overflow or len(encoded) > limit
+    if not overflow:
+        return decoded, False
+    marker = b"\n[output truncated]"[:limit]
+    prefix = encoded[: limit - len(marker)].decode("utf-8", errors="ignore")
+    return prefix + marker.decode("utf-8"), True
+
+
+def _close_pipes(process: subprocess.Popen[bytes]) -> None:
+    for stream in (process.stdout, process.stderr):
+        if stream is not None:
+            stream.close()
