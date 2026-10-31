@@ -168,6 +168,7 @@ class OpenRouterModel(OllamaModel):
             "messages": messages,
             "tools": payload["tools"],
             "tool_choice": "required",
+            "parallel_tool_calls": False,
             "max_tokens": self._max_output_tokens or 8192,
             "stream": False,
             "provider": {
@@ -278,6 +279,16 @@ class OpenRouterModel(OllamaModel):
             )
         except (ValueError, TypeError) as exc:
             msg = "OpenRouter tool arguments violate the native action schema"
+            if isinstance(exc, ValidationError):
+                # Locations/types are code-owned diagnostics; never echo input values,
+                # which can include credentials or repository prompt injections.
+                locations = [
+                    {"loc": list(error["loc"]), "type": error["type"]}
+                    for error in exc.errors(include_input=False)[:4]
+                ]
+                msg += ": " + json.dumps(locations)[:500]
+            elif isinstance(exc, json.JSONDecodeError):
+                msg += f": malformed JSON at character {exc.pos}"
             raise ModelTurnError(
                 ModelFailureClass.TRANSIENT, "MODEL_INVALID_RESPONSE", msg, usage=usage
             ) from exc

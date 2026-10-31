@@ -68,6 +68,7 @@ def test_native_action_history_actual_usage_and_credential_exclusion() -> None:
         assert '"data": "signature"' in wire
         assert '"arguments": "{\\"path\\": \\"adder.py\\"}"' in wire
         assert requests[0]["tool_choice"] == "required"
+        assert requests[0]["parallel_tool_calls"] is False
         assert requests[0]["cache_control"] == {"type": "ephemeral"}
     finally:
         model.close()
@@ -115,6 +116,12 @@ def test_malformed_action_retains_paid_usage(arguments: str) -> None:
             model.propose_action(_context())
         assert error.value.usage is not None
         assert error.value.usage.cost_usd == 0.00002
+        assert "input_value" not in str(error.value)
+        if arguments == "not-json":
+            assert "malformed JSON at character" in str(error.value)
+            assert "not-json" not in str(error.value)
+        else:
+            assert "string_type" in str(error.value)
     finally:
         model.close()
 
