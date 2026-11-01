@@ -33,6 +33,7 @@ from typing import Final, Literal, cast
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, StrictStr, ValidationError
 
+from loopforge.adapters.native_arguments import native_parameters, normalize_chat, wire_arguments
 from loopforge.adapters.observation_format import (
     checkpoint_stub,
     delimited,
@@ -417,7 +418,7 @@ class OllamaModel:
                     "function": {
                         "name": spec.name,
                         "description": spec.description,
-                        "parameters": spec.parameters,
+                        "parameters": native_parameters(spec),
                     },
                 }
                 for spec in selected_tools
@@ -1111,9 +1112,10 @@ class OllamaModel:
             ) from exc
         try:
             self.request_tracker.record(data)
-            parsed = ChatResponse.model_validate(data)
-        except ValidationError as exc:
-            msg = f"provider response violated the chat schema: {exc.error_count()} errors"
+            parsed = ChatResponse.model_validate(normalize_chat(data, self._tools))
+        except (ValidationError, ValueError, TypeError) as exc:
+            count = exc.error_count() if isinstance(exc, ValidationError) else 1
+            msg = f"provider response violated the chat schema: {count} errors"
             raise ModelTurnError(
                 ModelFailureClass.TRANSIENT,
                 "MODEL_INVALID_RESPONSE",
@@ -1224,7 +1226,7 @@ class OllamaModel:
                             "type": "function",
                             "function": {
                                 "name": function.name,
-                                "arguments": arguments,
+                                "arguments": wire_arguments(function.name, arguments, self._tools),
                             },
                         }
                     ],

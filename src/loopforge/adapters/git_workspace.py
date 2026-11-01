@@ -188,6 +188,17 @@ class GitWorkspace:
                 changed.append(path)
         return WorkspaceStatus(changed=tuple(sorted(changed)), untracked=tuple(sorted(untracked)))
 
+    def patch_status(self) -> WorkspaceStatus:
+        """Baseline-relative paths; status() deliberately remains HEAD-relative."""
+        tracked = self.run_git(
+            "diff", "--name-only", "-z", "--no-renames", self.base_revision, "--"
+        ).split("\0")
+        status = self.status()
+        return WorkspaceStatus(
+            changed=tuple(sorted(set(tracked) - {""})),
+            untracked=status.untracked,
+        )
+
     def diff(self) -> str:
         # --no-renames: status() reports renames as delete+add, so the diff
         # must use the same grammar — every changed path stays individually

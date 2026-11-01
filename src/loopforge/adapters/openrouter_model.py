@@ -8,6 +8,7 @@ from typing import cast
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from loopforge.adapters.native_arguments import native_arguments
 from loopforge.adapters.ollama_model import ChatResponse, OllamaModel
 from loopforge.domain.actions import ActionProposal
 from loopforge.domain.context import ModelContext
@@ -265,7 +266,11 @@ class OpenRouterModel(OllamaModel):
                             {
                                 "function": {
                                     "name": c.function.name,
-                                    "arguments": json.loads(c.function.arguments),
+                                    "arguments": native_arguments(
+                                        c.function.name,
+                                        json.loads(c.function.arguments),
+                                        self._tools,
+                                    ),
                                 }
                             }
                             for c in choice.message.tool_calls

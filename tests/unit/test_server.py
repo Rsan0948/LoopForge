@@ -150,6 +150,9 @@ class FakeWorkspace:
     def base_revision(self) -> str:
         return "base-revision"
 
+    def patch_status(self) -> WorkspaceStatus:
+        return self.status()
+
     def status(self) -> WorkspaceStatus:
         return WorkspaceStatus()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Final, Protocol
 
@@ -108,6 +109,14 @@ class ModelTurnError(RuntimeError):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class JsonTextParameter:
+    """Code-owned native schema/validator for one legacy JSON-text argument."""
+
+    schema: dict[str, object]
+    encode: Callable[[object], str]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ModelToolSpec:
     """Code-owned description of one tool a live model may propose.
 
@@ -122,8 +131,18 @@ class ModelToolSpec:
     name: str
     description: str
     parameters: dict[str, object]
+    json_text_parameters: Mapping[str, JsonTextParameter] = field(
+        default_factory=dict[str, JsonTextParameter]
+    )
 
     def __post_init__(self) -> None:
+        properties = self.parameters.get("properties", {})
+        if self.json_text_parameters and (
+            not isinstance(properties, dict)
+            or any(name not in properties for name in self.json_text_parameters)
+        ):
+            msg = "JSON-text codecs must name declared parameters"
+            raise ValueError(msg)
         if not self.name.strip():
             msg = "model tool spec name cannot be empty"
             raise ValueError(msg)

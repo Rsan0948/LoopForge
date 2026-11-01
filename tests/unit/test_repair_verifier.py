@@ -76,6 +76,9 @@ class StubWorkspace:
     def base_revision(self) -> str:
         return "0" * 40
 
+    def patch_status(self) -> WorkspaceStatus:
+        return self.status()
+
     def status(self) -> WorkspaceStatus:
         return self._status
 
@@ -362,6 +365,9 @@ def test_hook_exception_fails_closed_as_a_failed_check() -> None:
 
 def test_workspace_error_in_patch_check_fails_closed() -> None:
     class ExplodingWorkspace(StubWorkspace):
+        def patch_status(self) -> WorkspaceStatus:
+            return self.status()
+
         def status(self) -> WorkspaceStatus:
             msg = "repository metadata changed"
             raise WorkspaceError(msg)

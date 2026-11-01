@@ -357,7 +357,7 @@ class RepairVerifier:
 
     def _patch_outcome(self) -> CheckOutcome:
         constraints = self._criteria.patch
-        files = self._workspace.status().files
+        files = self._workspace.patch_status().files
         violations: list[str] = []
         if constraints.require_change and not files:
             violations.append("no workspace changes")
