@@ -136,7 +136,7 @@ def test_undeclared_native_structure_is_still_rejected() -> None:
     from loopforge.adapters.ollama_model import ChatResponse  # noqa: PLC0415
 
     tool = ModelToolSpec(name="other", description="No structure encoding", parameters={})
-    data = {
+    data: dict[str, object] = {
         "message": {
             "role": "assistant",
             "tool_calls": [{"function": {"name": "other", "arguments": {"unexpected": []}}}],
@@ -151,11 +151,11 @@ def test_undeclared_native_structure_is_still_rejected() -> None:
 
 @pytest.mark.parametrize("allowed", [True, False])
 def test_committed_patch_uses_scope_constraints(tmp_path: Path, allowed: bool) -> None:
-    from test_repair_verifier import (  # pyright: ignore[reportPrivateUsage] # noqa: PLC0415
+    from test_repair_verifier import (  # noqa: PLC0415
         StubSandbox,
-        _criteria,
-        _result,
-        _state,
+        _criteria,  # pyright: ignore[reportPrivateUsage]
+        _result,  # pyright: ignore[reportPrivateUsage]
+        _state,  # pyright: ignore[reportPrivateUsage]
     )
 
     from loopforge.workloads.repair import RepairVerifier  # noqa: PLC0415
