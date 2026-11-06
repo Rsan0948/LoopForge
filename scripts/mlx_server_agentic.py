@@ -43,6 +43,8 @@ class _Cap:
     budget = 10240
     exit_ids: tuple[int, ...] = ()
     end_id = -1
+    # A request can load a different model, so the ids follow the tokenizer in use.
+    tokenizer: object = None
     # Set by _tokenize for the request whose logits processors are built next; the
     # server runs one prompt and one decode at a time (--prompt/--decode-concurrency 1).
     thinking = False
@@ -96,6 +98,10 @@ def _tokenize(self, tokenizer, request, args):
         msg = "request renders to an empty prompt"
         raise ValueError(msg)
     _Cap.thinking = initial_state == "reasoning"
+    if tokenizer is not _Cap.tokenizer:
+        _Cap.tokenizer = tokenizer
+        _Cap.exit_ids = tuple(tokenizer.encode(_EXIT_PHRASE, add_special_tokens=False))
+        _Cap.end_id = tokenizer.convert_tokens_to_ids("</think>")
     messages = getattr(request, "messages", None) or []
     if (
         request.request_type == "chat"
