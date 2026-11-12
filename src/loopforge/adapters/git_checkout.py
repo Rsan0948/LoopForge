@@ -68,12 +68,27 @@ def _converted_paths(target: Path, names: list[str]) -> set[str]:
     return converted
 
 
+def _creation_modes(target: Path) -> dict[str, int]:
+    """Observe the process creation mask without ever changing global umask."""
+    modes: dict[str, int] = {}
+    for git_mode, requested in (("100644", 0o666), ("100755", 0o777)):
+        probe = target / ".git" / f".mode-probe-{uuid.uuid4().hex}"
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, requested)
+        try:
+            modes[git_mode] = stat.S_IMODE(os.fstat(descriptor).st_mode)
+        finally:
+            os.close(descriptor)
+            probe.unlink()
+    return modes
+
+
 def _populate(source: Path, target: Path, revision: str, algorithm: str) -> None:
     git_process(target, "read-tree", revision)
     entries = git_process(target, "ls-tree", "-r", "-l", "-z", revision).stdout
     converted = _converted_paths(
         target, [os.fsdecode(entry.split(b"\t", 1)[1]) for entry in entries.split(b"\0") if entry]
     )
+    creation_modes = _creation_modes(target)
     missing: list[str] = []
     for entry in entries.split(b"\0"):
         if not entry:
@@ -101,7 +116,7 @@ def _populate(source: Path, target: Path, revision: str, algorithm: str) -> None
                     missing.append(name)
                     continue
                 if _blob_matches(copied, identity, int(size), algorithm):
-                    copied.chmod(0o755 if mode == "100755" else 0o644)
+                    copied.chmod(creation_modes[mode])
                     continue
                 copied.unlink()  # Dirty source: materialize the pinned Git blob instead.
         missing.append(name)

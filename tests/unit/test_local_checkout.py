@@ -168,3 +168,20 @@ def test_pinned_checkout_still_applies_git_worktree_conversions(tmp_path: Path) 
     local_checkout(workspace.root, workspace.base_revision, candidate, "candidate/test")
     assert (candidate / "file.txt").read_bytes() == b"pinned\r\n"
     assert (workspace.root / "file.txt").read_bytes() == b"pinned\n"
+
+
+def test_checkout_preserves_private_file_creation_permissions(tmp_path: Path) -> None:
+    import os  # noqa: PLC0415
+    import stat  # noqa: PLC0415
+
+    workspace = GitWorkspaceManager(tmp_path / "sources").materialize(
+        FixtureSpec(fixture_id="source", files=(FixtureFile(path="file", content="private\n"),))
+    )
+    candidate = tmp_path / "candidate"
+    before = os.umask(0o077)
+    try:
+        local_checkout(workspace.root, workspace.base_revision, candidate, "candidate/private")
+        assert stat.S_IMODE((candidate / "file").stat().st_mode) == 0o600
+        assert os.umask(0o077) == 0o077
+    finally:
+        os.umask(before)
