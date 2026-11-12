@@ -778,7 +778,19 @@ def test_live_host_environment_is_not_inherited(
 
 
 @_REQUIRES_DOCKER
-def test_live_timeout_kills_container_and_children(tmp_path: Path) -> None:
+def test_live_timeout_kills_container_and_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    names: list[str] = []
+    original = ContainerSandbox._docker_run_argv  # pyright: ignore[reportPrivateUsage]
+
+    def record_name(
+        self: ContainerSandbox, *, spec: CommandSpec, container_name: str
+    ) -> tuple[str, ...]:
+        names.append(container_name)
+        return original(self, spec=spec, container_name=container_name)
+
+    monkeypatch.setattr(ContainerSandbox, "_docker_run_argv", record_name)
     spec = _sh("sleep 300 & sleep 300 & wait", timeout_seconds=120.0)
     sandbox = _sandbox(tmp_path, _config(commands=(spec,)))
     started = time.monotonic()
@@ -787,9 +799,10 @@ def test_live_timeout_kills_container_and_children(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
     assert elapsed < 60
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _sandbox_container_names():
+    assert len(names) == 1
+    while time.monotonic() < deadline and names[0] in _sandbox_container_names():
         time.sleep(0.2)
-    assert _sandbox_container_names() == [], "timed-out sandbox containers must be gone"
+    assert names[0] not in _sandbox_container_names(), "timed-out workload must be gone"
 
 
 @_REQUIRES_DOCKER
@@ -877,17 +890,25 @@ def test_live_destroy_leaves_no_running_workload(tmp_path: Path) -> None:
     outcome: list[object] = []
     worker = threading.Thread(target=lambda: outcome.append(sandbox.run("sh")))
     worker.start()
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and not _sandbox_container_names():
-        time.sleep(0.1)
-    assert _sandbox_container_names(), "workload container should be running"
-    sandbox.destroy()
-    worker.join(timeout=60)
-    assert not worker.is_alive()
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            name = sandbox.active_container
+            if name is not None and name in _sandbox_container_names():
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("this sandbox's workload container should be running")
+        sandbox.destroy()
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+    finally:
+        sandbox.destroy()
+        worker.join(timeout=60)
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _sandbox_container_names():
+    while time.monotonic() < deadline and name in _sandbox_container_names():
         time.sleep(0.2)
-    assert _sandbox_container_names() == [], "destroy must leave no running child workload"
+    assert name not in _sandbox_container_names(), "destroy must remove this child workload"
     result = outcome[0]
     assert isinstance(result, SandboxCommandResult)
     assert result.succeeded is False

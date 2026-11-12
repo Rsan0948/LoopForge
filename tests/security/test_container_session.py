@@ -465,3 +465,54 @@ def test_live_output_flood_is_bounded_and_does_not_end_the_session(
         assert later.succeeded
         assert later.stdout == "usable\n"
         assert not later.output_truncated
+
+
+def test_failed_close_retains_session_identity_for_retry(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = _session(tmp_path, fake)
+    session.run("echo hello")
+    name = session.active_container
+    original = subprocess.run
+    monkeypatch.setattr(container_session, "_KILL_TIMEOUT_SECONDS", 0.01)
+
+    def unavailable(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(argv, 1, b"", b"daemon unavailable")
+
+    monkeypatch.setattr(container_session.subprocess, "run", unavailable)
+    with pytest.raises(SandboxError, match="unconfirmed"):
+        session.close()
+    assert session.active_container == name
+    with pytest.raises(SandboxPolicyError, match="closed"):
+        session.run("echo forbidden")
+    monkeypatch.setattr(container_session.subprocess, "run", original)
+    monkeypatch.setattr(container_session, "_KILL_TIMEOUT_SECONDS", 1.0)
+    session.close()
+    assert session.active_container is None
+
+
+@pytest.mark.parametrize("failure", [subprocess.TimeoutExpired, KeyboardInterrupt])
+def test_interrupted_start_cleans_up_the_proposed_session_name(
+    tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch, failure: type[BaseException]
+) -> None:
+    session = _session(tmp_path, fake)
+    original = subprocess.run
+    proposed: list[str] = []
+
+    def interrupted(
+        argv: tuple[str, ...] | list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        if argv[1] == "run":
+            proposed.append(argv[argv.index("--name") + 1])
+            if failure is subprocess.TimeoutExpired:
+                raise subprocess.TimeoutExpired(argv, 1)
+            raise KeyboardInterrupt
+        return original(argv, capture_output=True, timeout=5, check=False)
+
+    monkeypatch.setattr(container_session.subprocess, "run", interrupted)
+    with pytest.raises(SandboxError if failure is subprocess.TimeoutExpired else KeyboardInterrupt):
+        session.run("echo hello")
+    assert f"kill {proposed[0]}" in _calls(tmp_path)
+    assert session.active_container is None
+    with pytest.raises(SandboxPolicyError, match="closed"):
+        session.run("echo forbidden")

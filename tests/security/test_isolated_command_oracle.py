@@ -60,3 +60,29 @@ def test_oracle_cannot_reference_an_unregistered_command() -> None:
             commands=(),
             oracles=(CommandOracle(command_name="unregistered", argv=("/usr/local/bin/python",)),),
         )
+
+
+@_REQUIRES_DOCKER
+@pytest.mark.parametrize("oracle_exit", [0, 1])
+def test_oracle_exit_policy_is_independent_of_producer(tmp_path: Path, oracle_exit: int) -> None:
+    config = ContainerSandboxConfig(
+        image="python:3.12-alpine",
+        commands=(
+            CommandSpec(
+                name="check",
+                argv=("/usr/local/bin/python", "-c", "raise SystemExit(1)"),
+                timeout_seconds=15,
+                allowed_exit_codes=frozenset({1}),
+            ),
+        ),
+        oracles=(
+            CommandOracle(
+                command_name="check",
+                argv=("/usr/local/bin/python", "-c", f"raise SystemExit({oracle_exit})"),
+            ),
+        ),
+    )
+    with ContainerSandbox(tmp_path, config=config) as sandbox:
+        result = sandbox.run("check")
+    assert result.exit_code == oracle_exit
+    assert result.succeeded is (oracle_exit == 0)

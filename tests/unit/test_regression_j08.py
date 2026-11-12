@@ -80,7 +80,7 @@ def test_failed_cleanup_retains_identity_for_a_later_retry(
     monkeypatch.setattr(container_sandbox, "_KILL_TIMEOUT_SECONDS", 0.01)
 
     def unavailable(_argv: object, **_kwargs: object) -> SimpleNamespace:
-        return SimpleNamespace(returncode=1)
+        return SimpleNamespace(returncode=1, stderr=b"daemon unavailable")
 
     monkeypatch.setattr(container_sandbox.subprocess, "run", unavailable)
     with pytest.raises(SandboxError, match="unconfirmed"):
@@ -131,3 +131,34 @@ def test_oracle_cleanup_failure_remains_reachable_for_retry(tmp_path: Path) -> N
     assert InterruptedOracle.cleanup_attempts == 1
     sandbox.destroy()
     assert InterruptedOracle.cleanup_attempts == 2
+
+
+def test_unconfirmed_cleanup_blocks_new_execution(tmp_path: Path) -> None:
+    config = container_sandbox.ContainerSandboxConfig(
+        image="offline",
+        commands=(CommandSpec(name="check", argv=("/bin/true",), timeout_seconds=5),),
+    )
+    sandbox = container_sandbox.ContainerSandbox(tmp_path, config=config)
+    sandbox._active_container = "retained-container"  # pyright: ignore[reportPrivateUsage]
+    with pytest.raises(SandboxError, match="cleanup"):
+        sandbox.run("check")
+    assert sandbox.active_container == "retained-container"
+
+
+def test_destroy_confirms_an_already_removed_container(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sandbox = container_sandbox.ContainerSandbox(
+        tmp_path, config=container_sandbox.ContainerSandboxConfig(image="offline", commands=())
+    )
+    sandbox._active_container = "removed-container"  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(container_sandbox, "_KILL_TIMEOUT_SECONDS", 0.01)
+
+    def absent(argv: list[str], **_kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        return subprocess.CompletedProcess(
+            argv, 1, b"", b"Error response from daemon: No such container: removed-container"
+        )
+
+    monkeypatch.setattr(container_sandbox.subprocess, "run", absent)
+    sandbox.destroy()
+    assert sandbox.active_container is None

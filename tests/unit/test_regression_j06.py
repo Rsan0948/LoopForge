@@ -49,3 +49,31 @@ def test_one_shot_capture_is_bounded_while_draining_both_streams(
     assert len(result.stdout.encode()) <= 1024
     assert len(result.stderr.encode()) <= 1024
     assert result.output_truncated
+
+
+def test_inherited_open_pipe_is_marked_incomplete_without_waiting_on_descendant() -> None:
+    import os  # noqa: PLC0415
+    import signal  # noqa: PLC0415
+    from contextlib import suppress  # noqa: PLC0415
+
+    from loopforge.adapters.process_output import capture_output  # noqa: PLC0415
+
+    producer = (
+        "import os,subprocess,sys; "
+        "subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); "
+        "os.write(1,b'prefix'); os._exit(0)"
+    )
+    process = subprocess.Popen(
+        [sys.executable, "-c", producer],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    try:
+        captured = capture_output(process, 5, 1024)
+        assert captured.stdout.startswith("prefix")
+        assert captured.truncated
+    finally:
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait(timeout=5)

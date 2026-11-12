@@ -189,7 +189,7 @@ class ContainerSession:
     def close(self) -> None:
         """Kill the session container; every process in it ends with its PID namespace."""
         self._closed = True
-        name, self._name = self._name, None
+        name = self._name
         if name is None:
             return
         deadline = time.monotonic() + _KILL_TIMEOUT_SECONDS
@@ -217,8 +217,11 @@ class ContainerSession:
                         check=False,
                     )
                     if removed.returncode == 0 or b"No such container" in removed.stderr:
+                        self._name = None
                         return
             time.sleep(0.1)
+        msg = f"Session cleanup is unconfirmed: {name}"
+        raise SandboxError(msg)
 
     def __enter__(self) -> ContainerSession:
         return self
@@ -241,6 +244,7 @@ class ContainerSession:
             "sleep",
             str(self._config.max_session_seconds),
         )
+        self._name = name
         try:
             started = subprocess.run(
                 argv,
@@ -249,14 +253,16 @@ class ContainerSession:
                 timeout=_START_TIMEOUT_SECONDS,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            # A start that timed out may still come up; it stops by its keepalive bound.
-            msg = f"session container failed to start: {type(exc).__name__}"
-            raise SandboxError(msg) from exc
-        if started.returncode != 0:
-            msg = f"session container failed to start: {started.stderr.decode()[:300]}"
-            raise SandboxError(msg)
-        self._name = name
+            if started.returncode != 0:
+                detail = started.stderr.decode(errors="replace")[:300]
+                msg = f"session container failed to start: {detail}"
+                raise SandboxError(msg)  # noqa: TRY301 - all failed starts require cleanup
+        except BaseException as exc:
+            self.close()
+            if isinstance(exc, (OSError, subprocess.TimeoutExpired)):
+                msg = f"session container failed to start: {type(exc).__name__}"
+                raise SandboxError(msg) from exc
+            raise
         self._started_at = time.monotonic()
         return name
 

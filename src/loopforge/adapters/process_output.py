@@ -72,7 +72,9 @@ def _drain_exited_pipe(fd: int, buffer: bytearray, limit: int) -> bool:
         try:
             tail = os.read(fd, min(65536, available + 1))
         except BlockingIOError:
-            return False
+            # EOF has not arrived: a descendant still holds this writer. We
+            # deliberately stop waiting, but must not call its prefix complete.
+            return True
         if not tail:
             return False
         buffer.extend(tail[:available])

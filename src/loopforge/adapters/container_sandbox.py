@@ -319,6 +319,9 @@ class ContainerSandbox:
     def run(
         self, command_name: str, *, timeout_seconds: float | None = None
     ) -> SandboxCommandResult:
+        if self._active_container is not None or self._oracle is not None:
+            msg = "Previous execution cleanup is unconfirmed; destroy the sandbox before reuse"
+            raise SandboxError(msg)
         try:
             spec = self._commands[command_name]
         except KeyError as exc:
@@ -362,7 +365,7 @@ class ContainerSandbox:
         if remaining <= 0:
             msg = "Command deadline exhausted before isolated verification"
             raise SandboxTimeoutError(msg)
-        command = replace(spec, argv=(*oracle.argv, payload))
+        command = replace(spec, argv=(*oracle.argv, payload), allowed_exit_codes=frozenset({0}))
         # Separate filesystem and PID namespaces; no candidate or extra inputs are
         # mounted in the verifier. Candidate text is data, never imported code.
         with tempfile.TemporaryDirectory(prefix="loopforge-oracle-") as root:
@@ -451,6 +454,7 @@ class ContainerSandbox:
         """Kill any in-flight workload container, leaving no running child workload."""
         if self._oracle is not None:
             self._oracle.destroy()
+            self._oracle = None
         active = self._active_container
         if active is not None:
             if self._kill_container(active, process=None):
@@ -491,11 +495,15 @@ class ContainerSandbox:
                     [self._docker, "kill", container_name],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=max(deadline - time.monotonic(), _KILL_POLL_INTERVAL_SECONDS),
                     check=False,
                 )
                 if completed.returncode == 0:
+                    return True
+                if (process is None or process.poll() is not None) and b"No such container" in (
+                    completed.stderr or b""
+                ):
                     return True
             if process is not None and process.poll() is not None:
                 return False
