@@ -417,3 +417,34 @@ def test_worker_merge_conflict_is_aborted(tmp_path: Path) -> None:
     assert manager.merge_worker(integration, worker_id="two") is None
     assert (integration.root / "module.py").read_text(encoding="utf-8") == "value = 2\n"
     assert integration.status().clean
+
+
+@pytest.mark.parametrize("content", [b"VALUE = 2", b"VALUE = 2\n", b"VALUE = 2\r\n", b""])
+@pytest.mark.parametrize("mode", [0o644, 0o755])
+def test_machine_patch_preserves_new_file_bytes_and_git_mode(
+    tmp_path: Path,
+    content: bytes,
+    mode: int,
+) -> None:
+    source = _manager(tmp_path / "source").materialize(_fixture())
+    target = _manager(tmp_path / "target").materialize(_fixture())
+    path = source.root / "new file.py"
+    path.write_bytes(content)
+    path.chmod(mode)
+    patch = tmp_path / "candidate.patch"
+    patch.write_bytes(source.candidate_patch().encode())
+    target.run_git("apply", "--index", str(patch))
+    integrated = target.root / "new file.py"
+    assert integrated.read_bytes() == content
+    assert integrated.stat().st_mode & 0o111 == mode & 0o111
+
+
+@pytest.mark.parametrize("staged", [False, True])
+def test_machine_patch_refuses_omitted_binary_material(tmp_path: Path, staged: bool) -> None:
+    workspace = _manager(tmp_path).materialize(_fixture())
+    (workspace.root / "module.py").write_text("value = 2\n")
+    (workspace.root / "blob.bin").write_bytes(b"\x00\xff")
+    if staged:
+        workspace.run_git("add", "blob.bin")
+    with pytest.raises(WorkspaceError, match="cannot be represented"):
+        workspace.candidate_patch()

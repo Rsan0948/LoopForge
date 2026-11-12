@@ -47,6 +47,7 @@ from loopforge.ports.model import ModelToolSpec
 from loopforge.ports.sandbox import SandboxError, SandboxPort, SandboxTimeoutError
 from loopforge.ports.verifier import VerificationResult
 from loopforge.ports.workspace import WorkspaceError, WorkspacePort
+from loopforge.workloads.check_output import completion_marker_present
 
 UNTRUSTED_REPAIR_REQUIREMENTS: Final = SandboxRequirements(
     process_filesystem_isolated=True,
@@ -326,7 +327,7 @@ class RepairVerifier:
             )
         detail = f"exit_code={result.exit_code}"
         marker = self._completion_markers.get(name)
-        completed = marker is None or result.stdout.splitlines()[-1:] == [marker]
+        completed = marker is None or completion_marker_present(result.stdout, marker)
         if not completed:
             detail += "; trusted acceptance completion marker missing"
         source = self._probe_sources.get(name)

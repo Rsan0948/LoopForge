@@ -20,7 +20,9 @@ def replace_exact_text(source: str, edits: tuple[TextReplacement, ...]) -> str:
         if not edit.old:
             msg = f"replacement {index}: old text must be nonempty"
             raise ValueError(msg)
-        matches = result.count(edit.old)
+        first = result.find(edit.old)
+        # A second occurrence may overlap the first; str.count skips those matches.
+        matches = 0 if first < 0 else 2 if result.find(edit.old, first + 1) >= 0 else 1
         if matches != 1:
             msg = (
                 f"replacement {index}: old text matched {matches} times; each edit target "

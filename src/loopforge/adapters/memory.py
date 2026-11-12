@@ -44,16 +44,16 @@ class InMemoryEventStore:
             return expected_version + 1
 
     def events_for(self, run_id: RunId) -> tuple[Event, ...]:
-        return tuple(self._events[run_id])
+        with self._lock:
+            return tuple(self._events.get(run_id, ()))
 
     def current_version(self, run_id: RunId) -> int:
-        return len(self._events[run_id])
+        with self._lock:
+            return len(self._events.get(run_id, ()))
 
     def list_runs(self) -> tuple[RunRecord, ...]:
-        records = [
-            summarize_run(run_id, tuple(events))
-            for run_id, events in self._events.items()
-            if events
-        ]
+        with self._lock:
+            snapshot = tuple((run_id, tuple(events)) for run_id, events in self._events.items())
+        records = [summarize_run(run_id, events) for run_id, events in snapshot if events]
         records.sort(key=lambda record: record.started_at, reverse=True)
         return tuple(records)

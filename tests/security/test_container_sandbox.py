@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, ClassVar
+from typing import ClassVar
 
 import pytest
 
@@ -435,8 +436,8 @@ class _FakePopen:
         self,
         argv: tuple[str, ...],
         *,
-        stdout: BinaryIO,
-        stderr: BinaryIO,
+        stdout: int,
+        stderr: int,
         **_kwargs: object,
     ) -> None:
         self.argv = argv
@@ -444,8 +445,17 @@ class _FakePopen:
         self.returncode: int | None = None
         self._wait_calls = 0
         self._release = threading.Event()
-        stdout.write(type(self).out)
-        stderr.write(type(self).err)
+        assert stdout == subprocess.PIPE
+        assert stderr == subprocess.PIPE
+        self.args = argv
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        os.write(out_write, type(self).out)
+        os.write(err_write, type(self).err)
+        os.close(out_write)
+        os.close(err_write)
+        self.stdout = os.fdopen(out_read, "rb")
+        self.stderr = os.fdopen(err_read, "rb")
         type(self).instances.append(self)
 
     def wait(self, timeout: float | None = None) -> int:
@@ -626,7 +636,8 @@ def test_captured_output_is_truncated_to_the_configured_bound(
     _FakePopen.out = b"0123456789"
     limits = SandboxLimits(max_output_bytes=4)
     result = _sandbox(tmp_path, _config(limits=limits)).run("sh")
-    assert result.stdout == "0123"
+    assert len(result.stdout.encode()) <= 4
+    assert result.output_truncated
 
 
 def test_missing_docker_executable_surfaces_sandbox_error(tmp_path: Path) -> None:

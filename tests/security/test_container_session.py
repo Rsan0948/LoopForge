@@ -13,7 +13,7 @@ from test_container_sandbox import (  # pyright: ignore[reportPrivateUsage]
     _TEST_IMAGE,  # pyright: ignore[reportPrivateUsage]
 )
 
-from loopforge.adapters import container_session
+from loopforge.adapters import container_session, process_output
 from loopforge.adapters.container_sandbox import ContainerSandboxConfig
 from loopforge.adapters.container_session import ContainerSession, ContainerSessionConfig
 from loopforge.adapters.local_sandbox import SandboxLimits
@@ -360,7 +360,7 @@ def test_capture_drains_a_finished_process_even_when_selector_reports_no_events(
             del timeout  # Deliberately miss the wakeup despite readable pipes.
             return []
 
-    monkeypatch.setattr(container_session.selectors, "DefaultSelector", MissedWakeupSelector)
+    monkeypatch.setattr(process_output.selectors, "DefaultSelector", MissedWakeupSelector)
     session = _session(tmp_path, fake)
     with subprocess.Popen(
         ["/bin/sh", "-c", "printf 'last stdout'; printf 'last stderr' >&2"],
