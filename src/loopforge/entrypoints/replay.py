@@ -57,6 +57,8 @@ def _recorded_capabilities(historical: tuple[Event, ...]) -> ModelCapabilities |
     )
     if recorded is None:
         return None
+    if recorded.model_capabilities is not None:
+        return recorded.model_capabilities
     return ModelCapabilities(
         provider=recorded.provider,
         model=recorded.model,

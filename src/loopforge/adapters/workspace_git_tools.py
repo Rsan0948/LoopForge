@@ -123,7 +123,7 @@ class WorkspaceGitTools:
                 ok=False,
                 observation="tool argument 'path' is required and must be a string",
                 error_code="TOOL_ARGUMENTS",
-                failure_class=ToolFailureClass.PERMANENT,
+                failure_class=ToolFailureClass.INVALID_INPUT,
             )
         self._workspace.checkout((path,))
         return ToolResult(ok=True, observation=f"reverted {path} to the base revision")

@@ -17,6 +17,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -424,13 +425,16 @@ class RuntimeTelemetry:
                     attributes={"loopforge.circuit.reason_code": reason_code},
                 )
                 self._metric(event, MetricName.CIRCUITS_OPENED, 1.0, tool_name=tool_name)
-            case VerificationPassed(summary=summary):
+            case VerificationPassed(summary=summary, task_complete=task_complete):
                 self._log(
                     event,
                     LogSeverity.INFO,
                     "verification passed",
                     verification_id=_verification_id_for(event),
-                    attributes={"loopforge.verification.summary": SensitiveText(summary)},
+                    attributes={
+                        "loopforge.verification.summary": SensitiveText(summary),
+                        "loopforge.verification.task_complete": task_complete,
+                    },
                 )
             case VerificationFailed(summary=summary, score=score):
                 attributes: dict[str, TelemetryAttributeValue | SensitiveText] = {
@@ -522,6 +526,13 @@ class RuntimeTelemetry:
                             unit=unit,
                         )
                     )
+            case ModelAttemptFailed(reason_code=code):
+                self._log(
+                    event,
+                    LogSeverity.ERROR,
+                    "model attempt failed",
+                    attributes={"loopforge.model.failure_code": code},
+                )
             case ModelTurnRecorded(provider=provider, model=model, action_id=action_id):
                 self._log(
                     event,

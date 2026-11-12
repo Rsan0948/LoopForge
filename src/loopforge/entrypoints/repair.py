@@ -35,10 +35,11 @@ from loopforge.adapters.context import (
 )
 from loopforge.adapters.file_tools import WorkspaceFileTools
 from loopforge.adapters.git_workspace import GitWorkspaceManager
-from loopforge.adapters.local_sandbox import CommandSpec, ConstrainedLocalSandbox, SandboxLimits
+from loopforge.adapters.local_sandbox import ConstrainedLocalSandbox, SandboxLimits
 from loopforge.adapters.model_registry import ModelRegistry, ModelRegistryEntry
+from loopforge.adapters.repair_commands import repair_command_bindings, repair_command_specs
 from loopforge.adapters.routing import TieredRoutingPolicy
-from loopforge.adapters.sandbox_tools import SandboxCommandTools, SandboxToolBinding
+from loopforge.adapters.sandbox_tools import SandboxCommandTools
 from loopforge.adapters.scripted import ScriptedModel
 from loopforge.adapters.workspace_git_tools import WorkspaceGitTools
 from loopforge.application.runtime import Runtime
@@ -50,14 +51,7 @@ from loopforge.domain.prompts import default_controller_template
 from loopforge.domain.reliability import ReliabilityPolicy
 from loopforge.domain.routing import ModelTier, RoutingPolicyConfig
 from loopforge.domain.security import SandboxRequirements
-from loopforge.domain.tooling import (
-    ApprovalClass,
-    IdempotencyClass,
-    RetryClass,
-    SideEffectClass,
-    ToolMetadata,
-)
-from loopforge.domain.types import BudgetLimit, Permission, RiskLevel, WorkspaceId
+from loopforge.domain.types import BudgetLimit, Permission, WorkspaceId
 from loopforge.ports.clock import ClockPort, SleeperPort
 from loopforge.ports.context import ContextBuilderPort
 from loopforge.ports.model import ModelPort
@@ -69,57 +63,12 @@ from loopforge.workloads.repair import (
     REPAIR_MODEL_REQUIREMENTS,
     UNTRUSTED_REPAIR_REQUIREMENTS,
     RepairCheck,
-    RepairCommand,
     RepairContextBuilder,
     RepairTask,
     RepairVerifier,
     WorkspaceArtifactCollector,
     scripted_repair_actions,
 )
-
-
-def repair_command_specs(commands: tuple[RepairCommand, ...]) -> list[CommandSpec]:
-    """Lower code-owned repair commands into sandbox command allowlist specs."""
-    return [
-        CommandSpec(
-            name=command.name,
-            argv=command.argv,
-            timeout_seconds=command.timeout_seconds,
-            cpu_seconds=command.cpu_seconds,
-        )
-        for command in commands
-    ]
-
-
-def repair_command_bindings(
-    commands: tuple[RepairCommand, ...], *, requirements: SandboxRequirements
-) -> list[SandboxToolBinding]:
-    """Bind predefined repair commands as sandbox tools.
-
-    The caller chooses the code-owned requirements contract: empty for the
-    trusted development path, ``UNTRUSTED_REPAIR_REQUIREMENTS`` for untrusted
-    fixture/build execution (which fails closed without container-grade
-    isolation). Command execution runs repository build/test code, so tools
-    are honestly classified as workspace-writing and non-retryable.
-    """
-    return [
-        SandboxToolBinding(
-            metadata=ToolMetadata(
-                name=command.name,
-                risk=RiskLevel.LOCAL_WRITE,
-                required_permission=Permission.LOCAL_WRITE,
-                side_effect=SideEffectClass.LOCAL_WRITE,
-                retry=RetryClass.NEVER,
-                idempotency=IdempotencyClass.NONE,
-                approval=ApprovalClass.NONE,
-                timeout_seconds=command.timeout_seconds,
-            ),
-            command_name=command.name,
-            requirements=requirements,
-        )
-        for command in commands
-    ]
-
 
 REPAIR_CONTEXT_BUDGET: ContextTokenBudget = ContextTokenBudget(max_tokens=4096, reserve_tokens=256)
 """The wired context budget envelope for repair runtimes (pre-PACS-017 literal)."""

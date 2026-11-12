@@ -125,7 +125,10 @@ def test_demo_prints_causally_correlated_telemetry_narrative(
         line.startswith("  span loopforge.run ") and "status=ok" in line for line in span_lines
     )
     assert any("span loopforge.cycle" in line for line in span_lines)
-    assert any("span loopforge.tool.execute" in line and "action=a2" in line for line in span_lines)
+    assert any(
+        "span loopforge.tool.execute" in line and f"action={run_id}:action:2" in line
+        for line in span_lines
+    )
 
     log_lines = [line for line in lines if line.startswith(("  info ", "  debug ", "  warn "))]
     assert all(f"run={run_id}" in line for line in log_lines)

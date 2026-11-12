@@ -77,6 +77,8 @@ class BudgetLimit:
     max_iterations: int | None
     """Iteration cap; None = unlimited (cost/token/time/stall budgets still apply)."""
     max_total_tokens: int | None = None
+    """Work-token cap (``RunState.work_tokens``): input the provider did not serve from
+    its prompt cache, plus output."""
     max_elapsed_seconds: float | None = None
 
     def __post_init__(self) -> None:

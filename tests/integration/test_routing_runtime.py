@@ -435,7 +435,12 @@ def test_every_successful_turn_records_its_model_identity() -> None:
     assert state.status is RunStatus.SUCCEEDED
     turns = _model_turns(store, state.run_id)
     assert [(turn.provider, turn.model) for turn in turns] == [("p", "direct"), ("p", "direct")]
-    assert [turn.action_id for turn in turns] == [ActionId("a1"), ActionId("a2")]
+    assert len({turn.action_id for turn in turns}) == 2
+    assert [turn.action_id for turn in turns] == [
+        e.proposal.action_id
+        for e in store.events_for(state.run_id)
+        if isinstance(e, ActionProposed)
+    ]
     # Each identity record lands immediately before the ActionProposed it yielded.
     events = store.events_for(state.run_id)
     proposed = [event for event in events if isinstance(event, ActionProposed)]
@@ -496,3 +501,4 @@ def test_adapter_with_broken_capabilities_fails_closed() -> None:
     # Nothing about the turn entered the durable stream.
     (record,) = store.list_runs()
     assert _model_turns(store, record.run_id) == []
+    assert model.calls == 0

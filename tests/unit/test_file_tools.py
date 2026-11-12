@@ -79,16 +79,26 @@ def test_read_file_returns_content(workspace: Path) -> None:
     assert result.observation == "def run():\n    return 1\n"
 
 
-def test_read_file_rejects_traversal_and_missing(workspace: Path) -> None:
+def test_read_file_rejects_traversal_as_policy(workspace: Path) -> None:
     tools = _tools(workspace)
-    for path in ("../outside.py", "/etc/passwd", "missing.py"):
+    for path in ("../outside.py", "/etc/passwd", ".git/config"):
         result = tools.execute(_request("read_file", path=path))
         assert not result.ok
         assert result.failure_class is ToolFailureClass.PERMANENT
         assert result.error_code == "SANDBOX_POLICY"
 
 
-def test_missing_arguments_fail_permanently(workspace: Path) -> None:
+def test_a_missing_path_is_refused_input_not_a_tool_failure(workspace: Path) -> None:
+    (workspace / "folder").mkdir()
+    tools = _tools(workspace)
+    for path in ("missing.py", "folder"):
+        result = tools.execute(_request("read_file", path=path))
+        assert not result.ok
+        assert result.failure_class is ToolFailureClass.INVALID_INPUT
+        assert result.error_code == "SANDBOX_PATH_MISSING"
+
+
+def test_missing_arguments_are_refused_input(workspace: Path) -> None:
     tools = _tools(workspace)
     for tool, arguments in (
         ("read_file", {}),
@@ -99,7 +109,7 @@ def test_missing_arguments_fail_permanently(workspace: Path) -> None:
         result = tools.execute(_request(tool, **arguments))
         assert not result.ok
         assert result.error_code == "TOOL_ARGUMENTS"
-        assert result.failure_class is ToolFailureClass.PERMANENT
+        assert result.failure_class is ToolFailureClass.INVALID_INPUT
 
 
 def test_search_files_finds_literal_matches_in_order(workspace: Path) -> None:
@@ -254,20 +264,14 @@ def test_search_files_skips_unreadable_files_with_an_honest_note(workspace: Path
     assert "skipped 1 unreadable file(s)" in result.observation
 
 
-def test_non_string_argument_values_fail_as_tool_arguments(workspace: Path) -> None:
-    tools = _tools(workspace)
-    proposals = [
-        ActionProposal(ActionId("a1"), "read_file", {"path": 123}),  # pyright: ignore[reportArgumentType]
-        ActionProposal(ActionId("a1"), "write_file", {"path": ["x"], "content": "y"}),  # pyright: ignore[reportArgumentType]
-        ActionProposal(ActionId("a1"), "edit_file", {"path": "a", "old": None, "new": "b"}),  # pyright: ignore[reportArgumentType]
-    ]
-    for proposal in proposals:
-        result = tools.execute(
-            ToolExecutionRequest(proposal=proposal, attempt=1, timeout_seconds=5.0)
-        )
-        assert not result.ok
-        assert result.error_code == "TOOL_ARGUMENTS"
-        assert result.failure_class is ToolFailureClass.PERMANENT
+def test_non_string_argument_values_fail_before_tool_execution(workspace: Path) -> None:
+    for arguments in (
+        {"path": 123},
+        {"path": ["x"], "content": "y"},
+        {"path": "a", "old": None, "new": "b"},
+    ):
+        with pytest.raises(TypeError, match="string keys and values"):
+            ActionProposal(ActionId("a1"), "read_file", arguments)  # pyright: ignore[reportArgumentType]
 
 
 def test_edit_file_preserves_crlf_line_endings(workspace: Path) -> None:

@@ -17,8 +17,12 @@ import sys
 import threading
 import time
 import webbrowser
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from loopforge.entrypoints.server import ServerExtension
 
 _PACKAGE_STATIC = Path(__file__).resolve().parent.parent / "console_static"
 """Prebuilt console assets shipped inside the wheel."""
@@ -81,7 +85,12 @@ def _start_server(uvicorn: Any, app: Any, port: int) -> tuple[Any, threading.Thr
     return server, thread
 
 
-def run_console(*, port: int | None = None, open_browser: bool = True) -> int:
+def run_console(
+    *,
+    port: int | None = None,
+    open_browser: bool = True,
+    extensions: Sequence[ServerExtension] = (),
+) -> int:
     """Serve the console until interrupted. ``port=None`` picks a free one.
 
     The browser (and the printed URL) open only after the server is actually
@@ -111,7 +120,7 @@ def run_console(*, port: int | None = None, open_browser: bool = True) -> int:
         data_dir=data_dir,
         static_dir=static_dir,
     )
-    app = create_app(settings)
+    app = create_app(settings, extensions=extensions)
 
     attempts = 1 if port is not None else MAX_START_ATTEMPTS
     server: Any = None

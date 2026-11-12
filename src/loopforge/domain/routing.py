@@ -64,8 +64,16 @@ class ModelCapabilities:
         if self.context_window_tokens <= 0:
             msg_3 = "model capabilities context window must be positive"
             raise ValueError(msg_3)
+        if type(self.supports_tool_calls) is not bool:
+            msg = "model tool-call capability must be a bool"
+            raise TypeError(msg)
         rates = (self.input_cost_usd_per_million, self.output_cost_usd_per_million)
-        if not all(math.isfinite(rate) for rate in rates):
+        if not all(
+            not isinstance(rate, bool)
+            and isinstance(rate, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]
+            and math.isfinite(rate)
+            for rate in rates
+        ):
             msg_6 = "model capabilities cost rates must be finite"
             raise ValueError(msg_6)
         if self.input_cost_usd_per_million < 0 or self.output_cost_usd_per_million < 0:

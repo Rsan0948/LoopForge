@@ -22,7 +22,9 @@ Everything in this module is code-owned workload authority:
 
 from __future__ import annotations
 
+import ast
 import math
+import re
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
@@ -42,9 +44,10 @@ from loopforge.domain.workspace import AcceptanceCriteria, FixtureSpec
 from loopforge.ports.artifacts import RunArtifact
 from loopforge.ports.context import ContextAccountingSource, ContextBuilderPort
 from loopforge.ports.model import ModelToolSpec
-from loopforge.ports.sandbox import SandboxError, SandboxPort
+from loopforge.ports.sandbox import SandboxError, SandboxPort, SandboxTimeoutError
 from loopforge.ports.verifier import VerificationResult
 from loopforge.ports.workspace import WorkspaceError, WorkspacePort
+from loopforge.workloads.check_output import completion_marker_present
 
 UNTRUSTED_REPAIR_REQUIREMENTS: Final = SandboxRequirements(
     process_filesystem_isolated=True,
@@ -227,21 +230,40 @@ class RepairVerifier:
     ``expected_observation``) can never influence the verdict.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913 - explicit immutable verification contracts
         self,
         sandbox: SandboxPort,
         workspace: WorkspacePort,
         criteria: AcceptanceCriteria,
         *,
         hooks: tuple[RepairCheck, ...] = (),
+        command_detail_budget: int = _DETAIL_BUDGET,
+        completion_markers: tuple[tuple[str, str], ...] = (),
+        probe_sources: tuple[tuple[str, str], ...] = (),
     ) -> None:
+        if not 64 <= command_detail_budget <= 8000:
+            msg = "command detail budget must be between 64 and 8000 characters"
+            raise ValueError(msg)
         self._sandbox = sandbox
         self._workspace = workspace
         self._criteria = criteria
         self._hooks = hooks
+        self._command_detail_budget = command_detail_budget
+        self._completion_markers = dict(completion_markers)
+        self._probe_sources = dict(probe_sources)
+        # Per acceptance probe, which of its assertions the last verification got past.
+        self.last_acceptance: dict[str, tuple[AcceptanceItem, ...]] = {}
+        if (
+            len(self._completion_markers) != len(completion_markers)
+            or any(not name or not marker for name, marker in completion_markers)
+            or not set(self._completion_markers) <= set(criteria.required_commands)
+        ):
+            msg = "completion marker contracts must be nonempty and unique"
+            raise ValueError(msg)
 
     def verify(self, state: RunState) -> VerificationResult:
         del state  # verification truth comes from the workspace, never model-claimed state
+        self.last_acceptance = {}
         outcomes = [self._command_outcome(name) for name in self._criteria.required_commands]
         outcomes.append(self._patch_outcome_checked())
         for index, hook in enumerate(self._hooks, start=1):
@@ -252,6 +274,7 @@ class RepairVerifier:
             summary=composite.summary,
             score=composite.score,
             inconclusive=composite.inconclusive,
+            outcomes=tuple(outcomes),
         )
 
     def _hook_outcome(self, index: int, hook: RepairCheck) -> CheckOutcome:
@@ -285,6 +308,16 @@ class RepairVerifier:
     def _command_outcome(self, name: str) -> CheckOutcome:
         try:
             result = self._sandbox.run(name)
+        except SandboxTimeoutError as exc:
+            # The check ran against this candidate and did not finish (for example a
+            # server that never became ready). That is a measured failure, not an
+            # infrastructure fault: it must not end the run as inconclusive.
+            return CheckOutcome(
+                name=f"command:{name}",
+                passed=False,
+                detail=f"timed out: {_bounded(str(exc))}; the command did not finish "
+                "against this candidate (a service that never becomes ready times out)",
+            )
         except SandboxError as exc:
             return CheckOutcome(
                 name=f"command:{name}",
@@ -293,18 +326,39 @@ class RepairVerifier:
                 executed=False,
             )
         detail = f"exit_code={result.exit_code}"
+        marker = self._completion_markers.get(name)
+        completed = marker is None or completion_marker_present(result.stdout, marker)
+        if not completed:
+            detail += "; trusted acceptance completion marker missing"
+        source = self._probe_sources.get(name)
+        if source is not None and not (result.succeeded and completed):
+            hint = acceptance_failure_line(source, result.stdout + "\n" + result.stderr)
+            if hint is not None:
+                detail += f"; {hint}"
+        if not result.succeeded and (result.stdout or result.stderr):
+            stdout = _without_pytest_warnings(result.stdout)
+            detail += (
+                f"; stdout={_bounded(stdout, self._command_detail_budget)}; "
+                f"stderr={_bounded(result.stderr, self._command_detail_budget)}"
+            )
         if result.resource_limits_skipped:
             skipped = ", ".join(result.resource_limits_skipped)
             detail += f"; resource limits not enforced by this platform: {skipped}"
-        return CheckOutcome(
-            name=f"command:{name}",
-            passed=result.succeeded,
-            detail=detail,
-        )
+        passed = result.succeeded and completed
+        if source is not None:
+            self.last_acceptance[name] = acceptance_items(source, result.stderr, passed=passed)
+        partial = None
+        if not passed:
+            partial = (
+                pytest_partial(result.stdout)
+                if source is None
+                else acceptance_partial(source, result.stderr)
+            )
+        return CheckOutcome(name=f"command:{name}", passed=passed, detail=detail, partial=partial)
 
     def _patch_outcome(self) -> CheckOutcome:
         constraints = self._criteria.patch
-        files = self._workspace.status().files
+        files = self._workspace.patch_status().files
         violations: list[str] = []
         if constraints.require_change and not files:
             violations.append("no workspace changes")
@@ -515,14 +569,57 @@ def scripted_repair_actions(task: RepairTask) -> list[ActionProposal]:
     return actions
 
 
-def _bounded(text: str) -> str:
+_PYTEST_COUNTS = re.compile(r"(\d+) (passed|failed|errors?)\b")
+_PYTEST_DURATION = re.compile(r"\bin \d+(?:\.\d+)?s\b")
+
+
+def pytest_partial(stdout: str) -> float | None:
+    """Share of tests passing from pytest's final summary line, when one is present.
+
+    Only the last line containing a count is used, so test output cannot add counts.
+    Returns None when there is no pytest summary (for example a lint failure stopped
+    the check before tests ran) or when nothing failed.
+    """
+    lines = [
+        line
+        for line in stdout.splitlines()
+        if _PYTEST_COUNTS.search(line) and _PYTEST_DURATION.search(line)
+    ]
+    if not lines:
+        return None
+    counts = {"passed": 0, "failed": 0, "error": 0}
+    for number, kind in _PYTEST_COUNTS.findall(lines[-1]):
+        counts["error" if kind.startswith("error") else kind] += int(number)
+    total = sum(counts.values())
+    if total == 0 or counts["passed"] == total:
+        return None
+    return counts["passed"] / total
+
+
+_WARNINGS_SECTION = re.compile(r"(?ms)^=+ warnings summary =+\n(.*?)(?=^=+ |\Z)")
+
+
+def _without_pytest_warnings(text: str) -> str:
+    """Drop pytest's warnings summary; it is never failure evidence and can fill the budget."""
+
+    def omitted(match: re.Match[str]) -> str:
+        return f"[pytest warnings summary omitted: {len(match.group(1).splitlines())} lines]\n"
+
+    return _WARNINGS_SECTION.sub(omitted, text)
+
+
+def _bounded(text: str, budget: int = _DETAIL_BUDGET) -> str:
+    # Terminal style is presentation, not check evidence. Remove only SGR
+    # sequences before budgeting so colored test output cannot consume the
+    # diagnostic allowance; other controls still receive visible escaping.
+    text = re.sub(r"\x1b\[[0-9;]*m", "", text)
     # Sanitize first: details embed model-influenced content (file names,
     # sandbox error text), and control characters must never forge lines in
     # verifier summaries, durable events, logs, or context items.
     sanitized = "".join(char if char.isprintable() else f"\\x{ord(char):02x}" for char in text)
-    if len(sanitized) <= _DETAIL_BUDGET:
+    if len(sanitized) <= budget:
         return sanitized
-    return sanitized[: _DETAIL_BUDGET - 3] + "..."
+    return sanitized[: budget - 3] + "..."
 
 
 def _path_allowed(path: str, allowed_prefixes: tuple[str, ...]) -> bool:
@@ -531,3 +628,101 @@ def _path_allowed(path: str, allowed_prefixes: tuple[str, ...]) -> bool:
     return any(
         path == prefix or path.startswith(prefix.rstrip("/") + "/") for prefix in allowed_prefixes
     )
+
+
+_PROBE_FRAME = re.compile(r'File "<trusted-acceptance>", line (\d+)')
+# A real traceback frame line, anchored at its line start; text inside an exception
+# message on the same line as other text does not match.
+_PROBE_MODULE_FRAME = re.compile(
+    r'^  File "<trusted-acceptance>", line (\d+), in <module>$', re.MULTILINE
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptanceItem:
+    """One assertion of a frozen acceptance probe, scored by the harness."""
+
+    line: int
+    text: str
+    passed: bool
+
+
+def acceptance_assertions(source: str) -> tuple[tuple[int, str], ...]:
+    """The probe's own assertions, in line order: every ``assert`` in module code.
+
+    Assertions inside helper functions belong to whichever module line called the
+    helper, so they are not separate items.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ()
+    lines = source.splitlines()
+    found: list[tuple[int, str]] = []
+
+    def visit(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+        if isinstance(node, ast.Assert):
+            message = node.msg
+            text = (
+                message.value
+                if isinstance(message, ast.Constant) and isinstance(message.value, str)
+                else lines[node.lineno - 1].strip()
+            )
+            found.append((node.lineno, text[:300]))
+        for child in ast.iter_child_nodes(node):
+            visit(child)
+
+    visit(tree)
+    return tuple(sorted(found))
+
+
+def acceptance_items(source: str, stderr: str, *, passed: bool) -> tuple[AcceptanceItem, ...]:
+    """Which of the probe's assertions this run got past.
+
+    A probe runs top to bottom, so failing at module line N means every assertion
+    above N held. The module frame is the first probe frame Python prints, ahead of
+    the exception message, so text the app under test puts into a message cannot
+    move it. Without a module frame (the probe was killed, or never started) no
+    assertion is credited. This is a progress signal only: passing still requires
+    the probe to exit cleanly and print its completion marker.
+    """
+    assertions = acceptance_assertions(source)
+    if passed:
+        return tuple(AcceptanceItem(line, text, passed=True) for line, text in assertions)
+    frame = _PROBE_MODULE_FRAME.search(stderr)
+    failing = int(frame.group(1)) if frame else 0
+    if not 1 <= failing <= len(source.splitlines()):
+        failing = 0
+    return tuple(AcceptanceItem(line, text, passed=line < failing) for line, text in assertions)
+
+
+def acceptance_partial(source: str, stderr: str) -> float | None:
+    """Partial credit for a failed probe: assertions passed out of assertions plus one.
+
+    The extra item is the probe completing, so a failed probe stays below one check.
+    """
+    items = acceptance_items(source, stderr, passed=False)
+    if not items:
+        return None
+    return sum(item.passed for item in items) / (len(items) + 1)
+
+
+def acceptance_failure_line(source: str, output: str) -> str | None:
+    """Name the one probe line that failed, without disclosing the rest of the probe.
+
+    Probe source stays omitted so it cannot be gamed, but a bare line number of
+    unseen code is not actionable. The innermost probe frame is reported.
+    """
+    frames = _PROBE_FRAME.findall(output)
+    if not frames:
+        return None
+    number = int(frames[-1])
+    lines = source.splitlines()
+    if not 1 <= number <= len(lines):
+        return None
+    text = lines[number - 1].strip()
+    if len(text) > 300:
+        text = text[:297] + "..."
+    return f"failing acceptance line {number}: {text}"

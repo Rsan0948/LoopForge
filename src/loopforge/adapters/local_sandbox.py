@@ -22,6 +22,7 @@ from loopforge.domain.security import SandboxCapabilities
 from loopforge.ports.sandbox import (
     SandboxCommandResult,
     SandboxError,
+    SandboxMissingPathError,
     SandboxPathError,
     SandboxPolicyError,
     SandboxTimeoutError,
@@ -174,7 +175,7 @@ class ConstrainedLocalSandbox:
         try:
             if not path.is_file():
                 msg_8 = "read target must be a regular file"
-                raise SandboxPathError(msg_8)
+                raise SandboxMissingPathError(msg_8)
             if path.stat().st_size > self._limits.max_read_bytes:
                 msg_9 = "read exceeds sandbox byte limit"
                 raise SandboxPolicyError(msg_9)
@@ -189,7 +190,7 @@ class ConstrainedLocalSandbox:
         except FileNotFoundError as exc:
             # Vanished between path resolution and read: report, never crash.
             msg_24 = "sandbox path does not exist"
-            raise SandboxPathError(msg_24) from exc
+            raise SandboxMissingPathError(msg_24) from exc
         except PermissionError as exc:
             msg_25 = "read target is not readable"
             raise SandboxPolicyError(msg_25) from exc
@@ -209,6 +210,7 @@ class ConstrainedLocalSandbox:
             msg_11 = "write target must be a regular non-symlink file"
             raise SandboxPathError(msg_11)
         try:
+            mode = path.stat().st_mode & 0o777 if path.exists() else 0o600
             fd, temp_name = tempfile.mkstemp(prefix=".loopforge-", dir=path.parent)
         except OSError as exc:
             msg_27 = f"write failed: {exc}"
@@ -216,6 +218,7 @@ class ConstrainedLocalSandbox:
         try:
             with os.fdopen(fd, "wb") as handle:
                 handle.write(encoded)
+                os.fchmod(handle.fileno(), mode)
                 handle.flush()
                 os.fsync(handle.fileno())
             Path(temp_name).replace(path)
@@ -314,7 +317,7 @@ class ConstrainedLocalSandbox:
             resolved = candidate.resolve(strict=not allow_missing)
         except FileNotFoundError as exc:
             msg_17 = "sandbox path does not exist"
-            raise SandboxPathError(msg_17) from exc
+            raise SandboxMissingPathError(msg_17) from exc
         if not resolved.is_relative_to(self._root):
             msg_14 = "sandbox path escapes configured root"
             raise SandboxPathError(msg_14)

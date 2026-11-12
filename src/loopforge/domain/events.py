@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.admission import ContextAdmission
 from loopforge.domain.artifacts import (
     ArtifactKind,
     validate_artifact_content,
@@ -20,6 +21,7 @@ from loopforge.domain.orchestration import (
 )
 from loopforge.domain.policies import ShadowDecisionKind, is_valid_policy_id
 from loopforge.domain.reliability import ToolFailureClass
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.tooling import ToolMetadata
 from loopforge.domain.types import (
     ActionId,
@@ -29,6 +31,11 @@ from loopforge.domain.types import (
     UsageDelta,
     WorkerId,
     WorkspaceId,
+)
+from loopforge.domain.verification import (
+    CheckOutcome,
+    VerificationProgress,
+    validate_verification_evidence,
 )
 
 
@@ -156,6 +163,34 @@ class CircuitOpened(DomainEvent):
 @dataclass(frozen=True, slots=True, kw_only=True)
 class VerificationPassed(DomainEvent):
     summary: str
+    task_complete: bool = True
+    score: float | None = 1.0
+
+    outcomes: tuple[CheckOutcome, ...] = ()
+    progress: VerificationProgress | None = None
+    evidence_identity: str | None = None
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        validate_verification_evidence(
+            self.outcomes,
+            self.progress,
+            summary=self.summary,
+            passed=True,
+            task_complete=self.task_complete,
+            evidence_identity=self.evidence_identity,
+        )
+        if not isinstance(self.task_complete, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "verification task_complete must be a bool"
+            raise TypeError(msg)
+        if self.score is not None and (
+            isinstance(self.score, bool)
+            or not isinstance(self.score, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not 0.0 <= self.score <= 1.0
+            or not math.isfinite(self.score)
+        ):
+            msg = "verification score must be a finite fraction in [0, 1]"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -166,11 +201,33 @@ class VerificationFailed(DomainEvent):
     """True when the verdict reflects checks that never executed (infra
     error) rather than measured workspace state. Defaults False so replays
     of pre-existing streams keep their meaning."""
+    repeat: bool = False
+    """True when this re-reports the verdict of an unchanged, already verified
+    candidate (an observation, not a new attempt): it neither advances nor resets
+    the no-progress counter. Defaults False so existing streams keep their meaning."""
+
+    outcomes: tuple[CheckOutcome, ...] = ()
+    progress: VerificationProgress | None = None
+    evidence_identity: str | None = None
 
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
+        validate_verification_evidence(
+            self.outcomes,
+            self.progress,
+            summary=self.summary,
+            passed=False,
+            inconclusive=self.inconclusive,
+            evidence_identity=self.evidence_identity,
+        )
+        if not isinstance(self.repeat, bool) or not isinstance(self.inconclusive, bool):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "verification repeat and inconclusive must be bools"
+            raise TypeError(msg)
         if self.score is not None and (
-            not math.isfinite(self.score) or not 0.0 <= self.score <= 1.0
+            isinstance(self.score, bool)
+            or not isinstance(self.score, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]
+            or not math.isfinite(self.score)
+            or not 0.0 <= self.score <= 1.0
         ):
             msg_9 = "verification score must be a finite fraction in [0, 1]"
             raise ValueError(msg_9)
@@ -237,23 +294,66 @@ class BudgetDebited(DomainEvent):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class ModelAttemptFailed(DomainEvent):
+    """A normalized unsuccessful inference attempt, independent of tool actions."""
+
+    reason_code: str
+    summary: str
+    context_admission: ContextAdmission | None = None
+    model_capabilities: ModelCapabilities | None = None
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if self.model_capabilities is not None and not isinstance(
+            self.model_capabilities, ModelCapabilities
+        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model capabilities must be typed"
+            raise TypeError(msg)
+        if self.context_admission is not None and not isinstance(
+            self.context_admission, ContextAdmission
+        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model context admission must be typed"
+            raise TypeError(msg)
+        if not self.reason_code.strip() or len(self.reason_code) > 200 or len(self.summary) > 1000:
+            msg = "model attempt failure fields exceed contract"
+            raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ModelTurnRecorded(DomainEvent):
     """Durable per-turn model-identity record (PACS-015).
 
     Recorded on every successful model turn: which provider/model produced
-    the turn and which action the turn yielded. Evidence-only — the reducer
-    projects it without any control-state effect — so the derived provenance
-    graph can attribute every proposed action to the model that produced it
-    from the authoritative stream alone. Identity comes from the adapter's
-    code-owned ``ModelCapabilities``, never from model output.
+    the turn and which action the turn yielded. The reducer also resets the
+    unresolved model failure streak and advances durable action allocation.
+    Provider identity comes from code-owned ``ModelCapabilities``; proposal
+    identity is allocated by the runtime, never by model output.
     """
 
     provider: str
     model: str
     action_id: ActionId
+    context_admission: ContextAdmission | None = None
+    model_capabilities: ModelCapabilities | None = None
 
     def __post_init__(self) -> None:
         DomainEvent.__post_init__(self)
+        if self.model_capabilities is not None and not isinstance(
+            self.model_capabilities, ModelCapabilities
+        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model capabilities must be typed"
+            raise TypeError(msg)
+        if self.context_admission is not None and not isinstance(
+            self.context_admission, ContextAdmission
+        ):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "model context admission must be typed"
+            raise TypeError(msg)
+        if self.model_capabilities is not None and (
+            self.provider != self.model_capabilities.provider
+            or self.model != self.model_capabilities.model
+        ):
+            msg = "model turn identity must match its capabilities"
+            raise ValueError(msg)
         if not isinstance(self.provider, str) or not self.provider.strip():  # pyright: ignore[reportUnnecessaryIsInstance]
             msg_11 = "model turn provider cannot be empty"
             raise ValueError(msg_11)
@@ -386,6 +486,13 @@ def validate_operator_text(value: str, field: str) -> None:
 class RunStopped(DomainEvent):
     reason: StopReason
     summary: str
+    reason_code: str = ""
+
+    def __post_init__(self) -> None:
+        DomainEvent.__post_init__(self)
+        if type(self.reason_code) is not str or len(self.reason_code) > 200:
+            msg = "stop reason code must be a bounded string"
+            raise ValueError(msg)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -482,6 +589,7 @@ Event = (
     | ContextAssembled
     | ArtifactRecorded
     | BudgetDebited
+    | ModelAttemptFailed
     | ModelTurnRecorded
     | ShadowDecisionRecorded
     | ApprovalRequested

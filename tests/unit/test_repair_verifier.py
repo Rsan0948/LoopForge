@@ -17,7 +17,12 @@ from loopforge.domain.state import RunState
 from loopforge.domain.types import RunId, WorkspaceId
 from loopforge.domain.verification import CheckOutcome
 from loopforge.domain.workspace import AcceptanceCriteria, PatchConstraints, WorkspaceStatus
-from loopforge.ports.sandbox import SandboxCommandResult, SandboxPolicyError, SandboxPort
+from loopforge.ports.sandbox import (
+    SandboxCommandResult,
+    SandboxPolicyError,
+    SandboxPort,
+    SandboxTimeoutError,
+)
 from loopforge.ports.verifier import VerificationResult
 from loopforge.ports.workspace import WorkspaceError, WorkspacePort
 from loopforge.workloads.repair import (
@@ -71,6 +76,9 @@ class StubWorkspace:
     def base_revision(self) -> str:
         return "0" * 40
 
+    def patch_status(self) -> WorkspaceStatus:
+        return self.status()
+
     def status(self) -> WorkspaceStatus:
         return self._status
 
@@ -99,6 +107,68 @@ def _criteria(**patch_overrides: object) -> AcceptanceCriteria:
 
 def _state() -> RunState:
     return RunState(run_id=RunId("run-verifier"))
+
+
+def test_expanded_command_diagnostics_remain_sanitized_bounded_and_fail_closed() -> None:
+    failure = SandboxCommandResult(
+        exit_code=1, stdout="", stderr="x" * 350 + "\nROOT_CAUSE" + "y" * 3000, succeeded=False
+    )
+    sandbox = StubSandbox({"run_tests": failure})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("adder.py",)))
+    default = RepairVerifier(sandbox, workspace, _criteria()).verify(_state())
+    expanded = RepairVerifier(sandbox, workspace, _criteria(), command_detail_budget=2000).verify(
+        _state()
+    )
+    assert not default.passed
+    assert not expanded.passed
+    assert "ROOT_CAUSE" not in default.summary
+    assert "\\x0aROOT_CAUSE" in expanded.summary
+    assert "\n" not in expanded.summary
+    assert len(expanded.summary) < 2300
+    assert "..." in expanded.summary
+
+
+def test_colored_failure_preserves_assertion_diagnostics_without_style_overhead() -> None:
+    failure = SandboxCommandResult(
+        exit_code=1,
+        stdout="\x1b[31m\x1b[1m" * 100 + "ASSERTION_FAILURE\x1b[0m",
+        stderr="",
+        succeeded=False,
+    )
+    result = RepairVerifier(
+        StubSandbox({"run_tests": failure}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+    ).verify(_state())
+    assert not result.passed
+    assert "ASSERTION_FAILURE" in result.summary
+    assert "[31m" not in result.summary
+
+
+def test_non_style_terminal_controls_still_cannot_forge_verifier_lines() -> None:
+    failure = SandboxCommandResult(
+        exit_code=1, stdout="\x1b[2J\nforged\rline", stderr="", succeeded=False
+    )
+    result = RepairVerifier(
+        StubSandbox({"run_tests": failure}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+    ).verify(_state())
+    assert not result.passed
+    assert "\\x1b[2J\\x0aforged\\x0dline" in result.summary
+    assert "\n" not in result.summary
+    assert "\x1b" not in result.summary
+
+
+@pytest.mark.parametrize("budget", [0, 63, 8001])
+def test_command_diagnostic_budget_denies_unbounded_values(budget: int) -> None:
+    with pytest.raises(ValueError, match="command detail budget"):
+        RepairVerifier(
+            StubSandbox({}),
+            StubWorkspace(status=WorkspaceStatus()),
+            _criteria(),
+            command_detail_budget=budget,
+        )
 
 
 def test_verifier_surfaces_platform_skipped_resource_limits_in_the_detail() -> None:
@@ -295,6 +365,9 @@ def test_hook_exception_fails_closed_as_a_failed_check() -> None:
 
 def test_workspace_error_in_patch_check_fails_closed() -> None:
     class ExplodingWorkspace(StubWorkspace):
+        def patch_status(self) -> WorkspaceStatus:
+            return self.status()
+
         def status(self) -> WorkspaceStatus:
             msg = "repository metadata changed"
             raise WorkspaceError(msg)
@@ -341,3 +414,103 @@ def test_verification_result_rejects_non_finite_or_out_of_range_scores() -> None
     for bad in (math.nan, math.inf, -0.1, 1.5):
         with pytest.raises(ValueError, match="finite fraction"):
             VerificationResult(passed=False, summary="s", score=bad)
+
+
+@pytest.mark.parametrize("output", ["", "done\nextra\n", "noise\ndone\n"])
+def test_trusted_probe_requires_natural_completion_marker(output: str) -> None:
+    sandbox = StubSandbox(
+        {"run_tests": SandboxCommandResult(exit_code=0, stdout=output, stderr="", succeeded=True)}
+    )
+    verifier = RepairVerifier(
+        sandbox,
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+        completion_markers=(("run_tests", "done"),),
+    )
+    result = verifier.verify(_state())
+    assert result.passed is (output == "noise\ndone\n")
+
+
+@pytest.mark.parametrize(
+    "contract",
+    [(("unknown", "done"),), (("run_tests", ""),), (("run_tests", "a"), ("run_tests", "b"))],
+)
+def test_probe_completion_contract_rejects_unknown_or_ambiguous_checks(
+    contract: tuple[tuple[str, str], ...],
+) -> None:
+    with pytest.raises(ValueError, match="marker contracts"):
+        RepairVerifier(
+            StubSandbox({"run_tests": _result(0)}),
+            StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+            _criteria(),
+            completion_markers=contract,
+        )
+
+
+_PROBE = "setup = 1\nsecret_fixture = 'not disclosed'\nassert page_ready(), 'Mobile overflow'\n"
+
+
+def _probe_failure(frame_line: int) -> SandboxCommandResult:
+    stderr = (
+        'Traceback (most recent call last):\n  File "<string>", line 1, in <module>\n'
+        f'  File "<trusted-acceptance>", line {frame_line}, in <module>\n'
+        "AssertionError: Mobile overflow\n"
+    )
+    return SandboxCommandResult(exit_code=1, stdout="", stderr=stderr, succeeded=False)
+
+
+def test_failing_probe_names_only_its_failing_line() -> None:
+    sandbox = StubSandbox({"run_tests": _probe_failure(3)})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("app.css",)))
+    result = RepairVerifier(
+        sandbox, workspace, _criteria(), probe_sources=(("run_tests", _PROBE),)
+    ).verify(_state())
+    assert not result.passed
+    assert "failing acceptance line 3: assert page_ready(), 'Mobile overflow'" in result.summary
+    assert "not disclosed" not in result.summary
+    assert "setup = 1" not in result.summary
+
+
+@pytest.mark.parametrize("frame_line", [0, 99])
+def test_unmatched_probe_frame_discloses_nothing(frame_line: int) -> None:
+    sandbox = StubSandbox({"run_tests": _probe_failure(frame_line)})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("app.css",)))
+    result = RepairVerifier(
+        sandbox, workspace, _criteria(), probe_sources=(("run_tests", _PROBE),)
+    ).verify(_state())
+    assert not result.passed
+    assert "failing acceptance line" not in result.summary
+
+
+def test_passing_probe_adds_no_hint() -> None:
+    sandbox = StubSandbox({"run_tests": _result(0)})
+    workspace = StubWorkspace(status=WorkspaceStatus(changed=("app.css",)))
+    result = RepairVerifier(
+        sandbox, workspace, _criteria(), probe_sources=(("run_tests", _PROBE),)
+    ).verify(_state())
+    assert result.passed
+    assert "failing acceptance line" not in result.summary
+
+
+class TimeoutSandbox(StubSandbox):
+    def run(
+        self, command_name: str, *, timeout_seconds: float | None = None
+    ) -> SandboxCommandResult:
+        del timeout_seconds
+        self.calls.append(command_name)
+        msg = f"command {command_name!r} exceeded 90s"
+        raise SandboxTimeoutError(msg)
+
+
+def test_a_check_timeout_is_a_measured_failure_not_an_inconclusive_verdict() -> None:
+    verifier = RepairVerifier(
+        TimeoutSandbox({}),
+        StubWorkspace(status=WorkspaceStatus(changed=("adder.py",))),
+        _criteria(),
+    )
+
+    result = verifier.verify(_state())
+
+    assert not result.passed
+    assert result.inconclusive is False
+    assert ": failed (timed out: command 'run_tests' exceeded 90s" in result.summary

@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
-from fastapi import FastAPI
+from fastapi import APIRouter, FastAPI
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -32,6 +32,7 @@ from loopforge.adapters.scripted import (
     RecordingSleeper,
     ScriptedModel,
     ScriptedTools,
+    ScriptedVerifier,
 )
 from loopforge.application.runtime import Runtime
 from loopforge.domain.actions import ActionProposal
@@ -148,6 +149,9 @@ class FakeWorkspace:
     @property
     def base_revision(self) -> str:
         return "base-revision"
+
+    def patch_status(self) -> WorkspaceStatus:
+        return self.status()
 
     def status(self) -> WorkspaceStatus:
         return WorkspaceStatus()
@@ -630,12 +634,14 @@ def test_approval_round_trip_through_http(tmp_path: Path) -> None:
 
         waiting = _wait_for_status(client, run_id, "waiting_for_approval")
         assert waiting["waiting_for_approval"] is True
-        assert waiting["pending_approval"]["action_id"] == "a1"
+        assert waiting["pending_approval"]["action_id"] == f"{run_id}:action:1"
         assert "deploy" in waiting["pending_approval"]["reason"]
         assert waiting["current_proposal"]["tool_name"] == "deploy"
-        assert waiting["current_proposal"]["action_id"] == "a1"
+        assert waiting["current_proposal"]["action_id"] == f"{run_id}:action:1"
 
-        approved = client.post(f"/api/sessions/{run_id}/approve", json={"action_id": "a1"})
+        approved = client.post(
+            f"/api/sessions/{run_id}/approve", json={"action_id": f"{run_id}:action:1"}
+        )
         assert approved.status_code == 200
 
         detail = _wait_for_status(client, run_id, "succeeded")
@@ -680,7 +686,7 @@ def test_reject_round_trip_replans_and_records_the_reason(tmp_path: Path) -> Non
 
         rejected = client.post(
             f"/api/sessions/{run_id}/reject",
-            json={"action_id": "a1", "reason": "too risky"},
+            json={"action_id": f"{run_id}:action:1", "reason": "too risky"},
         )
         assert rejected.status_code == 200
 
@@ -904,13 +910,16 @@ def test_websocket_streams_history_then_live_events(tmp_path: Path) -> None:
             )
             assert history[0]["event_type"] == "RunStarted"
             assert history[-1]["event_type"] == "ApprovalRequested"
-            assert all(frame["schema_version"] == 1 for frame in history)
+            assert all(frame["schema_version"] in {1, 3} for frame in history)
 
             # Client text frames are ignored (the socket streams only), and
             # idle queue polls must not disturb the stream.
             websocket.send_text("ignored")
             time.sleep(0.3)
-            client.post(f"/api/sessions/{run_id}/approve", json={"action_id": "a1"})
+            approved = client.post(
+                f"/api/sessions/{run_id}/approve", json={"action_id": f"{run_id}:action:1"}
+            )
+            assert approved.status_code == 200
 
             live_types: list[str] = []
             deadline = time.monotonic() + 10.0
@@ -2169,3 +2178,73 @@ def test_fs_routes_are_read_only(tmp_path: Path) -> None:
         assert client.post("/api/fs/detect").status_code == 405
         assert client.delete("/api/fs/browse").status_code == 405
         assert client.put("/api/fs/detect").status_code == 405
+
+
+@pytest.mark.parametrize("task_complete", [True, False])
+def test_passing_verification_clears_historical_inconclusive_status(
+    tmp_path: Path, task_complete: bool
+) -> None:
+    factory = FakeBundleFactory(
+        actions=[
+            _proposal("first", "probe"),
+            _proposal("second", "probe"),
+            _proposal("gate", "deploy"),
+        ],
+        results=[ToolResult(ok=True, observation="observed")] * 2,
+        verifier_override=ScriptedVerifier(
+            [
+                VerificationResult(False, "command unavailable", score=0, inconclusive=True),
+                VerificationResult(True, "measured", score=0.5, task_complete=task_complete),
+            ]
+        ),
+    )
+    repo = _repo(tmp_path / "repo")
+    with _client(tmp_path, factory) as client:
+        run_id = _create(client, repo)
+        client.post(f"/api/sessions/{run_id}/start")
+        _wait_for_status(client, run_id, "succeeded" if task_complete else "waiting_for_approval")
+        detail = _detail(client, run_id)
+        assert detail["last_verification_passed"] is True
+        assert detail["last_verification_task_complete"] is task_complete
+        assert detail["last_verification_inconclusive"] is False
+
+
+class _Extension:
+    """An application mounted into the server: one route and a background service."""
+
+    def __init__(self) -> None:
+        self.events: list[str] = []
+
+    def router(self) -> APIRouter:
+        router = APIRouter()
+
+        @router.get("/api/extension/ping")
+        def ping() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+            return {"pong": "yes"}
+
+        return router
+
+    def start(self) -> None:
+        self.events.append("start")
+
+    def close(self) -> None:
+        self.events.append("close")
+
+
+def test_an_extension_is_served_and_its_service_runs_for_the_app_lifetime(
+    tmp_path: Path,
+) -> None:
+    extension = _Extension()
+    settings = ServerSettings(
+        store_kind="sqlite", sqlite_path=str(tmp_path / "events.db"), data_dir=tmp_path / "data"
+    )
+    app = create_app(settings, bundle_factory=FakeBundleFactory([], []), extensions=(extension,))
+    with TestClient(app) as client:
+        assert extension.events == ["start"]
+        assert client.get("/api/extension/ping").json() == {"pong": "yes"}
+    assert extension.events == ["start", "close"]
+
+
+def test_without_extensions_the_core_server_has_no_goal_routes(tmp_path: Path) -> None:
+    with _client(tmp_path, FakeBundleFactory([], [])) as client:
+        assert client.get("/api/goals").status_code == 404

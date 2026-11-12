@@ -1179,6 +1179,23 @@ def test_failure_streaks_are_tracked_per_tool_and_sorted() -> None:
     assert state.failure_streak_for("beta") == 2
 
 
+def test_refused_input_leaves_the_tool_streak_alone() -> None:
+    state = _apply_outcome(RunState(run_id=RUN), "edit", success=False)
+    acting = replace(
+        RunState(run_id=RUN),
+        status=RunStatus.ACTING,
+        current_action_id="a1",
+        current_tool_metadata=_metadata("edit"),
+        tool_failure_streaks=state.tool_failure_streaks,
+    )
+    for _ in range(5):
+        refused = reduce_event(
+            acting, _tool_failed(1, failure_class=ToolFailureClass.INVALID_INPUT)
+        )
+        assert refused.failure_streak_for("edit") == 1
+        assert refused.last_tool_failure_class is ToolFailureClass.INVALID_INPUT
+
+
 def test_total_tokens_sums_input_and_output() -> None:
     state = replace(RunState(run_id=RUN), input_tokens=7, output_tokens=3)
     assert state.total_tokens == 10
@@ -1215,6 +1232,22 @@ def test_budget_ignores_tokens_when_no_token_limit() -> None:
 # --- property tests ---
 
 
+@pytest.mark.parametrize(("reported_cached", "expected_cached"), [(50, 50), (1000, 100)])
+def test_cache_credit_cannot_spill_into_another_requests_work(
+    reported_cached: int, expected_cached: int
+) -> None:
+    events = (
+        _started(1),
+        _budget(2, usage=UsageDelta(input_tokens=100, cached_input_tokens=reported_cached)),
+        _budget(3, usage=UsageDelta(input_tokens=900, output_tokens=20)),
+    )
+    state = replay(RUN, events)
+    assert state.input_tokens == 1000
+    assert state.cached_input_tokens == expected_cached
+    assert state.work_tokens == 1020 - expected_cached
+    assert budget_exceeded(state, BudgetLimit(1, 5, max_total_tokens=900))
+
+
 @settings(derandomize=True, max_examples=60, database=None)
 @given(
     usages=st.lists(
@@ -1244,7 +1277,7 @@ def test_budget_debits_accumulate_additively(usages: list[UsageDelta]) -> None:
         expected_cost += usage.cost_usd
         expected_input += usage.input_tokens
         expected_output += usage.output_tokens
-        expected_cached += usage.cached_input_tokens
+        expected_cached += min(usage.cached_input_tokens, usage.input_tokens)
 
     assert state.version == len(usages) + 1
     assert state.cost_usd == expected_cost
@@ -1511,10 +1544,13 @@ def test_model_turn_recorded_is_evidence_only_in_ready() -> None:
 
     after = reduce_event(before, _model_turn_recorded(3))
 
-    # No control-state effect beyond the universal version/last-occurred fold:
-    # the identity lives in the stream, not RunState.
+    # Successful model history allocates fresh identities and resets retry state.
     assert after == replace(
-        before, version=before.version + 1, last_occurred_at=after.last_occurred_at
+        before,
+        version=before.version + 1,
+        last_occurred_at=after.last_occurred_at,
+        model_turn_count=1,
+        model_attempts_since_progress=1,
     )
 
 
@@ -1546,3 +1582,16 @@ def test_model_turn_recorded_is_rejected_on_a_terminal_run() -> None:
         InvalidTransitionError, match="terminal run cannot accept ModelTurnRecorded"
     ):
         reduce_event(terminal, _model_turn_recorded(4))
+
+
+@pytest.mark.parametrize("success", [True, False])
+def test_observation_identity_comes_from_result_event_and_survives_denial(success: bool) -> None:
+    state = replay(RUN, (_started(1), _planned(2), _proposed(3), _authorized(4), _tool_started(5)))
+    result = _tool_succeeded(6) if success else _tool_failed(6)
+    state = reduce_event(state, result)
+    assert state.last_observation_sequence == 6
+    state = reduce_event(state, _verification_failed(7))
+    state = reduce_event(state, _planned(8))
+    state = reduce_event(state, _proposed(9, proposal=_proposal("a2")))
+    state = reduce_event(state, _rejected(10, proposal=_proposal("a2")))
+    assert state.last_observation_sequence == 6

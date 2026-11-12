@@ -194,13 +194,8 @@ def test_composite_rejects_duplicate_names_and_empty_composition(tmp_path: Path)
 
 
 def test_revert_rejects_non_string_path(tmp_path: Path) -> None:
-    tools = WorkspaceGitTools(_workspace(tmp_path))
-    proposal = ActionProposal(ActionId("a1"), "revert_file", {"path": 42})  # pyright: ignore[reportArgumentType]
-
-    result = tools.execute(ToolExecutionRequest(proposal=proposal, attempt=1, timeout_seconds=5.0))
-
-    assert not result.ok
-    assert result.error_code == "TOOL_ARGUMENTS"
+    with pytest.raises(TypeError, match="string keys and values"):
+        ActionProposal(ActionId("a1"), "revert_file", {"path": 42})  # pyright: ignore[reportArgumentType]
 
 
 def test_revert_rejects_glob_and_git_metadata_paths(tmp_path: Path) -> None:

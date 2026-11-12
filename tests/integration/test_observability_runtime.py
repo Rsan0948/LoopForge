@@ -352,7 +352,7 @@ def test_retry_path_emits_retry_span_and_metric() -> None:
     retry_spans = [span for span in telemetry.spans if span.name == SpanName.RETRY.value]
     assert len(retry_spans) == 1
     assert retry_spans[0].attributes["loopforge.retry.reason_code"] == "RETRY_TRANSIENT_FAILURE"
-    assert retry_spans[0].correlation.action_id == ActionId("a1")
+    assert retry_spans[0].correlation.action_id == ActionId(f"{state.run_id}:action:1")
     values = _metric_values(telemetry)
     assert values[MetricName.RETRIES.value] == [1.0]
     assert values[MetricName.TOOL_FAILURES.value] == [1.0]

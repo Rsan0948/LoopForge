@@ -17,6 +17,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -36,8 +37,10 @@ from loopforge.domain.events import (
 )
 from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome, WorkerProjection
 from loopforge.domain.reliability import ToolFailureClass
-from loopforge.domain.tooling import ToolMetadata
+from loopforge.domain.routing import ModelCapabilities
+from loopforge.domain.tooling import SideEffectClass, ToolMetadata
 from loopforge.domain.types import BudgetLimit, RunId, RunStatus, StopReason
+from loopforge.domain.verification import CheckOutcome, VerificationProgress
 
 
 class InvalidTransitionError(RuntimeError):
@@ -81,12 +84,23 @@ class RunState:
     retry_not_before: datetime | None = None
     execution_in_flight: bool = False
     last_observation: str | None = None
+    last_observation_sequence: int | None = None
     last_tool_failure_class: ToolFailureClass | None = None
     last_verification: str | None = None
     last_verification_passed: bool | None = None
+    last_verification_sequence: int | None = None
+    last_verification_repeat: bool = False
+    last_verification_inconclusive: bool = False
+    last_verification_task_complete: bool = True
     last_verification_score: float | None = None
     best_verification_score: float | None = None
+    last_verification_identity: str | None = None
+    last_verification_outcomes: tuple[CheckOutcome, ...] = ()
+    last_verification_progress: VerificationProgress | None = None
+    best_verification_progress: VerificationProgress | None = None
     consecutive_no_progress: int = 0
+    model_attempts_since_progress: int = 0
+    first_local_write_at: datetime | None = None
     last_reflection: str | None = None
     last_context_items: tuple[ContextItemSnapshot, ...] | None = None
     tool_failure_streaks: tuple[ToolFailureStreak, ...] = ()
@@ -106,11 +120,26 @@ class RunState:
     approved_action_ids: tuple[str, ...] = ()
     operator_instructions: tuple[str, ...] = ()
     last_approval_rejection: str | None = None
+    model_turn_count: int = 0
+    model_failure_streak: int = 0
+    last_model_capabilities: ModelCapabilities | None = None
+    last_model_failure_at: datetime | None = None
     version: int = 0
 
     @property
     def total_tokens(self) -> int:
         return self.input_tokens + self.output_tokens
+
+    @property
+    def work_tokens(self) -> int:
+        """Tokens a provider had to process: input not served from its prompt cache,
+        plus output. Hard token budgets count these, so an append-only conversation is
+        not charged again for the prefix it re-sends every turn."""
+        return (
+            self.input_tokens
+            - min(self.cached_input_tokens, self.input_tokens)
+            + (self.output_tokens)
+        )
 
     def failure_streak_for(self, tool_name: str) -> int:
         for item in self.tool_failure_streaks:
@@ -148,6 +177,7 @@ _ALLOWED_STATUS: dict[type[Event], set[RunStatus]] = {
         RunStatus.VERIFYING,
         RunStatus.REFLECTING,
     },
+    ModelAttemptFailed: {RunStatus.READY},
     ModelTurnRecorded: {RunStatus.READY},
     # Evidence-only shadow records (PACS-017): routing/context-budget advice
     # is journaled while the run is READY (the propose-turn decision points);
@@ -222,9 +252,25 @@ def _update_streak(
     return tuple(ToolFailureStreak(name, count) for name, count in sorted(items.items()))
 
 
-def _verification_progress(
-    state: RunState, *, summary: str, score: float | None
+def _verification_progress(  # noqa: PLR0911 - explicit typed/legacy comparison cases
+    state: RunState,
+    *,
+    summary: str,
+    score: float | None,
+    progress: VerificationProgress | None = None,
 ) -> tuple[float | None, int]:
+    if state.best_verification_progress is not None and progress is None:
+        return state.best_verification_score, state.consecutive_no_progress + 1
+    if progress is not None:
+        best = state.best_verification_progress
+        if best is not None and (
+            best.basis != progress.basis or set(best.checks) != set(progress.checks)
+        ):
+            msg = "verification progress basis cannot change during a run"
+            raise ValueError(msg)
+        if best is None or progress.dominates(best):
+            return score, 0
+        return state.best_verification_score, state.consecutive_no_progress + 1
     if score is not None:
         if state.best_verification_score is None or score > state.best_verification_score:
             return score, 0
@@ -355,7 +401,14 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             return replace(
                 base,
                 last_observation=observation,
+                last_observation_sequence=event.sequence,
                 last_tool_failure_class=None,
+                first_local_write_at=(
+                    base.first_local_write_at or event.occurred_at
+                    if base.current_tool_metadata is not None
+                    and base.current_tool_metadata.side_effect is SideEffectClass.LOCAL_WRITE
+                    else base.first_local_write_at
+                ),
                 current_attempt=attempt,
                 execution_in_flight=False,
                 tool_failure_streaks=_update_streak(
@@ -375,15 +428,20 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
             )
         case ToolFailed(error_message=message, failure_class=failure_class, attempt=attempt):
             tool_name = base.current_tool_metadata.name if base.current_tool_metadata else "unknown"
+            # Refused input says nothing about the tool's health: leave its streak alone.
+            streaks = (
+                base.tool_failure_streaks
+                if failure_class is ToolFailureClass.INVALID_INPUT
+                else _update_streak(base.tool_failure_streaks, tool_name, success=False)
+            )
             return replace(
                 base,
                 last_observation=message,
+                last_observation_sequence=event.sequence,
                 last_tool_failure_class=failure_class,
                 current_attempt=attempt,
                 execution_in_flight=False,
-                tool_failure_streaks=_update_streak(
-                    base.tool_failure_streaks, tool_name, success=False
-                ),
+                tool_failure_streaks=streaks,
                 # A grant is spent by the execution of its action, whatever the
                 # outcome. A failed-but-granted action that re-plans back to
                 # READY must not keep its grant: the next cycle would
@@ -412,24 +470,104 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 base,
                 open_circuit_tools=tuple(sorted(set(base.open_circuit_tools) | {tool_name})),
             )
-        case VerificationPassed(summary=summary):
-            return replace(
-                base,
-                last_verification=summary,
-                last_verification_passed=True,
-                last_verification_score=1.0,
-                best_verification_score=max(base.best_verification_score or 0.0, 1.0),
-                consecutive_no_progress=0,
-                status=RunStatus.VERIFYING,
+        case VerificationPassed(
+            summary=summary,
+            task_complete=task_complete,
+            score=score,
+            outcomes=outcomes,
+            evidence_identity=evidence_identity,
+            progress=progress,
+        ):
+            best_score, no_progress = _verification_progress(
+                base, summary=summary, score=score, progress=progress
             )
-        case VerificationFailed(summary=summary, score=score):
-            best_score, no_progress = _verification_progress(base, summary=summary, score=score)
             return replace(
                 base,
                 last_verification=summary,
-                last_verification_passed=False,
+                last_verification_sequence=event.sequence,
+                last_verification_repeat=False,
+                last_verification_inconclusive=False,
+                last_verification_outcomes=outcomes,
+                last_verification_identity=evidence_identity,
+                last_verification_progress=progress,
+                best_verification_progress=(
+                    progress
+                    if progress is not None
+                    and (
+                        base.best_verification_progress is None
+                        or progress.dominates(base.best_verification_progress)
+                    )
+                    else base.best_verification_progress
+                ),
+                last_verification_passed=True,
+                last_verification_task_complete=task_complete,
                 last_verification_score=score,
                 best_verification_score=best_score,
+                model_attempts_since_progress=(
+                    0
+                    if progress is not None and no_progress == 0
+                    else base.model_attempts_since_progress
+                ),
+                consecutive_no_progress=0 if task_complete else no_progress,
+                status=RunStatus.VERIFYING if task_complete else RunStatus.REFLECTING,
+            )
+        case VerificationFailed(
+            summary=summary,
+            score=score,
+            repeat=repeat,
+            outcomes=outcomes,
+            evidence_identity=evidence_identity,
+            progress=progress,
+            inconclusive=inconclusive,
+        ):
+            if (
+                repeat
+                and (outcomes or progress is not None or evidence_identity is not None)
+                and (
+                    base.last_verification_passed is not False
+                    or base.last_verification_inconclusive
+                    or outcomes != base.last_verification_outcomes
+                    or progress != base.last_verification_progress
+                    or evidence_identity != base.last_verification_identity
+                    or score != base.last_verification_score
+                )
+            ):
+                msg = "repeated verification must match its prior committed measurement"
+                raise ValueError(msg)
+            best_score, no_progress = (
+                (base.best_verification_score, base.consecutive_no_progress)
+                if repeat or inconclusive
+                else _verification_progress(base, summary=summary, score=score, progress=progress)
+            )
+            return replace(
+                base,
+                last_verification=summary,
+                last_verification_sequence=event.sequence,
+                last_verification_repeat=repeat,
+                last_verification_inconclusive=inconclusive,
+                last_verification_outcomes=outcomes,
+                last_verification_identity=evidence_identity,
+                last_verification_progress=progress,
+                best_verification_progress=(
+                    progress
+                    if not repeat
+                    and not inconclusive
+                    and progress is not None
+                    and (
+                        base.best_verification_progress is None
+                        or progress.dominates(base.best_verification_progress)
+                    )
+                    else base.best_verification_progress
+                ),
+                last_verification_passed=False,
+                last_verification_task_complete=False,
+                last_verification_score=score,
+                best_verification_score=best_score,
+                model_attempts_since_progress=(
+                    0
+                    if progress is not None and not repeat and not inconclusive and no_progress == 0
+                    else base.model_attempts_since_progress
+                ),
                 consecutive_no_progress=no_progress,
                 status=RunStatus.REFLECTING,
             )
@@ -450,13 +588,30 @@ def reduce_event(state: RunState, event: Event) -> RunState:  # noqa: PLR0911, P
                 cost_usd=base.cost_usd + usage.cost_usd,
                 input_tokens=base.input_tokens + usage.input_tokens,
                 output_tokens=base.output_tokens + usage.output_tokens,
-                cached_input_tokens=base.cached_input_tokens + usage.cached_input_tokens,
+                # Cache credit belongs only to this request. An overreported count
+                # cannot become credit against a later request's uncached work.
+                cached_input_tokens=base.cached_input_tokens
+                + min(usage.cached_input_tokens, usage.input_tokens),
             )
-        case ModelTurnRecorded():
-            # Evidence-only model-identity record (PACS-015): the provenance
-            # graph attributes the turn's action to this provider/model. No
-            # control-state effect; the payload stays in the event stream.
-            return base
+        case ModelAttemptFailed(model_capabilities=capabilities):
+            return replace(
+                base,
+                model_attempts_since_progress=base.model_attempts_since_progress + 1,
+                model_failure_streak=base.model_failure_streak + 1,
+                last_model_capabilities=capabilities or base.last_model_capabilities,
+                last_model_failure_at=event.occurred_at,
+            )
+        case ModelTurnRecorded(model_capabilities=capabilities):
+            # Successful inference resets its retry streak and advances action
+            # allocation. The same history restores routing after a rebuild.
+            return replace(
+                base,
+                model_turn_count=base.model_turn_count + 1,
+                model_attempts_since_progress=base.model_attempts_since_progress + 1,
+                model_failure_streak=0,
+                last_model_failure_at=None,
+                last_model_capabilities=capabilities or base.last_model_capabilities,
+            )
         case ShadowDecisionRecorded():
             # Evidence-only candidate-policy record (PACS-017): shadow advice
             # is journaled for audit/comparison and NEVER enacted — replaying
@@ -541,7 +696,7 @@ def budget_exceeded(state: RunState, limit: BudgetLimit) -> bool:
         return True
     if limit.max_iterations is not None and state.iteration >= limit.max_iterations:
         return True
-    return limit.max_total_tokens is not None and state.total_tokens >= limit.max_total_tokens
+    return limit.max_total_tokens is not None and state.work_tokens >= limit.max_total_tokens
 
 
 _TERMINAL_STATUS_BY_REASON: dict[StopReason, RunStatus] = {
@@ -594,6 +749,8 @@ def status_after_event(event: Event) -> RunStatus | None:
     """
     if isinstance(event, RunStopped):
         return _TERMINAL_STATUS_BY_REASON[event.reason]
+    if isinstance(event, VerificationPassed) and not event.task_complete:
+        return RunStatus.REFLECTING
     return _STATUS_AFTER_EVENT.get(type(event))
 
 

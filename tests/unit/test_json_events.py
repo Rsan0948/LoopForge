@@ -32,6 +32,7 @@ from loopforge.domain.events import (
     CircuitOpened,
     ContextAssembled,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -394,6 +395,14 @@ EXAMPLES: tuple[Event, ...] = (
         decision="ollama/devstral-small-2:latest tier=economy",
         basis="reason_code=ROUTE_INITIAL_SELECTION",
     ),
+    ModelAttemptFailed(
+        event_id=EventId("e31"),
+        run_id=RUN,
+        occurred_at=NOW,
+        sequence=31,
+        reason_code="MODEL_INVALID_RESPONSE",
+        summary="invalid fixture",
+    ),
     # Nullable-field variant exercising the PACS-015 lineage link.
     RunStarted(
         event_id=EventId("e29"),
@@ -435,6 +444,7 @@ EXAMPLES: tuple[Event, ...] = (
     OPERATOR_INSTRUCTION,
     MODEL_TURN_RECORDED,
     SHADOW_DECISION_RECORDED,
+    MODEL_ATTEMPT_FAILED,
     RUN_STARTED_WITH_PARENT,
 ) = EXAMPLES
 
@@ -477,7 +487,7 @@ def _legacy_tool_failed_payload(retryable: Any) -> str:
 
 def test_examples_cover_every_registered_event_type() -> None:
     assert {type(event).__name__ for event in EXAMPLES} == set(_EVENT_TYPES)
-    assert len(_EVENT_TYPES) == 26
+    assert len(_EVENT_TYPES) == 27
 
 
 @pytest.mark.parametrize(

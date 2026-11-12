@@ -18,7 +18,6 @@ from datetime import UTC, datetime
 import pytest
 
 from loopforge.application.trajectory import (
-    ProposalArgumentsContractError,
     compute_trajectory_metrics,
     count_human_interventions,
 )
@@ -238,15 +237,8 @@ def test_repetition_ratio_full_stall_is_one_minus_first() -> None:
 
 
 def test_non_serializable_proposal_arguments_fail_loudly() -> None:
-    # ActionProposal.arguments is typed Mapping[str, str] but not validated
-    # per value; a misbehaving caller can persist arguments json.dumps cannot
-    # canonicalize. The projection raises its code-owned contract error
-    # instead of leaking a bare TypeError.
-    events: tuple[Event, ...] = (
-        _proposed(1, "write_file", {"path": "src/a.py", "content": b"bytes"}),  # pyright: ignore[reportArgumentType]
-    )
-    with pytest.raises(ProposalArgumentsContractError, match="not JSON-serializable"):
-        compute_trajectory_metrics(_spec(), events)
+    with pytest.raises(TypeError, match="string keys and values"):
+        _proposed(1, "write_file", {"path": "src/a.py", "content": b"bytes"})  # pyright: ignore[reportArgumentType]
 
 
 # --- expensive_model_turns -------------------------------------------------------

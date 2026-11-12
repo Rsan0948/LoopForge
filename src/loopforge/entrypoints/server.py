@@ -17,12 +17,13 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Protocol
 
-from fastapi import FastAPI, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
@@ -37,7 +38,13 @@ from loopforge.adapters.postgres_events import PostgresEventStore
 from loopforge.adapters.sqlite_events import SQLiteEventStore
 from loopforge.application.provenance import build_provenance_graph, explain_provenance
 from loopforge.application.runtime import UnknownRunError
-from loopforge.domain.events import ApprovalRequested, ArtifactRecorded, Event, VerificationFailed
+from loopforge.domain.events import (
+    ApprovalRequested,
+    ArtifactRecorded,
+    Event,
+    VerificationFailed,
+    VerificationPassed,
+)
 from loopforge.domain.policies import PolicyLifecycle
 from loopforge.domain.provenance import ProvenanceNode, UnknownProvenanceNodeError
 from loopforge.domain.state import InvalidTransitionError
@@ -356,8 +363,26 @@ def _inline_fields(request: InlineProfileRequest) -> InlineProfileFields:
     )
 
 
+class ServerExtension(Protocol):
+    """An application mounted into the operator server: its routes and a background service.
+
+    The server knows nothing about what an extension does. Applications built on the
+    core (for example an agent product) pass extensions to ``create_app``; extension
+    routes are registered before the static UI and gain no authority from the server.
+    """
+
+    def router(self) -> APIRouter: ...
+
+    def start(self) -> None: ...
+
+    def close(self) -> None: ...
+
+
 def create_app(  # noqa: PLR0915 - the composition root registers routes linearly
-    settings: ServerSettings, *, bundle_factory: BundleFactory | None = None
+    settings: ServerSettings,
+    *,
+    bundle_factory: BundleFactory | None = None,
+    extensions: Sequence[ServerExtension] = (),
 ) -> FastAPI:
     """Build the operator-server ASGI app over a durable event store."""
     codec = JsonEventCodec()
@@ -379,7 +404,11 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncGenerator[None]:
+        for extension in extensions:
+            extension.start()
         yield
+        for extension in reversed(extensions):
+            extension.close()
         manager.shutdown()
 
     app = FastAPI(title="loopforge operator server", lifespan=lifespan)
@@ -480,7 +509,10 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
                 latest = requested[-1]
                 pending = {"action_id": str(latest.action_id), "reason": latest.reason}
         proposal = state.current_proposal
-        last_failed = next((e for e in reversed(events) if isinstance(e, VerificationFailed)), None)
+        last_verification = next(
+            (e for e in reversed(events) if isinstance(e, VerificationPassed | VerificationFailed)),
+            None,
+        )
         budget: dict[str, object] | None = None
         if wiring is not None:
             budget = {
@@ -503,9 +535,10 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
             "total_tokens": state.total_tokens,
             "last_verification": state.last_verification,
             "last_verification_passed": state.last_verification_passed,
+            "last_verification_task_complete": state.last_verification_task_complete,
             "last_verification_score": state.last_verification_score,
             "last_verification_inconclusive": (
-                last_failed is not None and last_failed.inconclusive
+                isinstance(last_verification, VerificationFailed) and last_verification.inconclusive
             ),
             "plan": state.plan,
             "current_proposal": (
@@ -852,6 +885,10 @@ def create_app(  # noqa: PLR0915 - the composition root registers routes linearl
     app.add_api_websocket_route("/ws/sessions/{run_id}", session_stream_route)
 
     # Static UI mounts LAST, after every /api and /ws route is registered.
+
+    for extension in extensions:
+        app.include_router(extension.router())
+
     if settings.static_dir is not None and Path(settings.static_dir).is_dir():
         app.mount(
             "/",

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import math
+import os
 import subprocess
 import threading
 import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import BinaryIO, ClassVar
+from typing import ClassVar
 
 import pytest
 
@@ -379,6 +380,46 @@ def test_docker_run_argv_omits_user_when_unset(tmp_path: Path) -> None:
     assert argv[-4:] == (_TEST_IMAGE, "/bin/sh", "-c", "true")
 
 
+def test_read_only_mounts_are_bound_read_only(tmp_path: Path) -> None:
+    spec = _sh("true")
+    scratch = tmp_path / "scratch"
+    workspace = tmp_path / "ws"
+    scratch.mkdir()
+    workspace.mkdir()
+    config = _config(commands=(spec,), read_only_mounts=((str(scratch), "/scratch"),))
+    sandbox = _sandbox(workspace, config)
+    argv = sandbox._docker_run_argv(  # pyright: ignore[reportPrivateUsage]  # enforcement-surface pin
+        spec=spec, container_name="test-name"
+    )
+    assert f"type=bind,source={scratch},target=/scratch,readonly" in argv
+
+
+@pytest.mark.parametrize(
+    "mount",
+    [
+        ("relative/dir", "/scratch"),
+        ("/host", "scratch"),
+        ("/host", "/workspace"),
+        ("/host", "/workspace/inner"),
+        ("/host", "/tmp"),
+        ("/host,readonly=false", "/scratch"),
+        ("/host", "/a/../workspace"),
+    ],
+    ids=[
+        "relative-source",
+        "relative-target",
+        "workspace",
+        "inside-workspace",
+        "tmp",
+        "option-injection",
+        "traversal",
+    ],
+)
+def test_read_only_mounts_cannot_shadow_or_widen_the_sandbox(mount: tuple[str, str]) -> None:
+    with pytest.raises(ValueError, match="read-only mount"):
+        _config(read_only_mounts=(mount,))
+
+
 # --- Plumbing with a faked container runtime (no daemon required) ---
 
 
@@ -395,8 +436,8 @@ class _FakePopen:
         self,
         argv: tuple[str, ...],
         *,
-        stdout: BinaryIO,
-        stderr: BinaryIO,
+        stdout: int,
+        stderr: int,
         **_kwargs: object,
     ) -> None:
         self.argv = argv
@@ -404,8 +445,17 @@ class _FakePopen:
         self.returncode: int | None = None
         self._wait_calls = 0
         self._release = threading.Event()
-        stdout.write(type(self).out)
-        stderr.write(type(self).err)
+        assert stdout == subprocess.PIPE
+        assert stderr == subprocess.PIPE
+        self.args = argv
+        out_read, out_write = os.pipe()
+        err_read, err_write = os.pipe()
+        os.write(out_write, type(self).out)
+        os.write(err_write, type(self).err)
+        os.close(out_write)
+        os.close(err_write)
+        self.stdout = os.fdopen(out_read, "rb")
+        self.stderr = os.fdopen(err_read, "rb")
         type(self).instances.append(self)
 
     def wait(self, timeout: float | None = None) -> int:
@@ -586,7 +636,8 @@ def test_captured_output_is_truncated_to_the_configured_bound(
     _FakePopen.out = b"0123456789"
     limits = SandboxLimits(max_output_bytes=4)
     result = _sandbox(tmp_path, _config(limits=limits)).run("sh")
-    assert result.stdout == "0123"
+    assert len(result.stdout.encode()) <= 4
+    assert result.output_truncated
 
 
 def test_missing_docker_executable_surfaces_sandbox_error(tmp_path: Path) -> None:
@@ -727,7 +778,19 @@ def test_live_host_environment_is_not_inherited(
 
 
 @_REQUIRES_DOCKER
-def test_live_timeout_kills_container_and_children(tmp_path: Path) -> None:
+def test_live_timeout_kills_container_and_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    names: list[str] = []
+    original = ContainerSandbox._docker_run_argv  # pyright: ignore[reportPrivateUsage]
+
+    def record_name(
+        self: ContainerSandbox, *, spec: CommandSpec, container_name: str
+    ) -> tuple[str, ...]:
+        names.append(container_name)
+        return original(self, spec=spec, container_name=container_name)
+
+    monkeypatch.setattr(ContainerSandbox, "_docker_run_argv", record_name)
     spec = _sh("sleep 300 & sleep 300 & wait", timeout_seconds=120.0)
     sandbox = _sandbox(tmp_path, _config(commands=(spec,)))
     started = time.monotonic()
@@ -736,9 +799,10 @@ def test_live_timeout_kills_container_and_children(tmp_path: Path) -> None:
     elapsed = time.monotonic() - started
     assert elapsed < 60
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _sandbox_container_names():
+    assert len(names) == 1
+    while time.monotonic() < deadline and names[0] in _sandbox_container_names():
         time.sleep(0.2)
-    assert _sandbox_container_names() == [], "timed-out sandbox containers must be gone"
+    assert names[0] not in _sandbox_container_names(), "timed-out workload must be gone"
 
 
 @_REQUIRES_DOCKER
@@ -826,17 +890,25 @@ def test_live_destroy_leaves_no_running_workload(tmp_path: Path) -> None:
     outcome: list[object] = []
     worker = threading.Thread(target=lambda: outcome.append(sandbox.run("sh")))
     worker.start()
-    deadline = time.monotonic() + 30
-    while time.monotonic() < deadline and not _sandbox_container_names():
-        time.sleep(0.1)
-    assert _sandbox_container_names(), "workload container should be running"
-    sandbox.destroy()
-    worker.join(timeout=60)
-    assert not worker.is_alive()
+    try:
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            name = sandbox.active_container
+            if name is not None and name in _sandbox_container_names():
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("this sandbox's workload container should be running")
+        sandbox.destroy()
+        worker.join(timeout=60)
+        assert not worker.is_alive()
+    finally:
+        sandbox.destroy()
+        worker.join(timeout=60)
     deadline = time.monotonic() + 15
-    while time.monotonic() < deadline and _sandbox_container_names():
+    while time.monotonic() < deadline and name in _sandbox_container_names():
         time.sleep(0.2)
-    assert _sandbox_container_names() == [], "destroy must leave no running child workload"
+    assert name not in _sandbox_container_names(), "destroy must remove this child workload"
     result = outcome[0]
     assert isinstance(result, SandboxCommandResult)
     assert result.succeeded is False

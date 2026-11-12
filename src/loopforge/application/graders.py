@@ -41,7 +41,13 @@ from loopforge.domain.benchmarks import (
     GraderResult,
     GraderVerdict,
 )
-from loopforge.domain.events import Event, ModelTurnRecorded, RunStopped, VerificationPassed
+from loopforge.domain.events import (
+    Event,
+    ModelTurnRecorded,
+    RunStopped,
+    VerificationFailed,
+    VerificationPassed,
+)
 from loopforge.domain.types import StopReason
 from loopforge.domain.workspace import FixtureFile, PatchConstraints
 
@@ -225,15 +231,30 @@ def grade_verified_success(
     """PASS iff the terminal stop is ``SUCCESS_VERIFIED`` *and* a ``VerificationPassed`` exists.
 
     Success is verifier-granted, never model-claimed: both the durable stop
-    reason and at least one durable passing verification must be present. Any
-    other outcome — a different stop reason, a non-terminal stream, or a
+    reason and the latest durable verification must confirm whole-task
+    completion for the same run before the stop. Any other outcome — a
+    different stop reason, a non-terminal stream, or a
     forged success stop without a passing verification — is FAIL; the detail
     names the actual stop reason. This grader is the success-claim check
     itself, so it never emits FALSE_SUCCESS.
     """
     del spec, evidence  # this grader reads the durable stream only
     stop = _terminal_stop(events)
-    verified = any(isinstance(event, VerificationPassed) for event in events)
+    latest_verification = next(
+        (
+            event
+            for event in reversed(events)
+            if isinstance(event, VerificationPassed | VerificationFailed)
+        ),
+        None,
+    )
+    verified = (
+        isinstance(latest_verification, VerificationPassed)
+        and latest_verification.task_complete
+        and stop is not None
+        and latest_verification.run_id == stop.run_id
+        and latest_verification.sequence < stop.sequence
+    )
     if stop is not None and stop.reason is StopReason.SUCCESS_VERIFIED and verified:
         return GraderResult(
             grader_id=GraderId.VERIFIED_SUCCESS,
@@ -241,7 +262,11 @@ def grade_verified_success(
             detail="terminal stop success_verified with durable VerificationPassed",
         )
     actual = "no terminal stop (non-terminal stream)" if stop is None else stop.reason.value
-    missing = "" if verified else "; no durable VerificationPassed"
+    missing = (
+        ""
+        if verified
+        else "; no durable VerificationPassed qualifying as the latest whole-task receipt"
+    )
     return GraderResult(
         grader_id=GraderId.VERIFIED_SUCCESS,
         verdict=GraderVerdict.FAIL,

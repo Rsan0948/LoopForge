@@ -46,13 +46,15 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import math
 import os
 import shutil
+import stat
 import subprocess
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Final
+from typing import Final, Self
 
 from loopforge.domain.types import WorkspaceId
 from loopforge.domain.workspace import FixtureSpec, WorkspaceStatus
@@ -68,13 +70,13 @@ _MAX_WORKSPACE_ID_LENGTH: Final = 128
 
 
 def _git_environment() -> dict[str, str]:
-    return {
+    environment = {
         "PATH": "/usr/bin:/bin",
         "LC_ALL": "C",
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_ATTR_NOSYSTEM": "1",
-        "GIT_LITERAL_PATHSPEMS": "1",
+        "GIT_LITERAL_PATHSPECS": "1",
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_AUTHOR_NAME": _FIXED_IDENTITY,
         "GIT_AUTHOR_EMAIL": "fixture@loopforge.invalid",
@@ -83,6 +85,13 @@ def _git_environment() -> dict[str, str]:
         "GIT_COMMITTER_EMAIL": "fixture@loopforge.invalid",
         "GIT_COMMITTER_DATE": _FIXED_DATE,
     }
+    # Operator-owned diagnostics only: Git's own event trace (one JSON line per process,
+    # with its error text) to an absolute file the operator chose. Never set from model
+    # or repository content, and never a path inside the workspace.
+    trace = os.environ.get("LOOPFORGE_GIT_TRACE2", "")
+    if trace and Path(trace).is_absolute():
+        environment["GIT_TRACE2_EVENT"] = trace
+    return environment
 
 
 def _has_unsafe_characters(value: str) -> bool:
@@ -181,6 +190,50 @@ class GitWorkspace:
                 changed.append(path)
         return WorkspaceStatus(changed=tuple(sorted(changed)), untracked=tuple(sorted(untracked)))
 
+    def patch_status(self) -> WorkspaceStatus:
+        """Baseline-relative paths; status() deliberately remains HEAD-relative."""
+        tracked = self.run_git(
+            "diff", "--name-only", "-z", "--no-renames", self.base_revision, "--"
+        ).split("\0")
+        status = self.status()
+        return WorkspaceStatus(
+            changed=tuple(sorted(set(tracked) - {""})),
+            untracked=status.untracked,
+        )
+
+    @classmethod
+    def from_workspace(cls, workspace: GitWorkspace, *, include_ignored: bool = True) -> Self:
+        """Adopt the same guarded workspace without consumers copying private fields."""
+        return cls(
+            _root=workspace.root,
+            _git=workspace._git,
+            _workspace_id=workspace.workspace_id,
+            _base_revision=workspace.base_revision,
+            _metadata_fingerprint=workspace._metadata_fingerprint,
+            _include_ignored=include_ignored,
+        )
+
+    def with_baseline(self, revision: str) -> Self:
+        """Return the same workspace bound to an existing immutable commit."""
+        resolved = self.run_git("rev-parse", "--verify", f"{revision}^{{commit}}").strip()
+        return replace(self, _base_revision=resolved)
+
+    def candidate_patch(self) -> str:
+        """Machine-consumable text patch, refusing any omitted candidate material."""
+        patch = self.diff()
+        if any(
+            line.startswith(("loopforge:", "Binary files ", "GIT binary patch"))
+            for line in patch.splitlines()
+        ):
+            msg = "Candidate contains files that cannot be represented as a text patch"
+            raise WorkspaceError(msg)
+        try:
+            patch.encode("utf-8")
+        except UnicodeEncodeError as exc:
+            msg = "Candidate contains non-UTF-8 material that cannot be represented as a text patch"
+            raise WorkspaceError(msg) from exc
+        return patch
+
     def diff(self) -> str:
         # --no-renames: status() reports renames as delete+add, so the diff
         # must use the same grammar — every changed path stays individually
@@ -201,6 +254,12 @@ class GitWorkspace:
             raise WorkspaceError(msg)
         for path in paths:
             _validate_checkout_path(path)
+            ancestor = self._root
+            for part in path.split("/")[:-1]:
+                ancestor /= part
+                if ancestor.is_symlink():
+                    msg = f"cannot revert {path}: symlink ancestor"
+                    raise WorkspaceError(msg)
         # Restore from the base revision (index and worktree), never from the
         # possibly-staged index: revert converges to the recorded base.
         at_base = tuple(path for path in paths if self._exists_at_base(path))
@@ -211,15 +270,7 @@ class GitWorkspace:
         for path in paths:
             if path in at_base:
                 continue
-            candidate = self._root.joinpath(*path.split("/"))
-            if candidate.is_symlink() or candidate.is_file():
-                candidate.unlink()
-            elif candidate.exists():
-                msg_2 = f"cannot revert {path}: not a regular file"
-                raise WorkspaceError(msg_2)
-            else:
-                msg_3 = f"cannot revert {path}: not at the base revision and not in the worktree"
-                raise WorkspaceError(msg_3)
+            _unlink_file(self._root, path)
 
     def _exists_at_base(self, path: str) -> bool:
         return bool(self.run_git("ls-tree", "--name-only", self._base_revision, "--", path).strip())
@@ -263,7 +314,10 @@ class GitWorkspace:
             raise WorkspaceError(msg_2) from exc
         if b"\x00" in raw:
             return f"loopforge: untracked binary file {relative!r} not rendered\n"
-        content = raw.decode("utf-8", errors="replace")
+        try:
+            content = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return f"loopforge: untracked non-UTF-8 file {relative!r} not rendered\n"
         rendered = difflib.unified_diff(
             [],
             content.splitlines(keepends=True),
@@ -274,8 +328,12 @@ class GitWorkspace:
         # the evidence document opens with a `diff --git` header, so downstream
         # parsers never mistake a headerless new-file render for a continuation
         # of the previous tracked file.
-        header = f"diff --git a/{relative} b/{relative}\nnew file mode 100644\n"
-        return header + "".join(rendered)
+        mode = "100755" if candidate.stat().st_mode & 0o111 else "100644"
+        header = f"diff --git a/{relative} b/{relative}\nnew file mode {mode}\n"
+        return header + "".join(
+            line if line.endswith("\n") else line + "\n\\ No newline at end of file\n"
+            for line in rendered
+        )
 
     def run_git(self, *args: str) -> str:
         if _metadata_fingerprint(self._root) != self._metadata_fingerprint:
@@ -310,6 +368,59 @@ def _metadata_fingerprint(root: Path) -> str:
         else:
             digest.update(b"\x00")
     return digest.hexdigest()
+
+
+def git_process(
+    root: Path,
+    *args: str,
+    check: bool = True,
+    timeout_seconds: float = 30.0,
+) -> subprocess.CompletedProcess[bytes]:
+    """Bootstrap Git with code-owned environment and exact output bytes.
+
+    Callers own repository admission and the operation, never model-supplied shell text.
+    Existing guarded workspaces should use their fingerprint-checked run_git method.
+    """
+    if not math.isfinite(timeout_seconds) or not 0 < timeout_seconds <= 600:
+        msg = "Git timeout must be finite and within 600 seconds"
+        raise ValueError(msg)
+    return subprocess.run(
+        [
+            _resolve_git_executable(None),
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            *args,
+        ],
+        cwd=root,
+        env=_git_environment(),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        check=check,
+        timeout=timeout_seconds,
+    )
+
+
+def _unlink_file(root: Path, path: str) -> None:
+    """Resolve each directory through no-follow descriptors, including after a rename race."""
+    descriptor = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        parts = path.split("/")
+        for part in parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = child
+        mode = os.stat(parts[-1], dir_fd=descriptor, follow_symlinks=False).st_mode
+        if not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+            msg = "Revert target is not a regular file or symlink"
+            raise WorkspaceError(msg)
+        os.unlink(parts[-1], dir_fd=descriptor)
+    except OSError as exc:
+        msg = f"cannot revert {path}: unsafe or missing path"
+        raise WorkspaceError(msg) from exc
+    finally:
+        os.close(descriptor)
 
 
 def _run_git(git: str, root: Path, *args: str) -> str:

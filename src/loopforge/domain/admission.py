@@ -1,0 +1,53 @@
+"""Code-owned measurements for admission of a complete provider request."""
+
+from dataclasses import dataclass
+from enum import StrEnum
+
+
+class InputMeasurementBasis(StrEnum):
+    UTF8_BYTE_UPPER_BOUND = "utf8_byte_upper_bound"
+    TOKEN_COUNTER = "token_counter"
+    # Conservative ratio bound: serialized UTF-8 bytes / 2. Measured local Qwen
+    # requests average ~3.4 bytes per token, so this keeps large headroom.
+    UTF8_BYTES_PER_TOKEN_FLOOR_2 = "utf8_bytes_per_token_floor_2"
+    # The provider's measured token count for the previous request of this run plus
+    # the UTF-8 byte delta since then at 2 bytes/token. Accurate at long context
+    # (the full-ratio bound overstates ~1.7x), conservative for the new part only.
+    PROVIDER_COUNT_PLUS_DELTA = "provider_count_plus_utf8_delta_floor_2"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ContextAdmission:
+    measurement_basis: InputMeasurementBasis
+    input_token_bound: int
+    serialized_request_bytes: int
+    context_window_tokens: int
+    output_reserve_tokens: int
+    framing_reserve_tokens: int
+    compacted_turns: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.measurement_basis, InputMeasurementBasis):  # pyright: ignore[reportUnnecessaryIsInstance]
+            msg = "context measurement basis must be code-owned"
+            raise TypeError(msg)
+        for value in (
+            self.input_token_bound,
+            self.serialized_request_bytes,
+            self.context_window_tokens,
+            self.output_reserve_tokens,
+            self.framing_reserve_tokens,
+            self.compacted_turns,
+        ):
+            if type(value) is not int or value < 0:
+                msg = "context admission counts must be nonnegative integers"
+                raise ValueError(msg)
+        if self.context_window_tokens == 0:
+            msg = "context window must be positive"
+            raise ValueError(msg)
+
+    @property
+    def admitted(self) -> bool:
+        return (
+            self.input_token_bound + self.output_reserve_tokens + self.framing_reserve_tokens
+            <= self.context_window_tokens
+        )

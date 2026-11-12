@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from datetime import datetime
 from typing import Any, Final, cast
 
 from loopforge.domain.actions import ActionProposal
+from loopforge.domain.admission import ContextAdmission, InputMeasurementBasis
 from loopforge.domain.artifacts import ArtifactKind
 from loopforge.domain.context import ContextItemSnapshot, ContextSource
 from loopforge.domain.events import (
@@ -23,6 +24,7 @@ from loopforge.domain.events import (
     ContextAssembled,
     DomainEvent,
     Event,
+    ModelAttemptFailed,
     ModelTurnRecorded,
     OperatorInstruction,
     PlanCreated,
@@ -43,6 +45,7 @@ from loopforge.domain.events import (
 from loopforge.domain.orchestration import MergeOutcome, WorkerOutcome
 from loopforge.domain.policies import ShadowDecisionKind
 from loopforge.domain.reliability import ToolFailureClass
+from loopforge.domain.routing import ModelCapabilities
 from loopforge.domain.security import TrustClass
 from loopforge.domain.tooling import (
     ApprovalClass,
@@ -64,8 +67,11 @@ from loopforge.domain.types import (
     WorkerId,
     WorkspaceId,
 )
+from loopforge.domain.verification import CheckOutcome, VerificationProgress
 
 SCHEMA_VERSION: Final[int] = 1
+CHECKPOINT_SCHEMA_VERSION: Final[int] = 2
+FACTS_SCHEMA_VERSION: Final[int] = 3
 
 _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
     cls.__name__: cls
@@ -86,6 +92,7 @@ _EVENT_TYPES: Final[dict[str, type[DomainEvent]]] = {
         ContextAssembled,
         ArtifactRecorded,
         BudgetDebited,
+        ModelAttemptFailed,
         ModelTurnRecorded,
         ShadowDecisionRecorded,
         ApprovalRequested,
@@ -117,7 +124,24 @@ class JsonEventCodec:
 
     def encode(self, event: Event) -> str:
         envelope = {
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": (
+                FACTS_SCHEMA_VERSION
+                if (
+                    isinstance(event, (ModelAttemptFailed, ModelTurnRecorded))
+                    and event.model_capabilities is not None
+                )
+                or (
+                    isinstance(event, (VerificationPassed, VerificationFailed))
+                    and (
+                        event.outcomes
+                        or event.progress is not None
+                        or event.evidence_identity is not None
+                    )
+                )
+                else CHECKPOINT_SCHEMA_VERSION
+                if isinstance(event, VerificationPassed) and not event.task_complete
+                else SCHEMA_VERSION
+            ),
             "event_type": type(event).__name__,
             "event": _to_jsonable(asdict(event)),
         }
@@ -131,7 +155,14 @@ class JsonEventCodec:
         raw = cast(dict[str, Any], parsed)
 
         version = raw.get("schema_version")
-        if not isinstance(version, int) or isinstance(version, bool) or version != SCHEMA_VERSION:
+        is_checkpoint = (
+            raw.get("event_type") == "VerificationPassed" and version == CHECKPOINT_SCHEMA_VERSION
+        )
+        if (
+            not isinstance(version, int)
+            or isinstance(version, bool)
+            or (version != SCHEMA_VERSION and not is_checkpoint and version != FACTS_SCHEMA_VERSION)
+        ):
             msg = f"unsupported event schema version: {version!r}"
             raise UnsupportedEventSchemaError(msg)
 
@@ -141,14 +172,41 @@ class JsonEventCodec:
             raise UnknownEventTypeError(msg)
 
         event_data = _required_object(raw, "event")
+        facts_events = {
+            "VerificationPassed",
+            "VerificationFailed",
+            "ModelAttemptFailed",
+            "ModelTurnRecorded",
+        }
+        new_facts = any(
+            event_data.get(key)
+            for key in (
+                "outcomes",
+                "progress",
+                "evidence_identity",
+                "model_capabilities",
+            )
+        )
+        if (version == FACTS_SCHEMA_VERSION and event_type not in facts_events) or (
+            new_facts and version != FACTS_SCHEMA_VERSION
+        ):
+            msg = "typed verification/model facts require event schema version 3"
+            raise UnsupportedEventSchemaError(msg)
+        checkpoint_flag = event_data.get("task_complete")
+        if event_type == "VerificationPassed" and (
+            (is_checkpoint and checkpoint_flag is not False)
+            or (version == SCHEMA_VERSION and checkpoint_flag is False)
+        ):
+            msg = "passing checkpoints require schema version 2 and task_complete=false"
+            raise UnsupportedEventSchemaError(msg)
         return _construct_event(event_type, event_data)
 
 
 def _to_jsonable(value: Any) -> Any:
     if isinstance(value, datetime):
         return value.isoformat()
-    if isinstance(value, dict):
-        mapping = cast(dict[Any, Any], value)
+    if isinstance(value, Mapping):
+        mapping = cast(Mapping[Any, Any], value)
         return {str(key): _to_jsonable(item) for key, item in mapping.items()}
     if isinstance(value, (list, tuple)):
         sequence = cast(list[Any] | tuple[Any, ...], value)
@@ -280,7 +338,17 @@ def _construct_circuit_opened(base: dict[str, Any], data: dict[str, Any]) -> Eve
 
 
 def _construct_verification_passed(base: dict[str, Any], data: dict[str, Any]) -> Event:
-    return VerificationPassed(**base, summary=_required_str(data, "summary"))
+    return VerificationPassed(
+        **base,
+        outcomes=_verification_outcomes(data),
+        progress=_verification_progress(data),
+        evidence_identity=_optional_str(data, "evidence_identity"),
+        summary=_required_str(data, "summary"),
+        task_complete=_optional_bool(data, "task_complete", default=True),
+        score=(None if data.get("score", 1.0) is None else _required_number(data, "score"))
+        if "score" in data
+        else 1.0,
+    )
 
 
 def _construct_verification_failed(base: dict[str, Any], data: dict[str, Any]) -> Event:
@@ -295,11 +363,19 @@ def _construct_verification_failed(base: dict[str, Any], data: dict[str, Any]) -
     if not isinstance(inconclusive, bool):
         msg = "inconclusive must be a bool"
         raise TypeError(msg)
+    repeat = data.get("repeat", False)
+    if not isinstance(repeat, bool):
+        msg = "repeat must be a bool"
+        raise TypeError(msg)
     return VerificationFailed(
         **base,
+        outcomes=_verification_outcomes(data),
+        progress=_verification_progress(data),
+        evidence_identity=_optional_str(data, "evidence_identity"),
         summary=_required_str(data, "summary"),
         score=float(score) if score is not None else None,
         inconclusive=inconclusive,
+        repeat=repeat,
     )
 
 
@@ -367,6 +443,37 @@ def _construct_artifact_recorded(base: dict[str, Any], data: dict[str, Any]) -> 
     )
 
 
+def _context_admission(data: dict[str, Any]) -> ContextAdmission | None:
+    if data.get("context_admission") is None:
+        return None
+    record = _required_object(data, "context_admission")
+    counts = {
+        "input_token_bound",
+        "serialized_request_bytes",
+        "context_window_tokens",
+        "output_reserve_tokens",
+        "framing_reserve_tokens",
+        "compacted_turns",
+    }
+    if set(record) != counts | {"measurement_basis"}:
+        msg = "invalid context admission fields"
+        raise ValueError(msg)
+    return ContextAdmission(
+        measurement_basis=InputMeasurementBasis(_required_str(record, "measurement_basis")),
+        **{name: _required_int(record, name) for name in counts},
+    )
+
+
+def _construct_model_attempt_failed(base: dict[str, Any], data: dict[str, Any]) -> Event:
+    return ModelAttemptFailed(
+        **base,
+        model_capabilities=_optional_capabilities(data),
+        reason_code=_required_str(data, "reason_code"),
+        summary=_required_str(data, "summary"),
+        context_admission=_context_admission(data),
+    )
+
+
 def _construct_budget_debited(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return BudgetDebited(**base, usage=_usage(_required_object(data, "usage")))
 
@@ -409,6 +516,7 @@ def _construct_run_stopped(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return RunStopped(
         **base,
         reason=StopReason(_required_str(data, "reason")),
+        reason_code=_required_str(data, "reason_code") if "reason_code" in data else "",
         summary=_required_str(data, "summary"),
     )
 
@@ -446,9 +554,11 @@ def _construct_worker_merged(base: dict[str, Any], data: dict[str, Any]) -> Even
 def _construct_model_turn_recorded(base: dict[str, Any], data: dict[str, Any]) -> Event:
     return ModelTurnRecorded(
         **base,
+        model_capabilities=_optional_capabilities(data),
         provider=_required_str(data, "provider"),
         model=_required_str(data, "model"),
         action_id=ActionId(_required_str(data, "action_id")),
+        context_admission=_context_admission(data),
     )
 
 
@@ -480,6 +590,7 @@ _CONSTRUCTORS: Final[dict[str, Callable[[dict[str, Any], dict[str, Any]], Event]
     "ContextAssembled": _construct_context_assembled,
     "ArtifactRecorded": _construct_artifact_recorded,
     "BudgetDebited": _construct_budget_debited,
+    "ModelAttemptFailed": _construct_model_attempt_failed,
     "ModelTurnRecorded": _construct_model_turn_recorded,
     "ShadowDecisionRecorded": _construct_shadow_decision_recorded,
     "ApprovalRequested": _construct_approval_requested,
@@ -597,3 +708,67 @@ def _optional_int(data: dict[str, Any], key: str, *, default: int) -> int:
     if key not in data:
         return default
     return _required_int(data, key)
+
+
+def _optional_capabilities(data: dict[str, Any]) -> ModelCapabilities | None:
+    raw = data.get("model_capabilities")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        msg = "model capabilities must be an object"
+        raise TypeError(msg)
+    value = cast(dict[str, Any], raw)
+    return ModelCapabilities(
+        provider=_required_str(value, "provider"),
+        model=_required_str(value, "model"),
+        supports_tool_calls=_optional_bool(value, "supports_tool_calls", default=False),
+        context_window_tokens=_required_int(value, "context_window_tokens"),
+        input_cost_usd_per_million=_required_number(value, "input_cost_usd_per_million"),
+        output_cost_usd_per_million=_required_number(value, "output_cost_usd_per_million"),
+    )
+
+
+def _verification_outcomes(data: dict[str, Any]) -> tuple[CheckOutcome, ...]:
+    raw = data.get("outcomes", [])
+    if not isinstance(raw, list):
+        msg = "verification outcomes must be an array"
+        raise TypeError(msg)
+    result: list[CheckOutcome] = []
+    for item in cast(list[Any], raw):
+        if not isinstance(item, dict):
+            msg = "verification outcome must be an object"
+            raise TypeError(msg)
+        value = cast(dict[str, Any], item)
+        result.append(
+            CheckOutcome(
+                name=_required_str(value, "name"),
+                detail=_required_str(value, "detail"),
+                passed=_optional_bool(value, "passed", default=False),
+                executed=_optional_bool(value, "executed", default=True),
+                partial=None
+                if value.get("partial") is None
+                else _required_number(value, "partial"),
+            )
+        )
+    return tuple(result)
+
+
+def _verification_progress(data: dict[str, Any]) -> VerificationProgress | None:
+    raw = data.get("progress")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        msg = "verification progress must be an object"
+        raise TypeError(msg)
+    value = cast(dict[str, Any], raw)
+    for key in ("checks", "passed"):
+        if not isinstance(value.get(key), list) or any(
+            not isinstance(item, str) for item in value[key]
+        ):
+            msg = "verification progress IDs must be string arrays"
+            raise TypeError(msg)
+    return VerificationProgress(
+        basis=_required_str(value, "basis"),
+        checks=tuple(value["checks"]),
+        passed=tuple(value["passed"]),
+    )

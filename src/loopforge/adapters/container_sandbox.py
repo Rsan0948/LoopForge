@@ -37,6 +37,7 @@ from PACS-005 are retained unchanged.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -47,17 +48,18 @@ import time
 import uuid
 from collections.abc import Mapping
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from pathlib import Path
 from types import MappingProxyType
-from typing import BinaryIO, Final
+from typing import Final
 
 from loopforge.adapters.local_sandbox import (
     CommandSpec,
     ConstrainedLocalSandbox,
     SandboxLimits,
 )
+from loopforge.adapters.process_output import capture_output, close_pipes
 from loopforge.domain.security import SandboxCapabilities
 from loopforge.ports.sandbox import (
     SandboxCommandResult,
@@ -89,6 +91,34 @@ _DEFAULT_LIMITS: Final = SandboxLimits()
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class CommandOracle:
+    """A frozen verifier in a separate container, with only bounded result data.
+
+    argv receives one final JSON argument containing the producer's exit_code,
+    stdout, stderr and output_truncated. It never mounts the producer workspace.
+    A check without a producer runs only the verifier, over an empty observation.
+    """
+
+    command_name: str
+    argv: tuple[str, ...]
+    producer: bool = True
+    max_observation_bytes: int = 64000
+
+    def __post_init__(self) -> None:
+        if (
+            not self.command_name
+            or not self.argv
+            or not self.argv[0]
+            or type(self.producer) is not bool
+            or type(self.max_observation_bytes) is not int
+            or not 1 <= self.max_observation_bytes <= 64000
+        ):
+            msg = "Invalid isolated command oracle"
+            raise ValueError(msg)
+        CommandSpec(name=self.command_name, argv=self.argv, timeout_seconds=1)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ContainerSandboxConfig:
     """Code-owned container configuration; invalid configs are unconstructable.
 
@@ -106,6 +136,12 @@ class ContainerSandboxConfig:
     tmpfs_bytes: int = 64 * 1024 * 1024
     user: str | None = None
     docker_executable: str = "docker"
+    workspace_read_only: bool = False
+    # Code-owned extra read-only inputs, as (absolute host directory, absolute container
+    # path): for example a harness-written script kept outside the workspace. Never the
+    # workspace or /tmp; mounted read-only, so they grant no write path.
+    read_only_mounts: tuple[tuple[str, str], ...] = ()
+    oracles: tuple[CommandOracle, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.image.strip() or any(char.isspace() for char in self.image):
@@ -140,6 +176,86 @@ class ContainerSandboxConfig:
         if len(set(names)) != len(names):
             msg_6 = "sandbox command names must be unique"
             raise ValueError(msg_6)
+        oracle_names = [oracle.command_name for oracle in self.oracles]
+        if len(set(oracle_names)) != len(oracle_names) or not set(oracle_names) <= set(names):
+            msg = "Oracle names must be unique registered commands"
+            raise ValueError(msg)
+        targets = [target for _source, target in self.read_only_mounts]
+        for source, target in self.read_only_mounts:
+            if (
+                not Path(source).is_absolute()
+                or not target.startswith("/")
+                or ".." in Path(source).parts
+                or ".." in target.split("/")
+                or any(char in source + target for char in ",\n\0")
+                or target.rstrip("/") in {_WORKSPACE_MOUNT, "/tmp", ""}
+                or target.startswith((_WORKSPACE_MOUNT + "/", "/tmp/"))
+            ):
+                msg_8 = f"invalid read-only mount: {source!r} -> {target!r}"
+                raise ValueError(msg_8)
+        if len(set(targets)) != len(targets):
+            msg_9 = "read-only mount targets must be unique"
+            raise ValueError(msg_9)
+
+
+def hardened_run_argv(
+    config: ContainerSandboxConfig,
+    root: Path,
+    *,
+    container_name: str,
+    cpu_seconds: int,
+    detached: bool = False,
+) -> tuple[str, ...]:
+    """The enforced ``docker run`` contract up to and including the image.
+
+    One builder for every container this package starts, so a one-shot command and a
+    persistent session can never drift apart in isolation flags.
+    """
+    argv = [
+        config.docker_executable,
+        "run",
+        *(("--detach",) if detached else ()),
+        "--rm",
+        "--init",
+        "--pull",
+        "never",
+        "--name",
+        container_name,
+        "--network",
+        config.network.value,
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--log-driver",
+        "none",
+        "--pids-limit",
+        str(config.pids_limit),
+        "--memory",
+        str(config.limits.max_memory_bytes),
+        "--memory-swap",
+        str(config.limits.max_memory_bytes),
+        "--ulimit",
+        f"nofile={config.limits.max_open_files}:{config.limits.max_open_files}",
+        "--ulimit",
+        f"cpu={cpu_seconds}:{cpu_seconds}",
+        "--tmpfs",
+        f"/tmp:rw,noexec,nosuid,size={config.tmpfs_bytes}",
+        "--workdir",
+        _WORKSPACE_MOUNT,
+        "--mount",
+        f"type=bind,source={root},target={_WORKSPACE_MOUNT}"
+        + (",readonly" if config.workspace_read_only else ""),
+    ]
+    for source, target in config.read_only_mounts:
+        argv.extend(["--mount", f"type=bind,source={source},target={target},readonly"])
+    if config.user is not None:
+        argv.extend(["--user", config.user])
+    for key, value in sorted((config.environment or {}).items()):
+        argv.extend(["--env", f"{key}={value}"])
+    argv.append(config.image)
+    return tuple(argv)
 
 
 class ContainerSandbox:
@@ -182,7 +298,11 @@ class ContainerSandbox:
         self._tmpfs_bytes = config.tmpfs_bytes
         self._user = config.user
         self._docker = config.docker_executable
+        self._workspace_read_only = config.workspace_read_only
+        self._read_only_mounts = config.read_only_mounts
+        self._config = config
         self._active_container: str | None = None
+        self._oracle: ContainerSandbox | None = None
 
     @property
     def capabilities(self) -> SandboxCapabilities:
@@ -199,6 +319,9 @@ class ContainerSandbox:
     def run(
         self, command_name: str, *, timeout_seconds: float | None = None
     ) -> SandboxCommandResult:
+        if self._active_container is not None or self._oracle is not None:
+            msg = "Previous execution cleanup is unconfirmed; destroy the sandbox before reuse"
+            raise SandboxError(msg)
         try:
             spec = self._commands[command_name]
         except KeyError as exc:
@@ -211,54 +334,116 @@ class ContainerSandbox:
                 raise SandboxPolicyError(msg_8)
             effective_timeout = min(effective_timeout, timeout_seconds)
 
+        oracle = next(
+            (item for item in self._config.oracles if item.command_name == command_name), None
+        )
+        if oracle is not None:
+            return self._run_oracle(spec, oracle, effective_timeout)
+        return self._run_command(spec, effective_timeout)
+
+    def _run_oracle(
+        self, spec: CommandSpec, oracle: CommandOracle, timeout: float
+    ) -> SandboxCommandResult:
+        deadline = time.monotonic() + timeout
+        observed = self._run_command(spec, timeout) if oracle.producer else None
+        if observed is not None and observed.output_truncated:
+            msg = "Truncated producer output cannot support an isolated oracle decision"
+            raise SandboxPolicyError(msg)
+        payload = json.dumps(
+            {
+                "exit_code": observed.exit_code if observed else None,
+                "stdout": observed.stdout if observed else "",
+                "stderr": observed.stderr if observed else "",
+                "output_truncated": observed.output_truncated if observed else False,
+            },
+            ensure_ascii=False,
+        )
+        if len(payload.encode()) > oracle.max_observation_bytes:
+            msg = "Producer observation exceeds the isolated oracle input allowance"
+            raise SandboxPolicyError(msg)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            msg = "Command deadline exhausted before isolated verification"
+            raise SandboxTimeoutError(msg)
+        command = replace(spec, argv=(*oracle.argv, payload), allowed_exit_codes=frozenset({0}))
+        # Separate filesystem and PID namespaces; no candidate or extra inputs are
+        # mounted in the verifier. Candidate text is data, never imported code.
+        with tempfile.TemporaryDirectory(prefix="loopforge-oracle-") as root:
+            config = replace(
+                self._config,
+                commands=(command,),
+                oracles=(),
+                read_only_mounts=(),
+                workspace_read_only=True,
+            )
+            with type(self)(root, config=config) as verifier:
+                self._oracle = verifier
+                result = verifier.run(spec.name, timeout_seconds=remaining)
+            # Keep the verifier reachable if execution or context cleanup failed,
+            # so destroy() can retry any unconfirmed container cleanup.
+            self._oracle = None
+            return result
+
+    def _run_command(self, spec: CommandSpec, effective_timeout: float) -> SandboxCommandResult:
+        command_name = spec.name
         container_name = f"{_CONTAINER_NAME_PREFIX}{uuid.uuid4().hex[:12]}"
         argv = self._docker_run_argv(spec=spec, container_name=container_name)
-        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+        process = None
+        cleanup_complete = False
+        try:
             try:
                 process = subprocess.Popen(
                     argv,
                     stdin=subprocess.DEVNULL,
-                    stdout=stdout_file,
-                    stderr=stderr_file,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     shell=False,
                     start_new_session=True,
                     close_fds=True,
                 )
             except OSError as exc:
-                msg_12 = f"container runtime failed to start: {exc}"
-                raise SandboxError(msg_12) from exc
+                msg = f"container runtime failed to start: {exc}"
+                raise SandboxError(msg) from exc
             self._active_container = container_name
-            try:
-                try:
-                    process.wait(timeout=effective_timeout)
-                except subprocess.TimeoutExpired as exc:
-                    self._kill_container(container_name, process=process)
-                    try:
-                        process.wait(timeout=_KILL_TIMEOUT_SECONDS)
-                    except subprocess.TimeoutExpired:
-                        # The container is already killed; signaling the docker CLI's
-                        # process group is best-effort cleanup of the client only.
-                        with suppress(OSError):
-                            os.killpg(process.pid, signal.SIGKILL)
-                        process.wait()
-                    msg_9 = f"command {command_name!r} exceeded {effective_timeout}s"
-                    raise SandboxTimeoutError(msg_9) from exc
-            finally:
-                self._active_container = None
-
-            stdout = self._read_output(stdout_file)
-            stderr = self._read_output(stderr_file)
-            if process.returncode == _DOCKER_CLI_ERROR_EXIT and stderr.startswith(
+            captured = capture_output(process, effective_timeout, self._limits.max_output_bytes)
+            if process.returncode == _DOCKER_CLI_ERROR_EXIT and captured.stderr_prefix.startswith(
                 _DOCKER_CLI_ERROR_MARKER
             ):
-                msg_10 = f"container runtime failed: {stderr}"
-                raise SandboxError(msg_10)
+                msg = f"container runtime failed: {captured.stderr}"
+                raise SandboxError(msg)  # noqa: TRY301 - cleanup owns all failures
+            cleanup_complete = True  # docker run returned after its container exited
             return SandboxCommandResult(
                 exit_code=process.returncode,
-                stdout=stdout,
-                stderr=stderr,
+                stdout=captured.stdout,
+                stderr=captured.stderr,
                 succeeded=process.returncode in spec.allowed_exit_codes,
+                output_truncated=captured.truncated,
             )
+        except BaseException as exc:
+            # Retain the identity through cleanup, including interruption during wait.
+            if process is None and not isinstance(exc, SandboxError):
+                self._active_container = container_name
+                cleanup_complete = self._kill_container(container_name, process=None)
+            if process is not None:
+                cleanup_complete = self._kill_container(container_name, process=process)
+                try:
+                    process.wait(timeout=_KILL_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    with suppress(OSError):
+                        os.killpg(process.pid, signal.SIGKILL)
+                    process.wait(timeout=_KILL_TIMEOUT_SECONDS)
+            if isinstance(exc, subprocess.TimeoutExpired):
+                msg = f"command {command_name!r} exceeded {effective_timeout}s"
+                raise SandboxTimeoutError(msg) from exc
+            if isinstance(exc, OSError):
+                msg = f"container output capture failed: {str(exc)[:300]}"
+                raise SandboxError(msg) from exc
+            raise
+        finally:
+            if process is not None:
+                close_pipes(process)
+            if cleanup_complete:
+                self._active_container = None
 
     @property
     def active_container(self) -> str | None:
@@ -267,10 +452,16 @@ class ContainerSandbox:
 
     def destroy(self) -> None:
         """Kill any in-flight workload container, leaving no running child workload."""
+        if self._oracle is not None:
+            self._oracle.destroy()
+            self._oracle = None
         active = self._active_container
         if active is not None:
-            self._kill_container(active, process=None)
-            self._active_container = None
+            if self._kill_container(active, process=None):
+                self._active_container = None
+            else:
+                msg = f"Container cleanup is unconfirmed: {active}"
+                raise SandboxError(msg)
 
     def __enter__(self) -> ContainerSandbox:
         return self
@@ -279,52 +470,19 @@ class ContainerSandbox:
         self.destroy()
 
     def _docker_run_argv(self, *, spec: CommandSpec, container_name: str) -> tuple[str, ...]:
-        argv = [
-            self._docker,
-            "run",
-            "--rm",
-            "--init",
-            "--pull",
-            "never",
-            "--name",
-            container_name,
-            "--network",
-            self._network.value,
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--log-driver",
-            "none",
-            "--pids-limit",
-            str(self._pids_limit),
-            "--memory",
-            str(self._limits.max_memory_bytes),
-            "--memory-swap",
-            str(self._limits.max_memory_bytes),
-            "--ulimit",
-            f"nofile={self._limits.max_open_files}:{self._limits.max_open_files}",
-            "--ulimit",
-            f"cpu={spec.cpu_seconds}:{spec.cpu_seconds}",
-            "--tmpfs",
-            f"/tmp:rw,noexec,nosuid,size={self._tmpfs_bytes}",
-            "--workdir",
-            _WORKSPACE_MOUNT,
-            "--mount",
-            f"type=bind,source={self._root},target={_WORKSPACE_MOUNT}",
-        ]
-        if self._user is not None:
-            argv.extend(["--user", self._user])
-        for key, value in sorted(self._environment.items()):
-            argv.extend(["--env", f"{key}={value}"])
-        argv.append(self._image)
-        argv.extend(spec.argv)
-        return tuple(argv)
+        return (
+            *hardened_run_argv(
+                self._config,
+                self._root,
+                container_name=container_name,
+                cpu_seconds=spec.cpu_seconds,
+            ),
+            *spec.argv,
+        )
 
     def _kill_container(
         self, container_name: str, *, process: subprocess.Popen[bytes] | None
-    ) -> None:
+    ) -> bool:
         # SIGKILL to the container destroys its PID namespace: no child workload of
         # the container survives, which subprocess-group kills cannot guarantee.
         # The kill is retried until it succeeds, the CLI exits, or the bounded deadline
@@ -337,21 +495,18 @@ class ContainerSandbox:
                     [self._docker, "kill", container_name],
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
                     timeout=max(deadline - time.monotonic(), _KILL_POLL_INTERVAL_SECONDS),
                     check=False,
                 )
                 if completed.returncode == 0:
-                    return
+                    return True
+                if (process is None or process.poll() is not None) and b"No such container" in (
+                    completed.stderr or b""
+                ):
+                    return True
             if process is not None and process.poll() is not None:
-                return
+                return False
             if time.monotonic() >= deadline:
-                return
+                return False
             time.sleep(_KILL_POLL_INTERVAL_SECONDS)
-
-    def _read_output(self, handle: BinaryIO) -> str:
-        handle.seek(0)
-        data = handle.read(self._limits.max_output_bytes + 1)
-        if len(data) > self._limits.max_output_bytes:
-            data = data[: self._limits.max_output_bytes]
-        return data.decode("utf-8", errors="replace")

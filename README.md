@@ -203,6 +203,20 @@ See `docs/process/cycles/PACS-014b-operator-usability.md`.
 
 ## Documentation
 
+The opt-in [repository goal supervisor](docs/architecture/repository-goal-supervisor.md)
+can investigate a scoped repository, prepare an approved environment, discover
+edit locations, checkpoint a dirty checkout, continue approved timeout experiments,
+and deliver an independently verified local candidate for console review. See the
+[implementation plan](docs/process/autonomous-supervisor-plan.md) for qualified
+scope and remaining rollout gates.
+
+
+The experimental review-campaign product (review lanes, issues, n8n loops) was retired on
+2026-10-24; see [ADR-0021](docs/decisions/ADR-0021-core-and-agent-product-split.md). The
+repository-goal agent now lives in the sibling WorkBuddy project, which depends on this core.
+WorkBuddy owns goal supervision, coding/review lifecycles and product configuration;
+LoopForge owns the generic runtime and adapters.
+
 - `docs/architecture/overview.md` — system overview; `docs/architecture/` also
   covers the kernel contract, durable event store, sandbox contract,
   reliability control plane, benchmark methodology, and honest limitations
