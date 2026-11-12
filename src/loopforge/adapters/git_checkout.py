@@ -43,9 +43,37 @@ def _blob_matches(path: Path, identity: str, size: int, algorithm: str) -> bool:
     return digest.hexdigest() == identity
 
 
+def _converted_paths(target: Path, names: list[str]) -> set[str]:
+    """Let Git materialize files whose attributes require checkout conversion."""
+    converted: set[str] = set()
+    for start in range(0, len(names), 32):
+        raw = git_process(
+            target,
+            "check-attr",
+            "--cached",
+            "-z",
+            "eol",
+            "working-tree-encoding",
+            "filter",
+            "ident",
+            "--",
+            *names[start : start + 32],
+        ).stdout.split(b"\0")
+        for index in range(0, len(raw) - 1, 3):
+            name, attribute, value = raw[index : index + 3]
+            if (attribute == b"eol" and value.lower() == b"crlf") or (
+                attribute != b"eol" and value not in {b"unspecified", b"unset"}
+            ):
+                converted.add(os.fsdecode(name))
+    return converted
+
+
 def _populate(source: Path, target: Path, revision: str, algorithm: str) -> None:
     git_process(target, "read-tree", revision)
     entries = git_process(target, "ls-tree", "-r", "-l", "-z", revision).stdout
+    converted = _converted_paths(
+        target, [os.fsdecode(entry.split(b"\t", 1)[1]) for entry in entries.split(b"\0") if entry]
+    )
     missing: list[str] = []
     for entry in entries.split(b"\0"):
         if not entry:
@@ -59,7 +87,7 @@ def _populate(source: Path, target: Path, revision: str, algorithm: str) -> None
             copied.mkdir(parents=True, exist_ok=True)
             continue
         copied.parent.mkdir(parents=True, exist_ok=True)
-        if mode in {"100644", "100755"}:
+        if mode in {"100644", "100755"} and name not in converted:
             try:
                 info = original.lstat()
             except FileNotFoundError:

@@ -152,3 +152,19 @@ def test_unreadable_dirty_worktree_does_not_prevent_checkout_of_pinned_blob(tmp_
     local_checkout(workspace.root, workspace.base_revision, candidate, "candidate/test")
     assert (candidate / "file").read_text() == "pinned\n"
     assert source.stat().st_mode & 0o777 == 0
+
+
+def test_pinned_checkout_still_applies_git_worktree_conversions(tmp_path: Path) -> None:
+    workspace = GitWorkspaceManager(tmp_path / "sources").materialize(
+        FixtureSpec(
+            fixture_id="source",
+            files=(
+                FixtureFile(path=".gitattributes", content="*.txt text eol=crlf\n"),
+                FixtureFile(path="file.txt", content="pinned\n"),
+            ),
+        )
+    )
+    candidate = tmp_path / "candidate"
+    local_checkout(workspace.root, workspace.base_revision, candidate, "candidate/test")
+    assert (candidate / "file.txt").read_bytes() == b"pinned\r\n"
+    assert (workspace.root / "file.txt").read_bytes() == b"pinned\n"
