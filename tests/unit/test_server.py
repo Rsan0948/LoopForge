@@ -329,10 +329,12 @@ def _detail(client: TestClient, run_id: str) -> dict[str, Any]:
 
 
 def _wait_for_status(client: TestClient, run_id: str, status: str) -> dict[str, Any]:
+    # All callers await quiescent states. Their event can commit before the
+    # driver's finally block clears liveness; neither implies the other atomically.
     deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         detail = _detail(client, run_id)
-        if detail["status"] == status:
+        if detail["status"] == status and detail["driving"] is False:
             return detail
         time.sleep(0.01)
     msg = f"run did not reach status {status!r}; last: {_detail(client, run_id)!r}"
