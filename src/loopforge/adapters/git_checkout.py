@@ -105,7 +105,7 @@ def _populate(source: Path, target: Path, revision: str, algorithm: str) -> None
         if mode in {"100644", "100755"} and name not in converted:
             try:
                 info = original.lstat()
-            except FileNotFoundError:
+            except (FileNotFoundError, NotADirectoryError):
                 info = None
             if info is not None and stat.S_ISREG(info.st_mode) and info.st_size == int(size):
                 try:

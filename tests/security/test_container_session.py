@@ -4,7 +4,6 @@ import os
 import selectors
 import stat
 import subprocess
-import time
 from pathlib import Path
 
 import pytest
@@ -177,7 +176,7 @@ def test_the_session_lifetime_bounds_every_command_and_then_ends_it(
     tmp_path: Path, fake: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     session = _session(tmp_path, fake, command_timeout_seconds=120, max_session_seconds=300)
-    clock = time.monotonic()
+    clock = 1000.0  # exact binary arithmetic; a real small uptime can floor 50 s to 49
     monkeypatch.setattr(container_session.time, "monotonic", lambda: clock)
     session.run("echo hi")
     clock += 250
