@@ -185,3 +185,15 @@ def test_checkout_preserves_private_file_creation_permissions(tmp_path: Path) ->
         assert os.umask(0o077) == 0o077
     finally:
         os.umask(before)
+
+
+def test_checkout_reads_pinned_blob_when_parent_directory_became_file(tmp_path: Path) -> None:
+    workspace = GitWorkspaceManager(tmp_path / "sources").materialize(
+        FixtureSpec(fixture_id="source", files=(FixtureFile(path="src/value", content="original"),))
+    )
+    shutil.rmtree(workspace.root / "src")
+    (workspace.root / "src").write_text("replacement")
+    candidate = tmp_path / "candidate"
+    local_checkout(workspace.root, workspace.base_revision, candidate, "candidate/test")
+    assert (candidate / "src/value").read_text() == "original"
+    assert (workspace.root / "src").read_text() == "replacement"
